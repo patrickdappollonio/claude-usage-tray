@@ -13,7 +13,8 @@
 //!
 //! See `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md`.
 
-use crate::config::{self, Config, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
+use crate::config::{self, Config, IconStyle, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
+use crate::icon::IconAppearance;
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
 use jiff::{Timestamp, tz::TimeZone};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +42,12 @@ pub enum Wake {
     /// there is no data). The install itself runs in the poll loop rather than
     /// in the D-Bus callback, so the menu never blocks on filesystem work.
     InstallHook,
+    /// The resolved icon appearance changed — either the user picked a
+    /// different `Icon style`, or (under `mono-auto`) the desktop switched
+    /// between its light and dark themes. The poll loop pushes a property
+    /// update so the new icon reaches the tray host immediately; like the
+    /// other settings wakes it neither re-reads the cache nor notifies.
+    AppearanceChanged,
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
@@ -454,6 +461,84 @@ impl NotifyHandle {
     }
 }
 
+/// Resolves the configured style plus the desktop's reported scheme into the
+/// appearance the renderer takes.
+///
+/// The pinned monochrome styles are named for the *user's UI*: `mono-dark`
+/// means "my desktop is dark", which is drawn with the light foreground.
+/// `portal_dark` is only consulted for `mono-auto`, and is itself already the
+/// dark-assuming fallback when the portal said nothing (see
+/// [`crate::portal::dark_ui_from_scheme`]).
+pub fn resolve_appearance(style: IconStyle, portal_dark: bool) -> IconAppearance {
+    match style {
+        IconStyle::Color => IconAppearance::Color,
+        IconStyle::MonoAuto => IconAppearance::Mono {
+            dark_ui: portal_dark,
+        },
+        IconStyle::MonoDark => IconAppearance::Mono { dark_ui: true },
+        IconStyle::MonoLight => IconAppearance::Mono { dark_ui: false },
+    }
+}
+
+/// The two inputs the icon appearance is resolved from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AppearanceState {
+    style: IconStyle,
+    /// Last value the portal watcher reported; the dark-assuming default holds
+    /// until (and unless) it reports anything.
+    portal_dark: bool,
+}
+
+/// Shared handle to the icon appearance: written by the menu (style changes)
+/// and by the portal watcher thread (desktop theme changes), read by the tray
+/// on every icon render. A mutex for the same reason as [`NotifyHandle`] — it
+/// is held only for a copy or a store, never across I/O.
+#[derive(Clone)]
+pub struct AppearanceHandle(Arc<Mutex<AppearanceState>>);
+
+impl AppearanceHandle {
+    fn new(style: IconStyle) -> Self {
+        AppearanceHandle(Arc::new(Mutex::new(AppearanceState {
+            style,
+            portal_dark: true,
+        })))
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut AppearanceState) -> R) -> R {
+        match self.0.lock() {
+            Ok(mut state) => f(&mut state),
+            // A poisoned mutex must not take the tray down over an icon color.
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// The appearance to render with right now.
+    pub fn resolved(&self) -> IconAppearance {
+        self.with(|state| resolve_appearance(state.style, state.portal_dark))
+    }
+
+    /// Records the user's new choice; returns whether the rendered appearance
+    /// actually changed (switching between two styles that resolve the same
+    /// way needs no repaint).
+    pub fn set_style(&self, style: IconStyle) -> bool {
+        self.with(|state| {
+            let before = resolve_appearance(state.style, state.portal_dark);
+            state.style = style;
+            resolve_appearance(style, state.portal_dark) != before
+        })
+    }
+
+    /// Records what the portal reported; returns whether that changed the
+    /// rendered appearance (it does not while a non-auto style is selected).
+    pub fn set_portal_dark(&self, dark: bool) -> bool {
+        self.with(|state| {
+            let before = resolve_appearance(state.style, state.portal_dark);
+            state.portal_dark = dark;
+            resolve_appearance(state.style, dark) != before
+        })
+    }
+}
+
 /// Settings shared between the menu (which changes them) and the poll loop
 /// (which reads the interval and the notification preferences every cycle, so
 /// changes apply live).
@@ -465,6 +550,8 @@ pub struct Settings {
     interval: Arc<AtomicU64>,
     /// Notification preferences, shared the same way.
     notify: NotifyHandle,
+    /// Icon appearance, shared with the portal watcher thread too.
+    appearance: AppearanceHandle,
     /// True when `CLAUDE_TRAY_POLL_SECS` is set to a usable value. The radio
     /// group then still persists the user's choice, but the effective interval
     /// stays the environment's.
@@ -477,10 +564,12 @@ impl Settings {
     pub fn new(config: Config, env_secs: Option<u64>) -> Self {
         let effective = env_secs.unwrap_or(config.refresh_secs);
         let notify = NotifyHandle::new(NotifyPrefs::from_config(&config));
+        let appearance = AppearanceHandle::new(config.icon_style);
         Settings {
             config,
             interval: Arc::new(AtomicU64::new(effective)),
             notify,
+            appearance,
             env_locked: env_secs.is_some(),
         }
     }
@@ -493,6 +582,12 @@ impl Settings {
     /// Handle for the poll loop; `get` it once per cycle.
     pub fn notify_handle(&self) -> NotifyHandle {
         self.notify.clone()
+    }
+
+    /// Handle for the portal watcher thread (and for the poll loop, which
+    /// needs nothing from it beyond keeping it alive).
+    pub fn appearance_handle(&self) -> AppearanceHandle {
+        self.appearance.clone()
     }
 }
 
@@ -537,6 +632,24 @@ impl UsageTray {
         if !self.settings.env_locked {
             self.settings.interval.store(secs, Ordering::Relaxed);
             self.send(Wake::IntervalChanged);
+        }
+    }
+
+    /// Radio-group handler: persist the chosen icon style and repaint. The
+    /// appearance is shared state, so pushing a property update (via the wake)
+    /// is all the poll loop has to do.
+    fn select_icon_style(&mut self, index: usize) {
+        let Some(&style) = IconStyle::ALL.get(index) else {
+            // Out-of-range index from the menu host: nothing to crash over.
+            return;
+        };
+        if self.settings.config.icon_style == style {
+            return;
+        }
+        self.settings.config.icon_style = style;
+        config::save(&self.settings.config);
+        if self.settings.appearance.set_style(style) {
+            self.send(Wake::AppearanceChanged);
         }
     }
 
@@ -651,6 +764,25 @@ impl UsageTray {
                     .collect(),
             }
             .into(),
+            ksni::MenuItem::Separator,
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: "Icon style".into(),
+                enabled: false,
+                ..Default::default()
+            }),
+            ksni::menu::RadioGroup {
+                selected: self.settings.config.icon_style.choice(),
+                select: Box::new(|tray: &mut Self, index: usize| tray.select_icon_style(index)),
+                options: IconStyle::ALL
+                    .iter()
+                    .map(|style| ksni::menu::RadioItem {
+                        label: style.label().to_string(),
+                        enabled: can_persist,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .into(),
         ];
         if self.settings.env_locked {
             // Without this the radio group would look broken: the choice is
@@ -691,7 +823,7 @@ impl ksni::Tray for UsageTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        crate::icon::render_icons(&self.snapshot)
+        crate::icon::render_icons(&self.snapshot, self.settings.appearance.resolved())
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
@@ -1414,6 +1546,79 @@ mod tests {
         }
 
         assert_eq!(fired_at, Some(reset_at), "reset fired late or not at all");
+    }
+
+    #[test]
+    fn pinned_styles_are_named_for_the_ui_not_for_the_icon() {
+        // "mono-dark" = my UI is dark = light icon, and vice versa. The portal
+        // value is irrelevant for both, whichever way it points.
+        for portal_dark in [true, false] {
+            assert_eq!(
+                resolve_appearance(IconStyle::MonoDark, portal_dark),
+                IconAppearance::Mono { dark_ui: true }
+            );
+            assert_eq!(
+                resolve_appearance(IconStyle::MonoLight, portal_dark),
+                IconAppearance::Mono { dark_ui: false }
+            );
+            assert_eq!(
+                resolve_appearance(IconStyle::Color, portal_dark),
+                IconAppearance::Color
+            );
+        }
+    }
+
+    #[test]
+    fn auto_follows_the_portal() {
+        assert_eq!(
+            resolve_appearance(IconStyle::MonoAuto, true),
+            IconAppearance::Mono { dark_ui: true }
+        );
+        assert_eq!(
+            resolve_appearance(IconStyle::MonoAuto, false),
+            IconAppearance::Mono { dark_ui: false }
+        );
+    }
+
+    #[test]
+    fn the_appearance_handle_defaults_to_a_dark_ui_until_the_portal_speaks() {
+        let handle = AppearanceHandle::new(IconStyle::MonoAuto);
+        assert_eq!(handle.resolved(), IconAppearance::Mono { dark_ui: true });
+    }
+
+    #[test]
+    fn appearance_changes_report_whether_a_repaint_is_needed() {
+        let handle = AppearanceHandle::new(IconStyle::Color);
+        assert!(!handle.set_style(IconStyle::Color), "no-op selection");
+        assert!(handle.set_style(IconStyle::MonoAuto));
+        assert_eq!(handle.resolved(), IconAppearance::Mono { dark_ui: true });
+
+        // Under auto, a portal change repaints.
+        assert!(handle.set_portal_dark(false));
+        assert_eq!(handle.resolved(), IconAppearance::Mono { dark_ui: false });
+        assert!(!handle.set_portal_dark(false), "same value again");
+
+        // Two styles that resolve identically need no repaint: auto currently
+        // says "light UI", which is exactly what mono-light pins.
+        assert!(!handle.set_style(IconStyle::MonoLight));
+        // ...and once pinned, the portal no longer moves the icon.
+        assert!(!handle.set_portal_dark(true));
+        assert_eq!(handle.resolved(), IconAppearance::Mono { dark_ui: false });
+    }
+
+    #[test]
+    fn the_tray_renders_with_the_configured_style() {
+        let settings = Settings::new(
+            Config {
+                icon_style: IconStyle::MonoLight,
+                ..Config::default()
+            },
+            None,
+        );
+        assert_eq!(
+            settings.appearance_handle().resolved(),
+            IconAppearance::Mono { dark_ui: false }
+        );
     }
 
     #[test]

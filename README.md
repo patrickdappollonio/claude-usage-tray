@@ -133,12 +133,16 @@ The tray menu has a `Settings` submenu with everything that is configurable:
   effect immediately; no restart.
 - **Refresh interval** — 5 s / 15 s / 30 s / 60 s. Changes take effect
   immediately; no restart.
+- **Icon style** — `Color` / `Monochrome (auto)` / `Monochrome dark` /
+  `Monochrome light`. See [Icon style](#icon-style) below. Changes take
+  effect immediately; no restart.
 
 **Grayed-out entries**: the tray checks, each time you open the menu,
 whether it can actually act on these settings. If
 `~/.config/claude-usage-tray/` cannot be created or written to (read-only
 home, full disk, wrong ownership), the refresh-interval options and the
-notification checkboxes are shown disabled rather than accepting a click
+notification checkboxes and the icon-style options are shown disabled
+rather than accepting a click
 that could not be saved. If `~/.config/autostart/` is unavailable, `Launch
 at login` is disabled the same way. Because the check runs on every menu
 open, fixing the permissions un-grays the entries without restarting the
@@ -152,13 +156,15 @@ refresh_secs = 5
 launch_at_login = false
 notify_thresholds = [50, 75, 90, 99, 100]
 notify_on_reset = true
+icon_style = "color"
 ```
 
 A missing or corrupt config file is not an error: the tray falls back to the
 defaults above. `notify_thresholds` is the list of thresholds that are
 switched **on**; unknown or out-of-range entries are dropped on load, a value
 that is not a list at all falls back to the default set, and an empty list is
-respected as "no threshold alerts".
+respected as "no threshold alerts". An `icon_style` that is missing,
+misspelled or of the wrong type falls back to `"color"`.
 
 ## Installing the statusline hook
 
@@ -248,6 +254,43 @@ out of your statusline script (backing the script up as
   hook** item that does the same thing as `claude-usage-tray hook install`,
   followed by a `Hook installed — data appears next time Claude Code
   refreshes` toast. That item is only there while there is no data.
+
+## Icon style
+
+`Settings ▸ Icon style` chooses between the colored gauge and a flat
+monochrome one, for panels and themes where four severity colors are more
+noise than signal. The setting is saved as `icon_style` in `config.toml` and
+applies the moment you pick it.
+
+| Menu option | `config.toml` | What you get |
+| --- | --- | --- |
+| `Color` (default) | `"color"` | The banded gauge described above. |
+| `Monochrome (auto)` | `"mono-auto"` | One flat color, following your desktop's light/dark preference. |
+| `Monochrome dark` | `"mono-dark"` | One flat color, pinned to "my desktop is dark". |
+| `Monochrome light` | `"mono-light"` | One flat color, pinned to "my desktop is light". |
+
+In monochrome mode the ring, the session arc and the weekly dot are all drawn
+in the same color, and the **length of the arc sweep alone** carries the usage
+signal — there is no green/amber/red to read. Everything else behaves exactly
+as in color mode: a stale cache still dims the icon, and a missing cache still
+renders the gray "no data" ring and dot.
+
+**The names describe your UI, not the icon.** `Monochrome dark` means "my
+desktop is dark", so it paints a **near-white** icon; `Monochrome light` means
+"my desktop is light" and paints a **near-black** one. Pick the one that
+matches your panel; if the icon comes out invisible, you have picked the other
+one.
+
+`Monochrome (auto)` reads your preference from the XDG Desktop Portal
+(`org.freedesktop.portal.Settings`, namespace `org.freedesktop.appearance`,
+key `color-scheme`), which is the same setting KDE, GNOME and friends
+publish for every other app: `1` means "prefer dark" (light icon), `0` and
+`2` mean no preference or "prefer light" (dark icon). The tray also
+subscribes to the portal's change signal, so flipping your desktop between
+light and dark repaints the icon live, without a restart. If no portal is
+running — or the lookup fails for any other reason — auto assumes a **dark
+desktop** and draws the light icon; pin `Monochrome light` if that is wrong
+for your setup.
 
 ## Notifications
 

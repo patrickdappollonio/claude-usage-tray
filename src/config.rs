@@ -2,13 +2,14 @@
 //! launch-at-login flag.
 //!
 //! The file lives at `~/.config/claude-usage-tray/config.toml` (respecting
-//! `$XDG_CONFIG_HOME`) and holds four keys:
+//! `$XDG_CONFIG_HOME`) and holds five keys:
 //!
 //! ```toml
 //! refresh_secs = 5
 //! launch_at_login = false
 //! notify_thresholds = [50, 75, 90, 99, 100]
 //! notify_on_reset = true
+//! icon_style = "color"
 //! ```
 //!
 //! Like every other read path in this crate, nothing here panics on bad input:
@@ -42,6 +43,72 @@ pub fn is_critical(threshold: u8) -> bool {
     threshold >= CRITICAL_FROM
 }
 
+/// How the tray icon is colored.
+///
+/// The two pinned monochrome options are named for *the user's UI*, not for
+/// the icon: `MonoDark` means "my desktop is dark", which needs a light icon.
+/// `MonoAuto` asks the XDG desktop portal which one it is (see
+/// [`crate::portal`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IconStyle {
+    /// The severity-banded color gauge (green/amber/orange/red).
+    #[default]
+    Color,
+    /// Monochrome, following the desktop's light/dark preference.
+    MonoAuto,
+    /// Monochrome pinned to "my UI is dark" — a light icon.
+    MonoDark,
+    /// Monochrome pinned to "my UI is light" — a dark icon.
+    MonoLight,
+}
+
+impl IconStyle {
+    /// Every option, in the order the menu radio group lists them. The index
+    /// into this array *is* the radio index.
+    pub const ALL: [IconStyle; 4] = [
+        IconStyle::Color,
+        IconStyle::MonoAuto,
+        IconStyle::MonoDark,
+        IconStyle::MonoLight,
+    ];
+
+    /// The value written to (and read from) `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IconStyle::Color => "color",
+            IconStyle::MonoAuto => "mono-auto",
+            IconStyle::MonoDark => "mono-dark",
+            IconStyle::MonoLight => "mono-light",
+        }
+    }
+
+    /// The menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            IconStyle::Color => "Color",
+            IconStyle::MonoAuto => "Monochrome (auto)",
+            IconStyle::MonoDark => "Monochrome dark",
+            IconStyle::MonoLight => "Monochrome light",
+        }
+    }
+
+    /// Parses a stored value. Anything unrecognized is `None`, which callers
+    /// turn into the default rather than an error.
+    pub fn parse(raw: &str) -> Option<IconStyle> {
+        IconStyle::ALL
+            .into_iter()
+            .find(|style| style.as_str() == raw)
+    }
+
+    /// Position within [`IconStyle::ALL`], for the radio group.
+    pub fn choice(self) -> usize {
+        IconStyle::ALL
+            .iter()
+            .position(|&style| style == self)
+            .unwrap_or(0)
+    }
+}
+
 /// User settings as stored in `config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -55,6 +122,8 @@ pub struct Config {
     pub notify_thresholds: Vec<u8>,
     /// Whether the "session quota reset" notification fires.
     pub notify_on_reset: bool,
+    /// How the icon is colored.
+    pub icon_style: IconStyle,
 }
 
 impl Default for Config {
@@ -64,6 +133,7 @@ impl Default for Config {
             launch_at_login: false,
             notify_thresholds: NOTIFY_THRESHOLDS.to_vec(),
             notify_on_reset: true,
+            icon_style: IconStyle::default(),
         }
     }
 }
@@ -163,11 +233,19 @@ pub fn parse_config(body: &str) -> Config {
         .get("notify_on_reset")
         .and_then(|value| value.as_bool())
         .unwrap_or(defaults.notify_on_reset);
+    // A missing, wrong-typed, or unrecognized style is not worth refusing to
+    // start over: it just means "the default look".
+    let icon_style = table
+        .get("icon_style")
+        .and_then(|value| value.as_str())
+        .and_then(IconStyle::parse)
+        .unwrap_or(defaults.icon_style);
     Config {
         refresh_secs,
         launch_at_login,
         notify_thresholds,
         notify_on_reset,
+        icon_style,
     }
 }
 
@@ -182,8 +260,13 @@ pub fn render_config(config: &Config) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\nnotify_on_reset = {}\n",
-        config.refresh_secs, config.launch_at_login, thresholds, config.notify_on_reset
+        "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\n\
+         notify_on_reset = {}\nicon_style = \"{}\"\n",
+        config.refresh_secs,
+        config.launch_at_login,
+        thresholds,
+        config.notify_on_reset,
+        config.icon_style.as_str()
     )
 }
 
@@ -289,6 +372,7 @@ mod tests {
                 launch_at_login: false,
                 notify_thresholds: vec![50, 75, 90, 99, 100],
                 notify_on_reset: true,
+                icon_style: IconStyle::Color,
             }
         );
     }
@@ -306,6 +390,7 @@ mod tests {
                 launch_at_login: true,
                 notify_thresholds: vec![75, 100],
                 notify_on_reset: false,
+                icon_style: IconStyle::Color,
             }
         );
     }
@@ -424,6 +509,63 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_icon_style_spelling() {
+        for style in IconStyle::ALL {
+            assert_eq!(
+                parse_config(&format!("icon_style = \"{}\"\n", style.as_str())).icon_style,
+                style
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_missing_or_wrong_typed_icon_style_is_color() {
+        for body in [
+            "",
+            "icon_style = \"chartreuse\"\n",
+            "icon_style = \"Color\"\n", // case-sensitive by design
+            "icon_style = 3\n",
+            "icon_style = true\n",
+            "icon_style = [\"mono-auto\"]\n",
+        ] {
+            assert_eq!(
+                parse_config(body).icon_style,
+                IconStyle::Color,
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn icon_style_choice_matches_the_radio_order() {
+        for (index, style) in IconStyle::ALL.into_iter().enumerate() {
+            assert_eq!(style.choice(), index);
+            assert_eq!(IconStyle::ALL[style.choice()], style);
+        }
+        // The menu contract from the spec, verbatim.
+        assert_eq!(
+            IconStyle::ALL.map(IconStyle::label),
+            [
+                "Color",
+                "Monochrome (auto)",
+                "Monochrome dark",
+                "Monochrome light"
+            ]
+        );
+    }
+
+    #[test]
+    fn icon_style_survives_a_toml_round_trip() {
+        for style in IconStyle::ALL {
+            let config = Config {
+                icon_style: style,
+                ..Config::default()
+            };
+            assert_eq!(parse_config(&render_config(&config)), config);
+        }
+    }
+
+    #[test]
     fn corrupt_or_wrong_typed_values_fall_back_to_defaults() {
         assert_eq!(parse_config("this is not toml {{{"), Config::default());
         assert_eq!(parse_config(""), Config::default());
@@ -442,6 +584,7 @@ mod tests {
             launch_at_login: true,
             notify_thresholds: vec![75, 99],
             notify_on_reset: false,
+            icon_style: IconStyle::MonoAuto,
         };
         assert_eq!(parse_config(&render_config(&config)), config);
 
@@ -472,6 +615,7 @@ mod tests {
             launch_at_login: true,
             notify_thresholds: vec![50, 100],
             notify_on_reset: false,
+            icon_style: IconStyle::MonoLight,
         };
         save_to(&path, &config).expect("save succeeds");
         assert!(path.exists());

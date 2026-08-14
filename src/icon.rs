@@ -5,6 +5,11 @@
 //! `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md` for the
 //! visual design ("Icon rendering").
 //!
+//! Two appearances are supported ([`IconAppearance`]): the banded color
+//! gauge, and a monochrome one that draws ring, arc and dot in a single
+//! foreground color — near-white on a dark UI, near-black on a light one —
+//! where the arc sweep alone carries the usage signal.
+//!
 //! `SnapshotState::Missing` renders as a flat gray ring + center dot (no
 //! arc, no color signal — there is no data to show). `SnapshotState::Stale`
 //! renders identically to `Fresh` but with every pixel's alpha scaled down,
@@ -22,6 +27,53 @@ const GRAY: (u8, u8, u8) = (128, 128, 128);
 /// Alpha multiplier applied to the whole pixmap when the snapshot is stale.
 const STALE_ALPHA_SCALE: f32 = 0.5;
 
+/// Monochrome foreground for a dark UI: near-white, so the icon reads against
+/// a dark panel.
+const MONO_ON_DARK: (u8, u8, u8) = (238, 238, 238);
+
+/// Monochrome foreground for a light UI: near-black.
+const MONO_ON_LIGHT: (u8, u8, u8) = (51, 51, 51);
+
+/// How the icon is painted. Resolved from the user's `icon_style` setting
+/// (plus, for `mono-auto`, the desktop portal's color-scheme value) before
+/// every render — see `crate::tray::resolve_appearance`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IconAppearance {
+    /// Severity-banded colors (green/amber/orange/red).
+    #[default]
+    Color,
+    /// A single foreground color. `dark_ui` describes the *desktop*, not the
+    /// icon: a dark UI gets the light foreground.
+    Mono { dark_ui: bool },
+}
+
+impl IconAppearance {
+    /// The single color everything is drawn in, or `None` in color mode.
+    fn foreground(self) -> Option<(u8, u8, u8)> {
+        match self {
+            IconAppearance::Color => None,
+            IconAppearance::Mono { dark_ui: true } => Some(MONO_ON_DARK),
+            IconAppearance::Mono { dark_ui: false } => Some(MONO_ON_LIGHT),
+        }
+    }
+
+    /// Color of the dim background ring.
+    fn ring(self) -> (u8, u8, u8) {
+        self.foreground().unwrap_or(GRAY)
+    }
+
+    /// Color of the session arc at `percent`. In monochrome mode the sweep
+    /// alone carries the signal, so the color never changes with severity.
+    fn arc(self, percent: f64) -> (u8, u8, u8) {
+        self.foreground().unwrap_or_else(|| band_color(percent))
+    }
+
+    /// Color of the weekly dot at `percent`, same rule as the arc.
+    fn dot(self, percent: f64) -> (u8, u8, u8) {
+        self.arc(percent)
+    }
+}
+
 /// Picks the severity color for a percentage: green below 60, amber below
 /// 80, orange below 95, red at 95 and above. Values outside 0..=100 are not
 /// expected but are not rejected either — the bands are open-ended.
@@ -37,12 +89,16 @@ pub fn band_color(percent: f64) -> (u8, u8, u8) {
     }
 }
 
-/// Renders the 22/24/48 px ARGB32 (network byte order) icons for `snapshot`.
-pub fn render_icons(snapshot: &UsageSnapshot) -> Vec<ksni::Icon> {
-    SIZES.iter().map(|&size| render_one(size, snapshot)).collect()
+/// Renders the 22/24/48 px ARGB32 (network byte order) icons for `snapshot`
+/// in the given appearance.
+pub fn render_icons(snapshot: &UsageSnapshot, appearance: IconAppearance) -> Vec<ksni::Icon> {
+    SIZES
+        .iter()
+        .map(|&size| render_one(size, snapshot, appearance))
+        .collect()
 }
 
-fn render_one(size: u32, snapshot: &UsageSnapshot) -> ksni::Icon {
+fn render_one(size: u32, snapshot: &UsageSnapshot, appearance: IconAppearance) -> ksni::Icon {
     // Fixed, known-valid dimensions (22/24/48, always > 0) — Pixmap::new only
     // returns None for zero-sized or overflowing dimensions, neither of which
     // can happen here.
@@ -57,7 +113,15 @@ fn render_one(size: u32, snapshot: &UsageSnapshot) -> ksni::Icon {
         SnapshotState::Fresh | SnapshotState::Stale => {
             let session_percent = extract_percent(snapshot.session.as_ref());
             let weekly_percent = extract_percent(snapshot.weekly.as_ref());
-            draw_gauge(&mut pixmap, center, radius, stroke_width, session_percent, weekly_percent);
+            draw_gauge(
+                &mut pixmap,
+                center,
+                radius,
+                stroke_width,
+                session_percent,
+                weekly_percent,
+                appearance,
+            );
         }
     }
 
@@ -92,9 +156,18 @@ fn draw_gauge(
     stroke_width: f32,
     session_percent: Option<f64>,
     weekly_percent: Option<f64>,
+    appearance: IconAppearance,
 ) {
     // Dim background ring, always full circle.
-    stroke_circle(pixmap, center, center, radius, stroke_width, GRAY, 70);
+    stroke_circle(
+        pixmap,
+        center,
+        center,
+        radius,
+        stroke_width,
+        appearance.ring(),
+        70,
+    );
 
     match session_percent {
         Some(session_percent) => {
@@ -104,7 +177,7 @@ fn draw_gauge(
             if sweep_deg > 0.0
                 && let Some(path) = arc_path(center, center, radius, -90.0, sweep_deg)
             {
-                let color = band_color(session_percent);
+                let color = appearance.arc(session_percent);
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(color.0, color.1, color.2, 255);
                 paint.anti_alias = true;
@@ -136,7 +209,11 @@ fn draw_gauge(
 
     // Small inner weekly dot, banded the same way — gray when there is no
     // reading, so "no data" never reads as a confident green 0%.
-    let weekly_color = weekly_percent.map(band_color).unwrap_or(GRAY);
+    // Unknown stays neutral gray in both appearances: "we have no reading"
+    // must not look like a confident one, and gray is unsaturated either way.
+    let weekly_color = weekly_percent
+        .map(|percent| appearance.dot(percent))
+        .unwrap_or(GRAY);
     fill_dot(pixmap, center, center, stroke_width * 0.55, weekly_color, 255);
 }
 
@@ -270,7 +347,7 @@ mod tests {
     #[test]
     fn renders_three_pixmaps_with_expected_sizes_and_content() {
         let snap = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
-        let icons = render_icons(&snap);
+        let icons = render_icons(&snap, IconAppearance::Color);
         assert_eq!(icons.len(), 3);
 
         let expected_sizes = [22i32, 24, 48];
@@ -294,7 +371,7 @@ mod tests {
             written_at: None,
             state: SnapshotState::Missing,
         };
-        let icons = render_icons(&snap);
+        let icons = render_icons(&snap, IconAppearance::Color);
         let icon = &icons[2]; // 48px: largest, most stable sampling
 
         let mut gray_like = 0usize;
@@ -324,8 +401,8 @@ mod tests {
         let fresh = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
         let stale = snapshot(SnapshotState::Stale, Some(70.0), Some(30.0));
 
-        let fresh_icon = &render_icons(&fresh)[2];
-        let stale_icon = &render_icons(&stale)[2];
+        let fresh_icon = &render_icons(&fresh, IconAppearance::Color)[2];
+        let stale_icon = &render_icons(&stale, IconAppearance::Color)[2];
 
         let max_alpha = |data: &[u8]| data.chunks_exact(4).map(|px| px[0]).max().unwrap_or(0);
 
@@ -341,7 +418,7 @@ mod tests {
     #[test]
     fn zero_percent_session_draws_no_arc_but_still_renders_ring_and_dot() {
         let snap = snapshot(SnapshotState::Fresh, Some(0.0), Some(0.0));
-        let icons = render_icons(&snap);
+        let icons = render_icons(&snap, IconAppearance::Color);
         assert!(icons[2].data.chunks_exact(4).any(|px| px[0] != 0));
     }
 
@@ -351,7 +428,7 @@ mod tests {
     #[test]
     fn unknown_percent_renders_gray_not_green() {
         let snap = snapshot(SnapshotState::Fresh, None, None);
-        let icon = &render_icons(&snap)[2]; // 48px: largest, most stable sampling
+        let icon = &render_icons(&snap, IconAppearance::Color)[2]; // 48px: largest, most stable sampling
 
         let green = (67u8, 160u8, 71u8);
         let mut green_like = 0usize;
@@ -383,7 +460,7 @@ mod tests {
     fn unknown_weekly_percent_dot_is_not_green() {
         let size = 48u32;
         let snap = snapshot(SnapshotState::Fresh, Some(10.0), None);
-        let icon = &render_icons(&snap)[2];
+        let icon = &render_icons(&snap, IconAppearance::Color)[2];
 
         // Sample only the small central region the dot occupies, well clear
         // of the outer arc/ring.
@@ -409,5 +486,149 @@ mod tests {
             }
         }
         assert!(saw_center_pixel, "expected the weekly dot to draw something at the center");
+    }
+
+    /// Visible (alpha != 0) pixels of an icon as `(r, g, b)` triples, with the
+    /// premultiplication already undone by the ARGB conversion.
+    fn visible_pixels(icon: &ksni::Icon) -> Vec<(u8, u8, u8)> {
+        icon.data
+            .chunks_exact(4)
+            .filter(|px| px[0] != 0)
+            .map(|px| (px[1], px[2], px[3]))
+            .collect()
+    }
+
+    /// Mean of a channel over the visible pixels; the icons are anti-aliased,
+    /// so single-pixel assertions would be brittle.
+    fn mean_luma(pixels: &[(u8, u8, u8)]) -> f64 {
+        let sum: f64 = pixels
+            .iter()
+            .map(|&(r, g, b)| (r as f64 + g as f64 + b as f64) / 3.0)
+            .sum();
+        sum / pixels.len() as f64
+    }
+
+    #[test]
+    fn monochrome_icons_contain_no_saturated_pixels() {
+        // Percentages spanning every color band, including the red one that is
+        // the most obviously non-gray in color mode.
+        for percent in [5.0, 59.0, 70.0, 85.0, 96.0, 100.0] {
+            for dark_ui in [true, false] {
+                for state in [SnapshotState::Fresh, SnapshotState::Stale] {
+                    let snap = snapshot(state.clone(), Some(percent), Some(percent));
+                    for icon in render_icons(&snap, IconAppearance::Mono { dark_ui }) {
+                        for (r, g, b) in visible_pixels(&icon) {
+                            let max = r.max(g).max(b);
+                            let min = r.min(g).min(b);
+                            assert!(
+                                max - min <= 4,
+                                "saturated pixel ({r},{g},{b}) at {percent}% \
+                                 dark_ui={dark_ui} state={state:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn monochrome_follows_the_ui_scheme_light_on_dark_and_dark_on_light() {
+        let snap = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
+        let on_dark = &render_icons(&snap, IconAppearance::Mono { dark_ui: true })[2];
+        let on_light = &render_icons(&snap, IconAppearance::Mono { dark_ui: false })[2];
+
+        let dark_ui_luma = mean_luma(&visible_pixels(on_dark));
+        let light_ui_luma = mean_luma(&visible_pixels(on_light));
+
+        assert!(
+            dark_ui_luma > 200.0,
+            "a dark UI must get a near-white icon, mean luma was {dark_ui_luma}"
+        );
+        assert!(
+            light_ui_luma < 80.0,
+            "a light UI must get a dark icon, mean luma was {light_ui_luma}"
+        );
+    }
+
+    #[test]
+    fn color_mode_still_bands_and_monochrome_does_not() {
+        // 96% is red in color mode; the same reading in monochrome must be the
+        // plain foreground, with the sweep left to carry the signal.
+        let snap = snapshot(SnapshotState::Fresh, Some(96.0), Some(96.0));
+        let red = (211u8, 47u8, 47u8);
+        let color = &render_icons(&snap, IconAppearance::Color)[2];
+        assert!(
+            visible_pixels(color).contains(&red),
+            "color mode should still paint the red band at 96%"
+        );
+        for dark_ui in [true, false] {
+            let mono = &render_icons(&snap, IconAppearance::Mono { dark_ui })[2];
+            assert!(
+                !visible_pixels(mono).contains(&red),
+                "monochrome must not paint the red band"
+            );
+        }
+    }
+
+    /// The arc sweep is the only signal in monochrome mode, so it had better
+    /// actually differ with the percentage.
+    #[test]
+    fn monochrome_sweep_grows_with_session_percent() {
+        let count_visible = |percent: f64| {
+            let snap = snapshot(SnapshotState::Fresh, Some(percent), Some(0.0));
+            visible_pixels(&render_icons(&snap, IconAppearance::Mono { dark_ui: true })[2]).len()
+        };
+        assert!(
+            count_visible(90.0) > count_visible(20.0),
+            "a fuller window must draw a longer arc"
+        );
+    }
+
+    #[test]
+    fn monochrome_missing_state_is_identical_to_color_mode() {
+        // The gray "no data" icon carries no severity, so there is nothing for
+        // the monochrome mode to change.
+        let snap = UsageSnapshot {
+            session: None,
+            weekly: None,
+            written_at: None,
+            state: SnapshotState::Missing,
+        };
+        let color = render_icons(&snap, IconAppearance::Color);
+        for dark_ui in [true, false] {
+            let mono = render_icons(&snap, IconAppearance::Mono { dark_ui });
+            for (a, b) in color.iter().zip(mono.iter()) {
+                assert_eq!(a.data, b.data, "missing-state icon must not vary by style");
+            }
+        }
+    }
+
+    #[test]
+    fn monochrome_stale_dims_exactly_like_color_mode() {
+        for dark_ui in [true, false] {
+            let appearance = IconAppearance::Mono { dark_ui };
+            let fresh = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
+            let stale = snapshot(SnapshotState::Stale, Some(70.0), Some(30.0));
+            let max_alpha = |icon: &ksni::Icon| {
+                icon.data
+                    .chunks_exact(4)
+                    .map(|px| px[0])
+                    .max()
+                    .unwrap_or(0)
+            };
+            let fresh_max = max_alpha(&render_icons(&fresh, appearance)[2]);
+            let stale_max = max_alpha(&render_icons(&stale, appearance)[2]);
+            assert!(
+                stale_max < fresh_max,
+                "stale ({stale_max}) should be dimmer than fresh ({fresh_max})"
+            );
+            // Same 0.5 scale as color mode, within rounding.
+            let expected = (f32::from(fresh_max) * STALE_ALPHA_SCALE).round() as u8;
+            assert!(
+                stale_max.abs_diff(expected) <= 1,
+                "stale alpha {stale_max} should be about {expected}"
+            );
+        }
     }
 }

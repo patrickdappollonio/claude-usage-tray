@@ -16,6 +16,7 @@ mod autostart;
 mod config;
 mod hook;
 mod icon;
+mod portal;
 mod source;
 #[cfg(test)]
 mod testutil;
@@ -211,9 +212,26 @@ fn run_tray() {
     let settings = tray::Settings::new(stored, env_secs);
     let interval = settings.interval_handle();
     let notify_prefs = settings.notify_handle();
+    let appearance = settings.appearance_handle();
     let tz = TimeZone::system();
 
     let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
+
+    // Watch the desktop's light/dark preference regardless of the current
+    // style: it costs one thread and one D-Bus connection, and it means
+    // switching to "Monochrome (auto)" is already correct instead of waiting
+    // for the next theme change. The handle ignores the value while a
+    // non-auto style is selected, so no repaint is triggered for it.
+    {
+        let appearance = appearance.clone();
+        let wake_tx = wake_tx.clone();
+        portal::spawn_watcher(move |dark_ui| {
+            if appearance.set_portal_dark(dark_ui) {
+                let _ = wake_tx.send(Wake::AppearanceChanged);
+            }
+        });
+    }
+
     let mut snapshot = source::read_snapshot(&cache_path, Timestamp::now());
 
     let handle = match tray::UsageTray::new(snapshot.clone(), settings, wake_tx).spawn() {
@@ -281,6 +299,14 @@ fn run_tray() {
             Ok(Wake::IntervalChanged) => continue,
             // A notification toggle changed: pick it up at the top of the loop.
             Ok(Wake::NotifyChanged) => continue,
+            // The icon style changed, or the desktop switched theme under
+            // `mono-auto`. The appearance is shared state that `icon_pixmap`
+            // reads, so an empty update is enough to make ksni re-render and
+            // push the new pixmaps.
+            Ok(Wake::AppearanceChanged) => {
+                handle.update(|_tray| {});
+                continue;
+            }
             // The first-run menu item. The install itself runs here, off the
             // D-Bus callback, then falls through to a re-read: the cache will
             // still be missing until Claude Code next refreshes, which is
