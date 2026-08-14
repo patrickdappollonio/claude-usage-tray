@@ -402,7 +402,7 @@ mod tests {
                 launch_at_login: false,
                 notify_thresholds: vec![50, 75, 90, 99, 100],
                 notify_on_reset: true,
-                icon_style: IconStyle::Color,
+                icon_style: IconStyle::default(),
                 check_updates: true,
             }
         );
@@ -413,7 +413,7 @@ mod tests {
         let config = parse_config(
             "refresh_secs = 30\nlaunch_at_login = true\n\
              notify_thresholds = [75, 100]\nnotify_on_reset = false\n\
-             check_updates = false\n",
+             icon_style = \"color\"\ncheck_updates = false\n",
         );
         assert_eq!(
             config,
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_missing_or_wrong_typed_icon_style_is_color() {
+    fn unknown_missing_or_wrong_typed_icon_style_is_the_platform_default() {
         for body in [
             "",
             "icon_style = \"chartreuse\"\n",
@@ -563,7 +563,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_config(body).icon_style,
-                IconStyle::Color,
+                IconStyle::default(),
                 "body: {body}"
             );
         }
