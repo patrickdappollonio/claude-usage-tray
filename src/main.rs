@@ -31,52 +31,85 @@ mod ui;
 mod update;
 
 use jiff::{Timestamp, tz::TimeZone};
-use platform::{Toast, Urgency};
+use platform::{Channel, Toast, Urgency};
 use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 use ui::{ResetAlert, UsageAlert, Wake};
 
+/// Builds the toast for a threshold crossing. Split out from [`notify`] so
+/// the routing to [`Channel::ThresholdAlert`] — the whole point of this
+/// function existing — is checkable without going through the backend's
+/// D-Bus call; see the `notify_channel_routing` tests below.
+fn threshold_toast(alert: &UsageAlert) -> (Toast, Channel) {
+    (
+        Toast {
+            summary: alert.summary(),
+            body: alert.body(),
+            urgency: if alert.critical {
+                Urgency::Critical
+            } else {
+                Urgency::Normal
+            },
+            transient: false,
+        },
+        Channel::ThresholdAlert,
+    )
+}
+
+/// Builds the toast for the "your 5-hour window rolled over" notification.
+/// Normal urgency: it is good news, not a warning. Ephemeral: a later
+/// threshold alert must not replace it, and it must not replace one either.
+fn reset_toast(alert: &ResetAlert) -> (Toast, Channel) {
+    (
+        Toast {
+            summary: alert.summary(),
+            body: alert.body(),
+            urgency: Urgency::Normal,
+            transient: false,
+        },
+        Channel::Ephemeral,
+    )
+}
+
+/// Builds the toast that follows a *user-initiated* action ("Check for new
+/// data", the `Install hook` item, or a left-click status readout): low
+/// urgency and transient, so it acknowledges the click without piling up in
+/// notification history the way the threshold alerts (deliberately) do, and
+/// ephemeral so it never competes with a threshold alert for the same slot.
+fn refresh_toast(body: &str) -> (Toast, Channel) {
+    (
+        Toast {
+            summary: "Claude usage tray".to_string(),
+            body: body.to_string(),
+            urgency: Urgency::Low,
+            transient: true,
+        },
+        Channel::Ephemeral,
+    )
+}
+
 /// Emits a threshold notification. Failures (no notification daemon, D-Bus
 /// down) are ignored by the backend: a missing notification must never take
 /// the tray with it.
 fn notify(alert: &UsageAlert) {
-    platform::notify(&Toast {
-        summary: alert.summary(),
-        body: alert.body(),
-        urgency: if alert.critical {
-            Urgency::Critical
-        } else {
-            Urgency::Normal
-        },
-        transient: false,
-    });
+    let (toast, channel) = threshold_toast(alert);
+    platform::notify(&toast, channel);
 }
 
-/// Emits the "your 5-hour window rolled over" notification. Normal urgency:
-/// it is good news, not a warning.
+/// Emits the "your 5-hour window rolled over" notification.
 fn notify_reset(alert: &ResetAlert) {
-    platform::notify(&Toast {
-        summary: alert.summary(),
-        body: alert.body(),
-        urgency: Urgency::Normal,
-        transient: false,
-    });
+    let (toast, channel) = reset_toast(alert);
+    platform::notify(&toast, channel);
 }
 
-/// Emits the toast that follows a *user-initiated* action ("Check for new
-/// data", the `Install hook` item, or a left-click status readout): low
-/// urgency and transient, so it acknowledges the click without piling up in
-/// notification history the way the threshold alerts (deliberately) do.
+/// Emits the toast that follows a *user-initiated* action.
 fn notify_refresh(body: &str) {
-    platform::notify(&Toast {
-        summary: "Claude usage tray".to_string(),
-        body: body.to_string(),
-        urgency: Urgency::Low,
-        transient: true,
-    });
+    let (toast, channel) = refresh_toast(body);
+    platform::notify(&toast, channel);
 }
+
 
 const USAGE: &str = "\
 claude-usage-tray — Claude Code usage in the system tray
@@ -462,5 +495,61 @@ fn poll_loop(
             PostRead::Silent => {}
         }
         snapshot = next;
+    }
+}
+
+/// Pure logic worth testing directly, without going through the backend's
+/// D-Bus call: which [`Channel`] each kind of toast is routed to. The
+/// replace-in-place mechanism itself (retaining and updating a
+/// `NotificationHandle`) lives in `platform::linux` and talks to a live
+/// notification daemon, so it is not unit-testable here — that verification
+/// is left to the orchestrator running this on a real desktop.
+#[cfg(test)]
+mod notify_channel_routing {
+    use super::*;
+
+    #[test]
+    fn normal_threshold_alert_routes_to_threshold_alert_channel() {
+        let alert = UsageAlert {
+            threshold: 75,
+            percent: 75.0,
+            critical: false,
+        };
+        let (toast, channel) = threshold_toast(&alert);
+        assert_eq!(channel, Channel::ThresholdAlert);
+        assert_eq!(toast.urgency, Urgency::Normal);
+        assert!(!toast.transient);
+    }
+
+    #[test]
+    fn critical_threshold_alert_also_routes_to_threshold_alert_channel() {
+        // The whole point: a 90% critical alert must land on the same
+        // replaceable channel as the 75% one it supersedes, not a separate
+        // lane that would let both stack.
+        let alert = UsageAlert {
+            threshold: 90,
+            percent: 90.0,
+            critical: true,
+        };
+        let (toast, channel) = threshold_toast(&alert);
+        assert_eq!(channel, Channel::ThresholdAlert);
+        assert_eq!(toast.urgency, Urgency::Critical);
+        assert!(!toast.transient);
+    }
+
+    #[test]
+    fn reset_alert_routes_to_ephemeral_channel() {
+        let alert = ResetAlert {
+            at: Timestamp::now(),
+        };
+        let (_, channel) = reset_toast(&alert);
+        assert_eq!(channel, Channel::Ephemeral);
+    }
+
+    #[test]
+    fn refresh_toast_routes_to_ephemeral_channel() {
+        let (toast, channel) = refresh_toast("2 requests today");
+        assert_eq!(channel, Channel::Ephemeral);
+        assert!(toast.transient);
     }
 }

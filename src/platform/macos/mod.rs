@@ -36,7 +36,7 @@
 pub mod autostart;
 mod tray;
 
-use crate::platform::{BackendError, Toast};
+use crate::platform::{BackendError, Channel, Toast};
 use crate::source::UsageSnapshot;
 use crate::ui::TrayCore;
 use std::sync::Arc;
@@ -200,7 +200,16 @@ where
 /// unbundled binary whose notifications the user has denied, most likely) are
 /// ignored on purpose: a missing notification must never take the tray with
 /// it.
-pub fn notify(toast: &Toast) {
+///
+/// `channel` is accepted and ignored: every toast is fire-and-forget here, so
+/// a new threshold alert stacks instead of replacing the previous one, same
+/// as before this lane existed on Linux. `notify-rust`'s macOS backend hands
+/// back a handle too, so replace-in-place is possible in principle, but
+/// wiring it up is deferred to the bundled-app work — an unsigned,
+/// unbundled binary's Notification Center entitlements are already shaky
+/// (see the doc comment above), and that work is where this gets revisited
+/// alongside a real app identity.
+pub fn notify(toast: &Toast, _channel: Channel) {
     let _ = notify_rust::Notification::new()
         .summary(&toast.summary)
         .body(&toast.body)

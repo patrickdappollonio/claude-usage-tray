@@ -133,6 +133,26 @@ pub struct Toast {
     pub transient: bool,
 }
 
+/// Which notification lane a [`Toast`] travels on, and therefore whether a
+/// later toast is allowed to replace an earlier, still-visible one.
+///
+/// This is a portable concept — "should this stack or replace?" — even though
+/// only the Linux backend can act on it today (see `notify` in
+/// `platform/linux/mod.rs` for the mechanism, and `platform/macos/mod.rs` for
+/// why macOS ignores it for now).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    /// Threshold alerts (75%, 90%, ...). A new one replaces whichever
+    /// threshold alert is still on screen, so the user always sees the
+    /// *current* severity instead of a pile of superseded ones — the 90%
+    /// critical banner should read where the 75% one was, not stack under it.
+    ThresholdAlert,
+    /// Everything else: the reset notice and the click acknowledgements
+    /// (refresh, status, install). Each shows and disappears independently,
+    /// exactly as before this lane existed.
+    Ephemeral,
+}
+
 /// Starts the tray and drives it until the poll loop finishes.
 ///
 /// Blocks for the whole life of the program on every platform; see the module
@@ -144,10 +164,10 @@ where
     imp::run(core, poll)
 }
 
-/// Shows a desktop notification. Failures are swallowed: a missing notification
-/// must never take the tray with it.
-pub fn notify(toast: &Toast) {
-    imp::notify(toast);
+/// Shows a desktop notification on `channel`. Failures are swallowed: a
+/// missing notification must never take the tray with it.
+pub fn notify(toast: &Toast, channel: Channel) {
+    imp::notify(toast, channel);
 }
 
 /// Starts watching the desktop's light/dark preference, calling `on_change`
