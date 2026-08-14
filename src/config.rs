@@ -10,6 +10,7 @@
 //! notify_thresholds = [50, 75, 90, 99, 100]
 //! notify_on_reset = true
 //! icon_style = "color"
+//! check_updates = true
 //! ```
 //!
 //! Like every other read path in this crate, nothing here panics on bad input:
@@ -124,6 +125,10 @@ pub struct Config {
     pub notify_on_reset: bool,
     /// How the icon is colored.
     pub icon_style: IconStyle,
+    /// Whether the once-daily GitHub releases check runs. The only setting
+    /// that gates a network request, which is why it is re-read on every
+    /// cycle rather than captured at startup.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -134,6 +139,7 @@ impl Default for Config {
             notify_thresholds: NOTIFY_THRESHOLDS.to_vec(),
             notify_on_reset: true,
             icon_style: IconStyle::default(),
+            check_updates: true,
         }
     }
 }
@@ -240,12 +246,20 @@ pub fn parse_config(body: &str) -> Config {
         .and_then(|value| value.as_str())
         .and_then(IconStyle::parse)
         .unwrap_or(defaults.icon_style);
+    // Deliberately defaults to *on* when missing or wrong-typed: a corrupt
+    // config should not silently switch a feature the user opted into off,
+    // and the check is anonymous enough that "on" is the safe fallback.
+    let check_updates = table
+        .get("check_updates")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(defaults.check_updates);
     Config {
         refresh_secs,
         launch_at_login,
         notify_thresholds,
         notify_on_reset,
         icon_style,
+        check_updates,
     }
 }
 
@@ -261,12 +275,13 @@ pub fn render_config(config: &Config) -> String {
         .join(", ");
     format!(
         "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\n\
-         notify_on_reset = {}\nicon_style = \"{}\"\n",
+         notify_on_reset = {}\nicon_style = \"{}\"\ncheck_updates = {}\n",
         config.refresh_secs,
         config.launch_at_login,
         thresholds,
         config.notify_on_reset,
-        config.icon_style.as_str()
+        config.icon_style.as_str(),
+        config.check_updates
     )
 }
 
@@ -373,6 +388,7 @@ mod tests {
                 notify_thresholds: vec![50, 75, 90, 99, 100],
                 notify_on_reset: true,
                 icon_style: IconStyle::Color,
+                check_updates: true,
             }
         );
     }
@@ -381,7 +397,8 @@ mod tests {
     fn parses_a_full_config() {
         let config = parse_config(
             "refresh_secs = 30\nlaunch_at_login = true\n\
-             notify_thresholds = [75, 100]\nnotify_on_reset = false\n",
+             notify_thresholds = [75, 100]\nnotify_on_reset = false\n\
+             check_updates = false\n",
         );
         assert_eq!(
             config,
@@ -391,6 +408,7 @@ mod tests {
                 notify_thresholds: vec![75, 100],
                 notify_on_reset: false,
                 icon_style: IconStyle::Color,
+                check_updates: false,
             }
         );
     }
@@ -578,6 +596,25 @@ mod tests {
     }
 
     #[test]
+    fn check_updates_defaults_on_and_survives_a_round_trip() {
+        // Missing, wrong-typed and unparseable all mean "leave it on".
+        assert!(parse_config("").check_updates);
+        assert!(parse_config("check_updates = 0\n").check_updates);
+        assert!(parse_config("check_updates = \"no\"\n").check_updates);
+        // An explicit false is the one thing that switches it off.
+        assert!(!parse_config("check_updates = false\n").check_updates);
+        assert!(parse_config("check_updates = true\n").check_updates);
+
+        for enabled in [true, false] {
+            let config = Config {
+                check_updates: enabled,
+                ..Config::default()
+            };
+            assert_eq!(parse_config(&render_config(&config)), config);
+        }
+    }
+
+    #[test]
     fn render_round_trips_through_parse() {
         let config = Config {
             refresh_secs: 60,
@@ -585,6 +622,7 @@ mod tests {
             notify_thresholds: vec![75, 99],
             notify_on_reset: false,
             icon_style: IconStyle::MonoAuto,
+            check_updates: false,
         };
         assert_eq!(parse_config(&render_config(&config)), config);
 
@@ -616,6 +654,7 @@ mod tests {
             notify_thresholds: vec![50, 100],
             notify_on_reset: false,
             icon_style: IconStyle::MonoLight,
+            check_updates: false,
         };
         save_to(&path, &config).expect("save succeeds");
         assert!(path.exists());

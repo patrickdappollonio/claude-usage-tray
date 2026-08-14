@@ -43,17 +43,31 @@ shell snippet. `claude-usage-tray hook install` deletes that file and strips
 the old injected shell block out of your statusline script automatically; you
 do not need to clean anything up by hand.
 
-## No network calls, no credentials — ever
+## No Anthropic network calls, no credentials — ever
 
-This tray makes **zero network requests** and **never reads or touches your
-Claude credentials** (`.credentials.json`, OAuth tokens, or any cookie). It
-only reads a local JSON file — the data Claude Code itself already hands to
-your statusline on stdin. This matters because Anthropic's January 2026 Terms of
-Service update prohibits using subscription OAuth outside Claude Code, and
-tools that impersonate a browser or spoof the Claude Code user agent to poll
-usage over the network have gotten accounts auto-banned. This tool never
-does that class of thing, by construction: there is no HTTP client in the
-dependency tree at all.
+This tray **never reads or touches your Claude credentials**
+(`.credentials.json`, OAuth tokens, or any cookie) and **never talks to
+Anthropic at all**. Usage data comes from one local JSON file — the data Claude
+Code itself already hands to your statusline on stdin. This matters because
+Anthropic's January 2026 Terms of Service update prohibits using subscription
+OAuth outside Claude Code, and tools that impersonate a browser or spoof the
+Claude Code user agent to poll usage over the network have gotten accounts
+auto-banned. This tool never does that class of thing, by construction.
+
+The one network call it can make is unrelated to your usage: an **optional,
+once-daily update check** against the GitHub releases API
+(`api.github.com/repos/patrickdappollonio/claude-usage-tray/releases/latest`).
+It is anonymous — no account, no token, no identifier of any kind; the request
+sends nothing but a `User-Agent` naming the program and its version — and it
+only ever reads the latest release's tag and page URL. If a newer version
+exists, an `⬆ Update available: v0.2.0` row appears in the menu; clicking it
+opens that release page in your browser via `xdg-open`. A failed check (no
+network, a proxy, a rate limit) is silent: no toast, no log line, no row.
+
+Switch it off with `Settings ▸ Check for updates`, or set
+`check_updates = false` in `config.toml`. With it off the binary makes **zero
+network requests**, which is what it also does on any run before the first
+check is due.
 
 ## Installation
 
@@ -211,13 +225,17 @@ The tray menu has a `Settings` submenu with everything that is configurable:
 - **Icon style** — `Color` / `Monochrome (auto)` / `Monochrome dark` /
   `Monochrome light`. See [Icon style](#icon-style) below. Changes take
   effect immediately; no restart.
+- **Check for updates** — a checkbox, on by default, and the only setting
+  that permits a network request. See
+  [Update checks](#update-checks) below. Unticking it stops the next check
+  without a restart.
 
 **Grayed-out entries**: the tray checks, each time you open the menu,
 whether it can actually act on these settings. If
 `~/.config/claude-usage-tray/` cannot be created or written to (read-only
 home, full disk, wrong ownership), the refresh-interval options and the
-notification checkboxes and the icon-style options are shown disabled
-rather than accepting a click
+notification checkboxes, the icon-style options and `Check for updates` are
+shown disabled rather than accepting a click
 that could not be saved. If `~/.config/autostart/` is unavailable, `Launch
 at login` is disabled the same way. Because the check runs on every menu
 open, fixing the permissions un-grays the entries without restarting the
@@ -232,6 +250,7 @@ launch_at_login = false
 notify_thresholds = [50, 75, 90, 99, 100]
 notify_on_reset = true
 icon_style = "color"
+check_updates = true
 ```
 
 A missing or corrupt config file is not an error: the tray falls back to the
@@ -239,7 +258,41 @@ defaults above. `notify_thresholds` is the list of thresholds that are
 switched **on**; unknown or out-of-range entries are dropped on load, a value
 that is not a list at all falls back to the default set, and an empty list is
 respected as "no threshold alerts". An `icon_style` that is missing,
-misspelled or of the wrong type falls back to `"color"`.
+misspelled or of the wrong type falls back to `"color"`. `check_updates` has
+to be a literal `false` to switch the update check off — a missing or
+wrong-typed value leaves it on.
+
+## Update checks
+
+Once a day (and once a few seconds after startup), the tray asks the GitHub
+releases API whether there is a newer version than the one running. It is the
+only network request this program makes, it is anonymous, and it sends nothing
+about you, your account or your usage — see
+[the section above](#no-anthropic-network-calls-no-credentials--ever).
+
+When a newer release is found, one extra row appears in the menu, directly
+above `Settings`:
+
+```
+⬆ Update available: v0.2.0
+```
+
+Clicking it opens that release's page on GitHub in your default browser (via
+`xdg-open`) and nothing else — the tray never downloads or installs anything.
+When there is no newer release, or the check simply did not get an answer, the
+row is absent and nothing is logged or notified; a version check is not worth
+interrupting anyone for.
+
+Uncheck `Settings ▸ Check for updates` (or set `check_updates = false`) to
+stop it. The setting is read again before every check, so switching it off
+takes effect without restarting the tray. A row that is already showing stays
+until you restart — it is a link you have already been offered, not a nag.
+
+Version comparison is on the numeric parts only (`0.10.0` really is newer than
+`0.9.0`), a leading `v` on the tag is ignored, and a prerelease tag such as
+`0.2.0-rc.1` counts as newer only if its *numbers* are newer — so running
+`0.1.0` you would be told about `0.2.0-rc.1`, but running `0.1.0-rc.1` you are
+not told to "update" to `0.1.0`.
 
 ## Installing the statusline hook
 
@@ -348,7 +401,9 @@ out of your statusline script (backing the script up as
   reads `⚠ Hook not installed — no data` and offers a clickable **Install
   hook** item that does the same thing as `claude-usage-tray hook install`,
   followed by a `Hook installed — data appears next time Claude Code
-  refreshes` toast. That item is only there while there is no data.
+  refreshes` toast — or `Hook already installed — entry refreshed` if it was
+  wired up all along and the entry was merely re-pointed at the current
+  binary. That item is only there while there is no data.
 
 ## Icon style
 
@@ -405,6 +460,10 @@ be switched off individually under `Settings ▸ Notifications`.
   you get one notification (99%), not four.
 - **Toggling is not retroactive**: switching a threshold back on while usage
   is already past it stays quiet until the next genuine crossing.
+- **Restarting is not a crossing**: the first reading after the tray starts
+  is a baseline, not an alert. Starting the tray at 82% tells you nothing;
+  climbing from 82% to 91% afterwards notifies at 90%. This is why no
+  notification state needs to survive a restart.
 
 **When quota resets** (also on by default, same submenu) is a separate
 notification — `Session quota reset — fresh 5-hour window`, normal priority

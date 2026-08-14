@@ -1,6 +1,8 @@
 //! Claude usage tray: reads the statusline usage cache on a timer and renders
-//! it as a StatusNotifierItem tray icon. No network, no credentials, no writes
-//! outside its own config, the Claude config directory, and autostart files.
+//! it as a StatusNotifierItem tray icon. No credentials, no writes outside its
+//! own config, the Claude config directory, and autostart files, and no
+//! network beyond the optional once-daily GitHub release check in
+//! [`update`] — nothing about the user's usage ever leaves the machine.
 //!
 //! The same binary is also the statusline command itself (`statusline`
 //! subcommand) and its own installer (`hook install|uninstall|status`), so
@@ -22,12 +24,14 @@ mod source;
 #[cfg(test)]
 mod testutil;
 mod tray;
+mod update;
 
 use jiff::{Timestamp, tz::TimeZone};
 use ksni::blocking::TrayMethods;
 use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 use tray::{ResetAlert, UsageAlert, Wake};
 
 /// Emits a threshold notification. Failures (no notification daemon, D-Bus
@@ -35,7 +39,7 @@ use tray::{ResetAlert, UsageAlert, Wake};
 fn notify(alert: &UsageAlert) {
     let mut notification = notify_rust::Notification::new();
     notification
-        .appname("Claude usage")
+        .appname("Claude usage tray")
         .summary(&alert.summary())
         .body(&alert.body())
         .urgency(if alert.critical {
@@ -51,7 +55,7 @@ fn notify(alert: &UsageAlert) {
 fn notify_reset(alert: &ResetAlert) {
     let mut notification = notify_rust::Notification::new();
     notification
-        .appname("Claude usage")
+        .appname("Claude usage tray")
         .summary(&alert.summary())
         .body(&alert.body())
         .urgency(notify_rust::Urgency::Normal);
@@ -65,8 +69,8 @@ fn notify_reset(alert: &ResetAlert) {
 fn notify_refresh(body: &str) {
     let mut notification = notify_rust::Notification::new();
     notification
-        .appname("Claude usage")
-        .summary("Claude usage")
+        .appname("Claude usage tray")
+        .summary("Claude usage tray")
         .body(body)
         .urgency(notify_rust::Urgency::Low)
         .hint(notify_rust::Hint::Transient(true));
@@ -210,6 +214,56 @@ fn install_hook_now() -> String {
     hook::install_toast(&result)
 }
 
+/// How long after startup the first update check runs. Late enough that a
+/// cold start never waits on DNS or TLS for anything the user can see; the
+/// check happens on its own thread anyway, so this is only about not competing
+/// with the tray's first paint.
+const FIRST_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(5);
+
+/// Interval between update checks thereafter.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Runs the update check on its own thread, forever: once shortly after
+/// startup, then daily.
+///
+/// The `enabled` flag is re-read before every check rather than captured, so
+/// unticking `Settings ▸ Check for updates` stops the next one without a
+/// restart (and re-ticking it resumes on the following cycle). A check that
+/// finds nothing — including one that failed outright, which is
+/// indistinguishable here on purpose — leaves the shared slot alone and says
+/// nothing.
+///
+/// The thread is deliberately never joined: it spends its whole life asleep,
+/// and the process exits out from under it when the user quits.
+fn spawn_update_checker(
+    enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    found: tray::UpdateHandle,
+    wake: mpsc::Sender<Wake>,
+) {
+    std::thread::spawn(move || {
+        let mut wait = FIRST_UPDATE_CHECK_DELAY;
+        loop {
+            std::thread::sleep(wait);
+            wait = UPDATE_CHECK_INTERVAL;
+            if !enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Some(update) = update::check() {
+                // Already showing this exact release: no need to make the tray
+                // re-render for it.
+                if found.get().as_ref() == Some(&update) {
+                    continue;
+                }
+                found.set(Some(update));
+                if wake.send(Wake::UpdateAvailable).is_err() {
+                    // The poll loop is gone: the process is on its way out.
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// What the poll loop should do with a fresh read once a wake reason has been
 /// handled.
 enum PostRead {
@@ -230,9 +284,15 @@ fn run_tray() {
     let interval = settings.interval_handle();
     let notify_prefs = settings.notify_handle();
     let appearance = settings.appearance_handle();
+    let check_updates = settings.check_updates_handle();
+    let updates = settings.update_handle();
     let tz = TimeZone::system();
 
     let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
+
+    // The only network activity in the whole program, and the only thing the
+    // `check_updates` setting gates.
+    spawn_update_checker(check_updates, updates, wake_tx.clone());
 
     // Watch the desktop's light/dark preference regardless of the current
     // style: it costs one thread and one D-Bus connection, and it means
@@ -264,6 +324,9 @@ fn run_tray() {
         }
     };
 
+    // The first cycle's reading becomes the notifier's baseline rather than a
+    // volley of alerts for crossings that happened before this process
+    // existed; see `Notifier`.
     let mut notifier = tray::Notifier::new(&notify_prefs.get().thresholds);
     let mut reset_notifier = tray::ResetNotifier::new();
 
@@ -326,6 +389,14 @@ fn run_tray() {
             // reads, so an empty update is enough to make ksni re-render and
             // push the new pixmaps.
             Ok(Wake::AppearanceChanged) => {
+                handle.update(|_tray| {});
+                continue;
+            }
+            // A newer release was found. The release itself is already in
+            // shared state that `menu` reads, so an empty update is enough to
+            // make the extra row appear. No toast: a version banner is not
+            // worth interrupting anyone for.
+            Ok(Wake::UpdateAvailable) => {
                 handle.update(|_tray| {});
                 continue;
             }

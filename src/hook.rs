@@ -662,8 +662,15 @@ impl StatusReport {
 }
 
 /// The toast shown after the tray menu's `Install hook` item runs.
+///
+/// A re-install says so rather than claiming a fresh one: somebody who clicks
+/// the item because the tray shows no data needs to know that the entry was
+/// *already* there — the wording that promises data "next time Claude Code
+/// refreshes" would send them off waiting for something that is not coming.
+/// This mirrors the CLI's own `Installed` / `Refreshed` distinction.
 pub fn install_toast(result: &io::Result<InstallReport>) -> String {
     match result {
+        Ok(report) if report.refreshed => "Hook already installed — entry refreshed".to_string(),
         Ok(_) => "Hook installed — data appears next time Claude Code refreshes".to_string(),
         Err(err) => format!("Hook install failed: {err}"),
     }
@@ -1186,5 +1193,19 @@ mod tests {
         let err: io::Result<InstallReport> =
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope"));
         assert_eq!(install_toast(&err), "Hook install failed: nope");
+    }
+
+    #[test]
+    fn install_toast_says_so_when_the_hook_was_already_installed() {
+        let temp = TempDir::new("hook-toast-refresh");
+        let first = install_in(temp.path(), &exe()).expect("first install");
+        assert!(!first.refreshed);
+
+        let again = install_in(temp.path(), &exe());
+        assert!(again.as_ref().expect("second install").refreshed);
+        assert_eq!(
+            install_toast(&again),
+            "Hook already installed — entry refreshed"
+        );
     }
 }

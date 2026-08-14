@@ -16,8 +16,9 @@
 use crate::config::{self, Config, IconStyle, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
 use crate::icon::IconAppearance;
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
+use crate::update::Update;
 use jiff::{Timestamp, tz::TimeZone};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,6 +52,13 @@ pub enum Wake {
     /// update so the new icon reaches the tray host immediately; like the
     /// other settings wakes it neither re-reads the cache nor notifies.
     AppearanceChanged,
+    /// A newer release was found by the update checker thread. The release
+    /// itself lives in shared state ([`UpdateHandle`]); this only asks the
+    /// poll loop to push a property update so the extra menu row appears
+    /// without waiting for the next tick. Like the other settings wakes it
+    /// neither re-reads the cache nor notifies — an update is worth a menu
+    /// row, not a toast.
+    UpdateAvailable,
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
@@ -324,13 +332,46 @@ impl UsageAlert {
     }
 }
 
+/// How far a window's `resets_at` may move between two readings and still
+/// count as *the same* window.
+///
+/// Reported reset times are not perfectly stable — they can shift by a few
+/// seconds between reports — and the notifier treats a new window as a reason
+/// to re-arm every threshold. Without a tolerance, a source whose `resets_at`
+/// creeps forward re-fires the same alert on every poll (which is exactly what
+/// a staged `kayfabe.json` used to do, several times a minute). A real
+/// rollover moves the reset time by the whole window length — hours — so a
+/// minute of slack cannot hide one.
+const WINDOW_JITTER_TOLERANCE_SECS: i64 = 60;
+
+/// Whether two `resets_at` readings describe the same window, within
+/// [`WINDOW_JITTER_TOLERANCE_SECS`]. "No reset time" is only the same window
+/// as "no reset time".
+fn same_window(a: Option<Timestamp>, b: Option<Timestamp>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a.as_second() - b.as_second()).abs() <= WINDOW_JITTER_TOLERANCE_SECS,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Pure state machine deciding when a threshold notification should fire.
 ///
 /// Each threshold fires once per crossing. A threshold re-arms when the
-/// session percentage drops back below it, or when `resets_at` changes (a new
-/// 5-hour window began). Readings without a percentage are ignored entirely:
+/// session percentage drops back below it, or when `resets_at` moves by more
+/// than [`WINDOW_JITTER_TOLERANCE_SECS`] (a new 5-hour window began; smaller
+/// movements are jitter, not a rollover). Readings without a percentage are ignored entirely:
 /// they neither fire nor re-arm, so a temporarily unreadable cache cannot
 /// cause a duplicate alert.
+///
+/// The **first reading that carries a percentage is a baseline, not a
+/// crossing**: every threshold at or below it is recorded as delivered and
+/// nothing is emitted. Without that, restarting the tray at 82% would
+/// re-announce the 75% crossing that happened before it started, every time.
+/// "First" means the first *real* percentage, so a tray started before any
+/// usage data exists baselines off the first genuine reading rather than off
+/// the emptiness that preceded it. This is also why no notification state has
+/// to survive a restart: the first reading reconstructs it.
 ///
 /// Fired state is tracked for *every* threshold in [`NOTIFY_THRESHOLDS`],
 /// including the ones currently switched off. That is what makes toggling
@@ -346,6 +387,9 @@ pub struct Notifier {
     fired: Vec<u8>,
     window: Option<Timestamp>,
     seen_window: bool,
+    /// Whether a reading with a real percentage has been seen yet. The first
+    /// one is the baseline (see [`Notifier::evaluate`]) and never alerts.
+    baselined: bool,
 }
 
 impl Notifier {
@@ -356,6 +400,19 @@ impl Notifier {
             fired: Vec::new(),
             window: None,
             seen_window: false,
+            baselined: false,
+        }
+    }
+
+    /// Records every threshold at or below `percent` as already delivered,
+    /// without producing an alert. This is what the first real reading does:
+    /// see [`Notifier::evaluate`].
+    fn baseline(&mut self, percent: f64) {
+        self.baselined = true;
+        for threshold in NOTIFY_THRESHOLDS {
+            if percent >= f64::from(threshold) && !self.fired.contains(&threshold) {
+                self.fired.push(threshold);
+            }
         }
     }
 
@@ -373,10 +430,24 @@ impl Notifier {
         let metric = session?;
         let percent = metric.percent?;
 
-        if !self.seen_window || self.window != metric.resets_at {
+        if !self.seen_window || !same_window(self.window, metric.resets_at) {
             self.seen_window = true;
-            self.window = metric.resets_at;
             self.fired.clear();
+        }
+        // Recorded on every reading, not only on a re-arm: the comparison is
+        // against the *previous* reading, so a reset time that creeps forward
+        // by a second at a time never accumulates its way into a false
+        // rollover.
+        self.window = metric.resets_at;
+
+        // The startup baseline. Usage that was already past a threshold when
+        // the tray started is not a crossing the tray witnessed, and
+        // announcing it would mean every restart above 50% re-plays an old
+        // alert (the reason nothing here needs to persist notification state
+        // across runs: the first reading reconstructs it).
+        if !self.baselined {
+            self.baseline(percent);
+            return None;
         }
 
         // Anything usage has fallen back below is armed again.
@@ -417,7 +488,7 @@ pub struct ResetAlert {
 
 impl ResetAlert {
     pub fn summary(&self) -> String {
-        "Claude usage".to_string()
+        "Claude usage tray".to_string()
     }
 
     pub fn body(&self) -> String {
@@ -557,6 +628,38 @@ impl NotifyHandle {
     }
 }
 
+/// Shared slot holding the newest release the update checker has found, if
+/// any: written by the checker thread, read by the menu on every build.
+///
+/// `None` is both "no check has succeeded" and "you are up to date" — the menu
+/// draws nothing for either, and nothing else in the tray behaves differently
+/// because of it. Poison-tolerant for the same reason as [`NotifyHandle`]: a
+/// version banner is not worth taking the tray down for.
+#[derive(Clone, Default)]
+pub struct UpdateHandle(Arc<Mutex<Option<Update>>>);
+
+impl UpdateHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The release to advertise right now, if any.
+    pub fn get(&self) -> Option<Update> {
+        match self.0.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Records a found release.
+    pub fn set(&self, update: Option<Update>) {
+        match self.0.lock() {
+            Ok(mut slot) => *slot = update,
+            Err(poisoned) => *poisoned.into_inner() = update,
+        }
+    }
+}
+
 /// Resolves the configured style plus the desktop's reported scheme into the
 /// appearance the renderer takes.
 ///
@@ -648,6 +751,11 @@ pub struct Settings {
     notify: NotifyHandle,
     /// Icon appearance, shared with the portal watcher thread too.
     appearance: AppearanceHandle,
+    /// Whether the update checker may run, shared with its thread so that
+    /// switching the setting off stops the *next* check without a restart.
+    check_updates: Arc<AtomicBool>,
+    /// The release the update checker found, if any.
+    update: UpdateHandle,
     /// True when `CLAUDE_TRAY_POLL_SECS` is set to a usable value. The radio
     /// group then still persists the user's choice, but the effective interval
     /// stays the environment's.
@@ -661,11 +769,14 @@ impl Settings {
         let effective = env_secs.unwrap_or(config.refresh_secs);
         let notify = NotifyHandle::new(NotifyPrefs::from_config(&config));
         let appearance = AppearanceHandle::new(config.icon_style);
+        let check_updates = Arc::new(AtomicBool::new(config.check_updates));
         Settings {
             config,
             interval: Arc::new(AtomicU64::new(effective)),
             notify,
             appearance,
+            check_updates,
+            update: UpdateHandle::new(),
             env_locked: env_secs.is_some(),
         }
     }
@@ -684,6 +795,18 @@ impl Settings {
     /// needs nothing from it beyond keeping it alive).
     pub fn appearance_handle(&self) -> AppearanceHandle {
         self.appearance.clone()
+    }
+
+    /// Handle for the update-checker thread; `load` it before every check so
+    /// switching the setting off takes effect without a restart.
+    pub fn check_updates_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.check_updates)
+    }
+
+    /// Handle for the update-checker thread (which writes it) — the menu reads
+    /// the same slot through the tray's own copy.
+    pub fn update_handle(&self) -> UpdateHandle {
+        self.update.clone()
     }
 }
 
@@ -782,6 +905,20 @@ impl UsageTray {
     fn toggle_notify_on_reset(&mut self) {
         self.settings.config.notify_on_reset = !self.settings.config.notify_on_reset;
         self.apply_notify_change();
+    }
+
+    /// Checkbox handler for the update check. Switching it off stops the next
+    /// scheduled check (the checker thread re-reads the shared flag before
+    /// every request) but deliberately leaves an already-found update on the
+    /// menu: hiding a result the user has already been shown would look like a
+    /// bug, and the row is one click away from being acted on.
+    fn toggle_check_updates(&mut self) {
+        let enabled = !self.settings.config.check_updates;
+        self.settings.config.check_updates = enabled;
+        config::save(&self.settings.config);
+        self.settings
+            .check_updates
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// The `Notifications` sub-submenu. `enabled` is the capability probe
@@ -892,6 +1029,19 @@ impl UsageTray {
                 ..Default::default()
             }));
         }
+        submenu.push(ksni::MenuItem::Separator);
+        submenu.push(
+            ksni::menu::CheckmarkItem {
+                label: "Check for updates".into(),
+                // Grayed with the rest of the persisted settings: a toggle
+                // that cannot be written would silently revert on restart.
+                enabled: can_persist,
+                checked: self.settings.config.check_updates,
+                activate: Box::new(|tray: &mut Self| tray.toggle_check_updates()),
+                ..Default::default()
+            }
+            .into(),
+        );
         ksni::menu::SubMenu {
             label: "Settings".into(),
             submenu,
@@ -969,8 +1119,22 @@ impl ksni::Tray for UsageTray {
                 .into(),
             );
         }
+        items.push(ksni::MenuItem::Separator);
+        if let Some(update) = self.settings.update.get() {
+            // Enabled, unlike the three info rows above it: this one does
+            // something. `xdg-open` is spawned and never waited on, so a slow
+            // browser cannot block the D-Bus thread this callback runs on.
+            let url = update.url.clone();
+            items.push(
+                ksni::menu::StandardItem {
+                    label: update.label(),
+                    activate: Box::new(move |_tray: &mut Self| crate::update::open_url(&url)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.extend([
-            ksni::MenuItem::Separator,
             self.settings_menu(),
             ksni::menu::StandardItem {
                 label: "Check for new data".into(),
@@ -1502,6 +1666,7 @@ mod tests {
     #[test]
     fn notifier_fires_at_exactly_the_threshold() {
         let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
         let alert = n
             .evaluate(Some(&metric(Some(50.0), Some(BASE))))
             .expect("50.0 counts as reaching 50");
@@ -1547,17 +1712,101 @@ mod tests {
     }
 
     #[test]
-    fn notifier_first_ever_reading_above_threshold_fires() {
+    fn notifier_treats_small_resets_at_drift_as_the_same_window() {
+        // The live bug: a source whose reset time crept forward a few seconds
+        // per poll re-fired the same alert every tick.
         let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
+        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
+        for tick in 1..=12 {
+            assert_eq!(
+                n.evaluate(Some(&metric(Some(82.0), Some(BASE + tick * 5)))),
+                None,
+                "re-fired after {}s of drift",
+                tick * 5
+            );
+        }
+    }
+
+    #[test]
+    fn notifier_window_tolerance_is_exactly_sixty_seconds() {
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
+        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
+        // Sixty seconds either way is still the same window.
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE + 60)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE - 60)))), None);
+        // A second more is a different window.
         let alert = n
-            .evaluate(Some(&metric(Some(85.0), Some(BASE))))
-            .expect("first reading above 75 fires");
+            .evaluate(Some(&metric(Some(82.0), Some(BASE + 61))))
+            .expect("past the tolerance, this is a rollover");
         assert_eq!(alert.threshold, 75);
+    }
+
+    #[test]
+    fn notifier_treats_appearing_and_disappearing_reset_times_as_new_windows() {
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
+        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
+        // A reading that lost its reset time is not "the same window".
+        assert!(n.evaluate(Some(&metric(Some(82.0), None))).is_some());
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), None))), None);
+        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
+    }
+
+    #[test]
+    fn notifier_baselines_on_the_first_reading_instead_of_firing() {
+        // Restarting the tray at 82% must not re-announce the 75% crossing
+        // that happened before it started.
+        let mut n = all_on();
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
+        // Nor on any later reading that stays inside the same band.
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(89.9), Some(BASE)))), None);
+
+        // A crossing the tray actually witnesses still fires, and only the
+        // one that was crossed.
+        let alert = n
+            .evaluate(Some(&metric(Some(91.0), Some(BASE))))
+            .expect("90 was crossed while watching");
+        assert_eq!(alert.threshold, 90);
+    }
+
+    #[test]
+    fn notifier_baseline_still_re_arms_on_a_drop_and_re_rise() {
+        let mut n = all_on();
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
+        // Below 75 again: that threshold is armed even though its "crossing"
+        // was never announced.
+        assert_eq!(n.evaluate(Some(&metric(Some(70.0), Some(BASE)))), None);
+        let alert = n
+            .evaluate(Some(&metric(Some(76.0), Some(BASE))))
+            .expect("a real crossing after the baseline");
+        assert_eq!(alert.threshold, 75);
+    }
+
+    #[test]
+    fn notifier_baselines_off_the_first_real_percentage_not_off_the_absence() {
+        // A tray started before Claude Code has ever reported: the readings
+        // without a percentage must not consume the baseline, or the first
+        // real one (already at 82%) would fire.
+        let mut n = all_on();
+        assert_eq!(n.evaluate(None), None);
+        assert_eq!(n.evaluate(Some(&metric(None, None))), None);
+        assert_eq!(n.evaluate(Some(&metric(None, Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
+        // ...and from there it behaves normally.
+        let alert = n
+            .evaluate(Some(&metric(Some(99.0), Some(BASE))))
+            .expect("a witnessed crossing");
+        assert_eq!(alert.threshold, 99);
     }
 
     #[test]
     fn notifier_ignores_missing_data_without_rearming() {
         let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
         assert!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))).is_some());
         assert_eq!(n.evaluate(None), None);
         assert_eq!(n.evaluate(Some(&metric(None, Some(BASE)))), None);
@@ -1575,6 +1824,7 @@ mod tests {
     fn notifier_skips_disabled_thresholds_and_fires_the_next_enabled_one() {
         // Only 50 and 100 on: passing 76 must stay silent, 100 must not.
         let mut n = Notifier::new(&[50, 100]);
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
         let alert = n
             .evaluate(Some(&metric(Some(51.0), Some(BASE))))
             .expect("50 is on");
@@ -1609,7 +1859,8 @@ mod tests {
     #[test]
     fn notifier_reenabling_after_a_drop_fires_on_the_next_crossing() {
         let mut n = Notifier::new(&[50, 75]);
-        n.evaluate(Some(&metric(Some(95.0), Some(BASE))));
+        // The startup baseline, which is silent whatever it reads.
+        assert_eq!(n.evaluate(Some(&metric(Some(95.0), Some(BASE)))), None);
         n.set_enabled(&NOTIFY_THRESHOLDS);
         // Usage falls back below 90, then climbs again: now it is a crossing
         // the user has asked to hear about.
@@ -1881,6 +2132,44 @@ mod tests {
             settings.appearance_handle().resolved(),
             IconAppearance::Mono { dark_ui: false }
         );
+    }
+
+    #[test]
+    fn no_update_is_known_until_the_checker_reports_one() {
+        // The menu row's presence is exactly "is there something in the slot",
+        // so that is what this pins.
+        let settings = Settings::new(Config::default(), None);
+        let handle = settings.update_handle();
+        assert_eq!(handle.get(), None);
+
+        let found = Update {
+            version: "0.2.0".into(),
+            url: "https://example.test/releases/tag/v0.2.0".into(),
+        };
+        handle.set(Some(found.clone()));
+        assert_eq!(settings.update.get(), Some(found.clone()));
+        assert_eq!(found.label(), "⬆ Update available: v0.2.0");
+
+        // A later check that finds nothing clears the row again.
+        handle.set(None);
+        assert_eq!(settings.update.get(), None);
+    }
+
+    #[test]
+    fn the_update_check_flag_starts_from_the_config() {
+        for enabled in [true, false] {
+            let settings = Settings::new(
+                Config {
+                    check_updates: enabled,
+                    ..Config::default()
+                },
+                None,
+            );
+            assert_eq!(
+                settings.check_updates_handle().load(Ordering::Relaxed),
+                enabled
+            );
+        }
     }
 
     #[test]

@@ -205,7 +205,7 @@ pub fn read_snapshot_or_kayfabe(
     now: jiff::Timestamp,
 ) -> UsageSnapshot {
     match std::fs::read_to_string(kayfabe_path) {
-        Ok(body) => fake_snapshot(&body, now),
+        Ok(body) => fake_snapshot(&body, cache_mtime(kayfabe_path), now),
         Err(err) if err.kind() == io::ErrorKind::NotFound => read_snapshot(path, now),
         Err(_) => UsageSnapshot::missing(),
     }
@@ -220,8 +220,20 @@ pub fn read_snapshot_or_kayfabe(
 ///   staleness is classified by the same 600 s rule as real cache reads, so
 ///   720 renders as "Stale" ("12 h ago").
 /// * `session_resets_in_minutes` (default 180) and `weekly_resets_in_days`
-///   (default 4) set each metric's `resets_at` relative to `now`. Both accept
-///   negative values (a reset already in the past).
+///   (default 4) set each metric's `resets_at` relative to the fixture file's
+///   **mtime**. Both accept negative values (a reset already in the past).
+///
+/// The two anchors are different on purpose. `written_at` follows `now`, so a
+/// staged `age_minutes` keeps meaning what it says on every poll instead of
+/// drifting into staleness while the demo is being looked at. `resets_at`
+/// follows the file's mtime, so it is *stable* for an unedited file: anchoring
+/// it to `now` moved every reset time forward a few seconds per tick, and the
+/// threshold notifier reads a changed `resets_at` as "a new 5-hour window
+/// began" — which re-armed every threshold and re-fired the alert on every
+/// single poll. An mtime-anchored reset only moves when the fixture is
+/// actually edited, which is exactly when a re-arm is wanted. A file whose
+/// mtime cannot be read falls back to `now`, which is no worse than the old
+/// behaviour.
 ///
 /// Unlike `parse_metric`, this deliberately does **not** zero a percent whose
 /// `resets_at` has already passed: the fake file is authoritative for every
@@ -232,7 +244,11 @@ pub fn read_snapshot_or_kayfabe(
 ///
 /// Missing/unreadable is handled by the caller ([`read_snapshot_or_kayfabe`]);
 /// this function only has to decide `Missing` for unparseable JSON.
-pub fn fake_snapshot(body: &str, now: jiff::Timestamp) -> UsageSnapshot {
+pub fn fake_snapshot(
+    body: &str,
+    mtime: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
+) -> UsageSnapshot {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return UsageSnapshot::missing();
     };
@@ -247,10 +263,12 @@ pub fn fake_snapshot(body: &str, now: jiff::Timestamp) -> UsageSnapshot {
 
     let session_resets_in_minutes = field_i64("session_resets_in_minutes").unwrap_or(180);
     let weekly_resets_in_days = field_i64("weekly_resets_in_days").unwrap_or(4);
+    // The stable anchor: see the note above on why this is not `now`.
+    let anchor = mtime.unwrap_or(now).as_second();
     let session_resets_at =
-        jiff::Timestamp::from_second(now.as_second() + session_resets_in_minutes * 60).ok();
+        jiff::Timestamp::from_second(anchor + session_resets_in_minutes * 60).ok();
     let weekly_resets_at =
-        jiff::Timestamp::from_second(now.as_second() + weekly_resets_in_days * 86400).ok();
+        jiff::Timestamp::from_second(anchor + weekly_resets_in_days * 86400).ok();
 
     UsageSnapshot {
         session: Some(Metric {
@@ -629,7 +647,7 @@ mod tests {
         let now = ts(1_700_000_000);
         let body = r#"{"session": 82, "weekly": 45, "age_minutes": 10,
                         "session_resets_in_minutes": 30, "weekly_resets_in_days": 2}"#;
-        let snap = fake_snapshot(body, now);
+        let snap = fake_snapshot(body, Some(now), now);
 
         assert_eq!(snap.state, SnapshotState::Fresh);
         assert_eq!(snap.written_at, Some(ts(1_700_000_000 - 600)));
@@ -646,7 +664,7 @@ mod tests {
     #[test]
     fn fake_snapshot_empty_object_uses_every_default() {
         let now = ts(1_700_000_000);
-        let snap = fake_snapshot("{}", now);
+        let snap = fake_snapshot("{}", Some(now), now);
 
         assert_eq!(snap.state, SnapshotState::Fresh);
         assert_eq!(snap.written_at, Some(now)); // age_minutes defaults to 0
@@ -663,7 +681,7 @@ mod tests {
     #[test]
     fn fake_snapshot_session_omitted_is_none_percent_but_weekly_still_set() {
         let now = ts(1_700_000_000);
-        let snap = fake_snapshot(r#"{"weekly": 45}"#, now);
+        let snap = fake_snapshot(r#"{"weekly": 45}"#, Some(now), now);
         assert_eq!(snap.session.expect("session present").percent, None);
         assert_eq!(snap.weekly.expect("weekly present").percent, Some(45.0));
     }
@@ -671,7 +689,7 @@ mod tests {
     #[test]
     fn fake_snapshot_weekly_omitted_is_none_percent_but_session_still_set() {
         let now = ts(1_700_000_000);
-        let snap = fake_snapshot(r#"{"session": 82}"#, now);
+        let snap = fake_snapshot(r#"{"session": 82}"#, Some(now), now);
         assert_eq!(snap.session.expect("session present").percent, Some(82.0));
         assert_eq!(snap.weekly.expect("weekly present").percent, None);
     }
@@ -679,10 +697,10 @@ mod tests {
     #[test]
     fn fake_snapshot_age_crossing_stale_boundary() {
         let now = ts(1_700_000_000);
-        let fresh = fake_snapshot(r#"{"age_minutes": 9}"#, now); // 540s < 600s
+        let fresh = fake_snapshot(r#"{"age_minutes": 9}"#, Some(now), now); // 540s < 600s
         assert_eq!(fresh.state, SnapshotState::Fresh);
 
-        let stale = fake_snapshot(r#"{"age_minutes": 12}"#, now); // 720s > 600s
+        let stale = fake_snapshot(r#"{"age_minutes": 12}"#, Some(now), now); // 720s > 600s
         assert_eq!(stale.state, SnapshotState::Stale);
         assert_eq!(stale.written_at, Some(ts(1_700_000_000 - 12 * 60)));
     }
@@ -692,6 +710,7 @@ mod tests {
         let now = ts(1_700_000_000);
         let snap = fake_snapshot(
             r#"{"session": 0, "session_resets_in_minutes": -5, "weekly_resets_in_days": -1}"#,
+            Some(now),
             now,
         );
         // The fake file is authoritative: percent is NOT re-zeroed by the
@@ -704,9 +723,85 @@ mod tests {
     }
 
     #[test]
+    fn fake_snapshot_resets_are_anchored_to_the_mtime_not_to_now() {
+        let mtime = ts(1_700_000_000);
+        let now = ts(1_700_000_000 + 3_600); // an hour of polling later
+        let snap = fake_snapshot(
+            r#"{"session": 82, "session_resets_in_minutes": 30, "weekly_resets_in_days": 2}"#,
+            Some(mtime),
+            now,
+        );
+        assert_eq!(
+            snap.session.expect("session").resets_at,
+            Some(ts(1_700_000_000 + 30 * 60))
+        );
+        assert_eq!(
+            snap.weekly.expect("weekly").resets_at,
+            Some(ts(1_700_000_000 + 2 * 86_400))
+        );
+    }
+
+    #[test]
+    fn fake_snapshot_resets_do_not_move_between_polls_of_an_unedited_file() {
+        // The bug this pins: a `now`-anchored reset time drifted forward on
+        // every poll, which the threshold notifier read as a brand-new 5-hour
+        // window and used to re-fire the same alert every few seconds.
+        let mtime = ts(1_700_000_000);
+        let body = r#"{"session": 82}"#;
+        let first = fake_snapshot(body, Some(mtime), ts(1_700_000_100));
+        for tick in [1, 5, 60, 3_600] {
+            let later = fake_snapshot(body, Some(mtime), ts(1_700_000_100 + tick));
+            assert_eq!(
+                first.session.as_ref().expect("session").resets_at,
+                later.session.as_ref().expect("session").resets_at,
+                "session reset moved after {tick}s"
+            );
+            assert_eq!(
+                first.weekly.as_ref().expect("weekly").resets_at,
+                later.weekly.as_ref().expect("weekly").resets_at,
+                "weekly reset moved after {tick}s"
+            );
+        }
+    }
+
+    #[test]
+    fn fake_snapshot_without_an_mtime_falls_back_to_now() {
+        let now = ts(1_700_000_000);
+        let snap = fake_snapshot(r#"{"session_resets_in_minutes": 30}"#, None, now);
+        assert_eq!(
+            snap.session.expect("session").resets_at,
+            Some(ts(1_700_000_000 + 30 * 60))
+        );
+    }
+
+    #[test]
+    fn read_snapshot_or_kayfabe_takes_the_reset_anchor_from_the_file_on_disk() {
+        // End to end through the real stat, not just the pure helper.
+        let temp = TempDir::new("kayfabe-anchor");
+        let cache_path = temp.path().join(CACHE_FILE_NAME); // never created
+        let kayfabe_path = write_with_mtime(
+            temp.path(),
+            "kayfabe.json",
+            r#"{"session": 82, "session_resets_in_minutes": 30}"#,
+            1_700_000_000,
+        );
+
+        let first = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_005));
+        let later = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_305));
+        assert_eq!(
+            first.session.expect("session").resets_at,
+            Some(ts(1_700_000_000 + 30 * 60))
+        );
+        assert_eq!(
+            later.session.expect("session").resets_at,
+            Some(ts(1_700_000_000 + 30 * 60))
+        );
+    }
+
+    #[test]
     fn fake_snapshot_garbage_json_is_missing() {
         let now = ts(1_700_000_000);
-        let snap = fake_snapshot("not json", now);
+        let snap = fake_snapshot("not json", Some(now), now);
         assert_eq!(snap.state, SnapshotState::Missing);
         assert!(snap.session.is_none());
         assert!(snap.weekly.is_none());
