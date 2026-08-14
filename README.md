@@ -13,7 +13,8 @@ live in the menu itself), no multi-account profiles.
 Claude Code statusline JSON (stdin, includes rate_limits since v2.1.80)
   -> claude-usage-tray statusline  (this same binary, configured as your
      statusLine.command) writes that JSON verbatim to
-     ~/.claude/usage-tray-statusline.json (atomic: temp file + rename)
+     ~/.claude/usage-tray-statusline.json (atomic: temp file + rename),
+     for repaints carrying usage data
   -> claude-usage-tray reads that cache file every few seconds and
      renders the tray icon, tooltip, and menu from it
 ```
@@ -24,9 +25,13 @@ both the transport and the parser.
 **Cache contract (v2).** The cache file at
 `${CLAUDE_CONFIG_DIR:-~/.claude}/usage-tray-statusline.json` is a byte-for-byte
 copy of the JSON Claude Code sends its statusline command on stdin — the whole
-document, `model`, `workspace`, `cost` and all. The tray reads
-`rate_limits.five_hour` and `rate_limits.seven_day`
-(`used_percentage`, `resets_at`) out of it and ignores everything else.
+document, `model`, `workspace`, `cost` and all — for repaints that carry
+usage data. The tray reads `rate_limits.five_hour` and `rate_limits.seven_day`
+(`used_percentage`, `resets_at`) out of it and ignores everything else. A
+repaint whose `rate_limits` is absent or null does not overwrite a cache that
+already has real data (see [below](#the-statusline-subcommand)), so a
+session's pre-first-turn statusline paint can't clobber the previous
+session's numbers.
 
 There is no timestamp *inside* the file: **freshness comes from the file's
 mtime**. Older than 10 minutes and the tray treats the data as stale (dimmed
@@ -285,12 +290,19 @@ You can also wire it up by hand — this is all `hook install` does:
 
 Drop the `--exec '...'` part if you have no statusline command of your own.
 
-The subcommand is deliberately boring: it reads stdin to EOF, writes those
-bytes verbatim to the cache file, and then, with `--exec`, runs your command
-via `sh -c` with the same bytes on stdin and lets its stdout through
-unmodified. **It always exits 0 and never prints anything of its own**, even
-if the cache write fails or your command is missing or fails — a usage tray
-must not be able to break your statusline.
+The subcommand is deliberately boring: it reads stdin to EOF, and then, with
+`--exec`, runs your command via `sh -c` with the same bytes on stdin and lets
+its stdout through unmodified. **It always exits 0 and never prints anything
+of its own**, even if the cache write fails or your command is missing or
+fails — a usage tray must not be able to break your statusline.
+
+Repaints carrying usage data are written to the cache verbatim. One
+exception: a freshly started session paints its statusline once before its
+first turn, with `rate_limits` absent, and that repaint is skipped rather
+than clobbering a cache that already has real usage data — otherwise the
+tray would flash "no data" at the start of every session. If there is no
+cache yet, or the existing cache is equally empty, it writes anyway, so the
+first-run experience is unaffected.
 
 ### Upgrading from the old shell hook
 

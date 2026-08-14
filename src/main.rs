@@ -124,7 +124,11 @@ fn run_statusline(args: &[String]) -> i32 {
     // A read error leaves whatever arrived before it; there is nothing better
     // to do with it than carry on.
     let _ = std::io::stdin().read_to_end(&mut input);
-    let _ = source::write_cache(&source::default_cache_path(), &input);
+    let cache_path = source::default_cache_path();
+    let existing = std::fs::read(&cache_path).ok();
+    if source::should_write_cache(&input, existing.as_deref()) {
+        let _ = source::write_cache(&cache_path, &input);
+    }
 
     if let Some(command) = exec {
         // stdout is inherited rather than piped and copied, so the child's

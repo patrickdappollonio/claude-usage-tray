@@ -117,6 +117,39 @@ pub fn write_cache(path: &Path, body: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Whether a document (raw statusline bytes) has a non-null `rate_limits`
+/// key. Malformed JSON and an explicit `null` both count as "lacks it".
+fn has_rate_limits(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    matches!(value.get("rate_limits"), Some(v) if !v.is_null())
+}
+
+/// Decides whether the `statusline` subcommand should overwrite the cache
+/// file with the incoming statusline document.
+///
+/// A freshly started interactive session paints its statusline before its
+/// first turn, with `rate_limits` absent or null. Writing that payload
+/// verbatim would clobber a previous cache that *did* have real usage data,
+/// and the tray would show "no data" until the session's first real turn.
+///
+/// So: skip the write only when the incoming payload lacks `rate_limits` and
+/// an existing cache is present and *does* have it — that's the one case
+/// where writing loses information. Every other case writes: there's no
+/// cache yet, the incoming payload carries real data, or the existing cache
+/// was equally empty (an empty-but-present cache is still better than none
+/// for first-run UX, and mtime freshness should still tick forward).
+pub fn should_write_cache(incoming: &[u8], existing: Option<&[u8]>) -> bool {
+    if has_rate_limits(incoming) {
+        return true;
+    }
+    match existing {
+        Some(existing) => !has_rate_limits(existing),
+        None => true,
+    }
+}
+
 /// The cache file's mtime, or `None` when it cannot be read.
 pub fn cache_mtime(path: &Path) -> Option<jiff::Timestamp> {
     let modified = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
@@ -433,6 +466,54 @@ mod tests {
             path,
             std::path::PathBuf::from("/tmp/custom-claude-dir/usage-tray-statusline.json")
         );
+    }
+
+    #[test]
+    fn should_write_cache_writes_when_no_existing_cache() {
+        assert!(should_write_cache(b"{}", None));
+    }
+
+    #[test]
+    fn should_write_cache_writes_when_incoming_has_rate_limits() {
+        let incoming = br#"{"rate_limits":{"five_hour":{"used_percentage":3}}}"#;
+        let existing = br#"{"rate_limits":{"five_hour":{"used_percentage":1}}}"#;
+        assert!(should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_skips_when_incoming_lacks_it_but_existing_has_it() {
+        let incoming = br#"{"model":"opus"}"#;
+        let existing = br#"{"rate_limits":{"five_hour":{"used_percentage":1}}}"#;
+        assert!(!should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_writes_when_both_lack_it() {
+        let incoming = br#"{"model":"opus"}"#;
+        let existing = br#"{"model":"sonnet"}"#;
+        assert!(should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_skips_when_incoming_malformed_and_existing_good() {
+        let incoming = b"not json";
+        let existing = br#"{"rate_limits":{"five_hour":{"used_percentage":1}}}"#;
+        assert!(!should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_writes_when_existing_malformed_and_incoming_good() {
+        let incoming = br#"{"rate_limits":{"five_hour":{"used_percentage":3}}}"#;
+        let existing = b"not json";
+        assert!(should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_treats_null_rate_limits_as_absent() {
+        let incoming = br#"{"rate_limits":null}"#;
+        let existing = br#"{"rate_limits":{"five_hour":{"used_percentage":1}}}"#;
+        assert!(!should_write_cache(incoming, Some(existing)));
+        assert!(should_write_cache(incoming, None));
     }
 
     #[test]
