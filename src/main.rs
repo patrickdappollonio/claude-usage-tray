@@ -1,5 +1,6 @@
 //! Claude usage tray: reads the statusline usage cache on a timer and renders
-//! it as a StatusNotifierItem tray icon. No credentials, no writes outside its
+//! it as a tray icon (a StatusNotifierItem on Linux, a menu bar `NSStatusItem`
+//! on macOS). No credentials, no writes outside its
 //! own config, the Claude config directory, and autostart files, and no
 //! network beyond the optional once-daily GitHub release check in
 //! [`update`] — nothing about the user's usage ever leaves the machine.
@@ -11,16 +12,12 @@
 //! Threading (tray mode): the platform backend decides which thread the poll
 //! loop gets ([`platform::run`] takes it as a closure precisely so that
 //! neither side has to assume). On Linux the tray service runs on its own
-//! thread and the main thread *is* the poll loop, waiting on an mpsc channel
+//! thread and the main thread *is* the poll loop; on macOS it is the other way
+//! round, because AppKit owns the main thread. Either way the loop waits on an
+//! mpsc channel
 //! with a timeout so that "Check for new data", left-click (a worded usage
 //! summary), "Quit", "Install hook", and interval changes take effect
 //! immediately instead of on the next tick.
-
-// The macOS backend is still a stub (`src/platform/macos/`), so it never calls
-// into the portable core and almost everything below `platform` looks unused
-// when type-checking for Darwin. Expected until the real backend lands; the
-// Linux build is unaffected.
-#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 mod config;
 mod hook;

@@ -9,17 +9,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PLATFORM_TARGETS = [
+  { platform: "darwin", arch: "x64", key: "darwin-x64" },
+  { platform: "darwin", arch: "arm64", key: "darwin-arm64" },
   { platform: "linux", arch: "x64", key: "linux-x64" },
   { platform: "linux", arch: "arm64", key: "linux-arm64" }
 ];
-
-if (process.platform !== "linux") {
-  throw new Error(
-    `claude-usage-tray is a Linux-only application; it cannot run on ${process.platform}. ` +
-      "It draws a StatusNotifierItem tray icon, which is a freedesktop protocol. " +
-      "See https://github.com/patrickdappollonio/claude-usage-tray/issues"
-  );
-}
 
 const current = PLATFORM_TARGETS.find(
   (target) => target.platform === process.platform && target.arch === process.arch

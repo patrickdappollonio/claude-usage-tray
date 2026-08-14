@@ -49,6 +49,19 @@ mod imp;
 #[path = "macos/mod.rs"]
 mod imp;
 
+/// The macOS LaunchAgent module, compiled (but never called) on other
+/// platforms during `cargo test`.
+///
+/// Everything in it except the two `dirs`-based path lookups is portable
+/// filesystem code — the plist body, the atomic write, the "is the entry
+/// there" check — and that is exactly the half worth testing. Compiling it
+/// here means the Linux test run covers it too, so a broken plist is caught
+/// before the macOS job ever starts.
+#[cfg(all(test, not(target_os = "macos")))]
+#[allow(dead_code)]
+#[path = "macos/autostart.rs"]
+mod macos_autostart;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
     "no tray backend for this platform: add one under src/platform/ and wire it up in \

@@ -36,6 +36,26 @@ pub struct IconImage {
     pub data: Vec<u8>,
 }
 
+impl IconImage {
+    /// The same pixels as straight (non-premultiplied) RGBA, which is the
+    /// layout every non-freedesktop tray API asks for —
+    /// `tray_icon::Icon::from_rgba` on macOS, in particular.
+    ///
+    /// Only the byte order changes: [`data`](IconImage::data) is already
+    /// un-premultiplied (see `premultiplied_rgba_to_argb_be`), so this rotates
+    /// `A R G B` into `R G B A` and nothing else. Kept here rather than in the
+    /// backend so the pixel layout — the one thing both trays have to agree on
+    /// — stays testable without a desktop.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.data.len());
+        for px in self.data.chunks_exact(4) {
+            out.extend_from_slice(&[px[1], px[2], px[3], px[0]]);
+        }
+        out
+    }
+}
+
 /// Dim neutral gray used for the background ring and the `Missing` state.
 const GRAY: (u8, u8, u8) = (128, 128, 128);
 
@@ -943,5 +963,52 @@ mod tests {
             );
         }
     }
-}
 
+    // ---- the RGBA view --------------------------------------------------
+    //
+    // The macOS backend feeds `to_rgba` straight into
+    // `tray_icon::Icon::from_rgba`, which rejects anything whose byte count
+    // does not match the dimensions — and would silently draw the wrong
+    // colors if the channels were rotated the wrong way.
+
+    #[test]
+    fn to_rgba_rotates_argb_into_rgba() {
+        let icon = IconImage {
+            width: 1,
+            height: 2,
+            data: vec![0xAA, 0x11, 0x22, 0x33, 0x00, 0x44, 0x55, 0x66],
+        };
+        assert_eq!(
+            icon.to_rgba(),
+            vec![0x11, 0x22, 0x33, 0xAA, 0x44, 0x55, 0x66, 0x00]
+        );
+    }
+
+    #[test]
+    fn to_rgba_keeps_one_pixel_per_four_bytes() {
+        for icon in render_icons(
+            &snapshot(SnapshotState::Fresh, Some(42.0), Some(17.0)),
+            IconAppearance::Color,
+        ) {
+            let rgba = icon.to_rgba();
+            assert_eq!(rgba.len(), (icon.width * icon.height * 4) as usize);
+            assert_eq!(rgba.len(), icon.data.len());
+        }
+    }
+
+    /// The alpha channel is what macOS tints a template image through, so a
+    /// monochrome render must still be transparent everywhere it does not
+    /// draw, and opaque where it does.
+    #[test]
+    fn to_rgba_preserves_transparency_for_template_icons() {
+        let icons = render_icons(
+            &snapshot(SnapshotState::Fresh, Some(50.0), Some(50.0)),
+            IconAppearance::Mono { dark_ui: false },
+        );
+        let icon = &icons[2];
+        let rgba = icon.to_rgba();
+        let alphas: Vec<u8> = rgba.chunks_exact(4).map(|px| px[3]).collect();
+        assert!(alphas.contains(&0), "nothing is transparent");
+        assert!(alphas.iter().any(|&a| a > 200), "nothing is drawn");
+    }
+}

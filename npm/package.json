@@ -1,7 +1,7 @@
 {
   "name": "@patrickdappollonio/claude-usage-tray",
   "version": "0.0.0-dev",
-  "description": "Linux tray icon showing Claude Code 5-hour and weekly usage.",
+  "description": "Tray icon showing Claude Code 5-hour and weekly usage, for Linux and macOS.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -23,7 +23,9 @@
     "usage",
     "tray",
     "statusnotifieritem",
+    "menubar",
     "linux",
+    "macos",
     "cli"
   ],
   "engines": {

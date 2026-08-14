@@ -14,7 +14,7 @@ env:
 
 jobs:
   check:
-    name: Build, test and lint
+    name: Build, test and lint (linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +31,35 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  check-macos:
+    name: Build, test and lint (macos)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Also no system dependencies: the macOS backend is AppKit through
+      # tray-icon/muda/tao, all of which bind the system frameworks that ship
+      # with the Xcode command line tools the runner already has.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+
+      - name: Build
+        run: cargo build --locked
+
+      # The portable core's tests are the same ones the Linux job runs; what
+      # this adds is that they run against the macOS backend's `platform`
+      # module, including the LaunchAgent tests.
       - name: Test
         run: cargo test --locked
 

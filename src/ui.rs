@@ -882,6 +882,18 @@ impl TrayCore {
         crate::icon::render_icons(&self.snapshot, self.settings.appearance.resolved())
     }
 
+    /// The appearance [`icons`](TrayCore::icons) would render with right now.
+    ///
+    /// Backends do not choose an appearance — this is the resolved user
+    /// setting — but a backend may need to *know* which one it is: the macOS
+    /// one marks the status item as an AppKit template image (so the system
+    /// tints it for the menu bar) only when the user asked for monochrome,
+    /// because a template image throws the severity colors away.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn appearance(&self) -> crate::icon::IconAppearance {
+        self.settings.appearance.resolved()
+    }
+
     /// The tooltip body: the same three lines the menu opens with.
     pub fn tooltip(&self) -> String {
         tooltip_text(&self.snapshot, Timestamp::now(), &self.tz)
@@ -2108,6 +2120,29 @@ mod tests {
             settings.appearance_handle().resolved(),
             IconAppearance::Mono { dark_ui: false }
         );
+    }
+
+    /// The macOS backend asks the core which appearance it is about to render
+    /// in, and turns the answer into "is this an AppKit template image". If
+    /// this ever stopped tracking the setting, the menu bar icon would either
+    /// lose its colors or stop following the system theme.
+    #[test]
+    fn the_core_reports_the_appearance_it_renders_with() {
+        for (style, expected) in [
+            (IconStyle::Color, IconAppearance::Color),
+            (IconStyle::MonoDark, IconAppearance::Mono { dark_ui: true }),
+            (IconStyle::MonoLight, IconAppearance::Mono { dark_ui: false }),
+        ] {
+            let (core, _rx) = core_for(
+                timeless(SnapshotState::Fresh),
+                Config {
+                    icon_style: style,
+                    ..Config::default()
+                },
+                None,
+            );
+            assert_eq!(core.appearance(), expected, "{style:?}");
+        }
     }
 
     #[test]

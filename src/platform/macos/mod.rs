@@ -1,80 +1,221 @@
-//! The macOS backend — **a stub**. It exists so the crate type-checks for
-//! Darwin (`cargo check --target aarch64-apple-darwin`) while the real
-//! implementation is written; running the tray on macOS today fails cleanly
-//! with "macOS backend not implemented yet" rather than doing something worse.
+//! The macOS backend: an `NSStatusItem` in the menu bar (`tray-icon`), its
+//! `NSMenu` (`muda`, which `tray-icon` re-exports as `tray_icon::menu`), a
+//! LaunchAgent for autostart, and Notification Center toasts (`notify-rust`).
 //!
-//! # What the real implementation has to do
+//! # Which thread everything runs on
 //!
-//! * **[`run`]** — the inversion the contract in [`crate::platform`] exists
-//!   for. `NSApplication` owns the main thread and does not return until the
-//!   app quits, so this backend must build the status item, spawn `poll` on a
-//!   worker thread with a [`TrayHandle`] that can reach the status item, and
-//!   *then* run the event loop on the thread `run` was called on. The Linux
-//!   backend does the opposite (the poll loop keeps the calling thread) and
-//!   nothing above [`crate::platform`] can tell the difference.
-//! * **[`TrayHandle`]** — every method is called from the poll-loop thread, so
-//!   each one has to hop to the main thread before touching AppKit
-//!   (`dispatch_async` onto the main queue, or the event loop's own proxy).
-//!   `set_snapshot` re-renders the icon from
-//!   [`TrayCore::icons`](crate::ui::TrayCore::icons) — the pixmaps are ARGB32
-//!   big-endian, so they need swizzling into an `NSImage` — plus a menu rebuild
-//!   from [`TrayCore::menu`](crate::ui::TrayCore::menu); `refresh` is the same
-//!   without the snapshot; `is_closed` reports whether the app is terminating.
-//! * **The menu** — map [`crate::menu::MenuRow`] onto `NSMenu`/`muda` exactly
-//!   as `platform/linux/tray.rs` maps it onto `ksni`, and route clicks back
-//!   through [`TrayCore::activate`](crate::ui::TrayCore::activate) and
-//!   [`TrayCore::select`](crate::ui::TrayCore::select). No wording, ordering or
-//!   enabled-state logic belongs here: it is all in [`crate::ui`] already.
-//! * **[`notify`]** — `notify-rust` supports macOS, but its ObjC dependency
-//!   cannot be built from Linux, so the dependency is currently gated to the
-//!   Linux target in `Cargo.toml`. Re-add it under
-//!   `[target.'cfg(target_os = "macos")'.dependencies]` (or use
-//!   `UNUserNotificationCenter` directly) when building on a Mac. Note that
-//!   `notify-rust`'s `urgency`/`hint` builders are Linux-only, which is exactly
-//!   why [`Toast`] is a portable struct rather than a notify-rust type.
-//! * **[`watch_appearance`]** — observe `NSApp.effectiveAppearance` (KVO on
-//!   `AppleInterfaceStyle`) and report `true` for the dark aqua appearance. Not
-//!   calling `on_change` at all is a valid implementation: the dark-assuming
-//!   default then stands.
-//! * **[`autostart`]** — a `~/Library/LaunchAgents` LaunchAgent; see that
-//!   module.
+//! This is the inversion the contract in [`crate::platform`] exists for.
+//! AppKit owns the main thread: `tray-icon` documents that "an event loop must
+//! be running on the main thread so you also need to create the tray icon on
+//! the main thread", and that the icon must be created once the loop is
+//! *already running* rather than merely built. So [`run`] keeps the thread it
+//! was called on for the event loop, creates the status item on the first
+//! `StartCause::Init`, and spawns the poll loop onto a worker thread from
+//! there. The Linux backend does the opposite, and nothing above
+//! [`crate::platform`] can tell the difference.
+//!
+//! Everything that touches the status item therefore has to get back to the
+//! main thread first. [`TrayHandle`] does that by posting a [`UserEvent`]
+//! through the event loop's proxy — the same route `tray-icon`'s own
+//! `tao`/`winit` examples use for tray and menu events — and the loop applies
+//! it. Nothing but the proxy crosses the thread boundary, which is what makes
+//! the `muda` menu (which is `Rc`-based and main-thread-only) safe to keep.
+//!
+//! The structure follows `tray-icon`'s `examples/tao.rs` closely, including
+//! the `CFRunLoop::wake_up` after creating the icon, which their example needs
+//! to make the icon appear at all.
+//!
+//! # What is deliberately not here
+//!
+//! * **No `NSApplication` delegate of our own.** `tao` already owns one, and
+//!   handing `tray-icon` a running loop is all the status item needs.
+//! * **No appearance watcher.** See [`watch_appearance`]: monochrome icons are
+//!   AppKit template images, which the system re-tints for the menu bar by
+//!   itself.
 
 pub mod autostart;
+mod tray;
 
 use crate::platform::{BackendError, Toast};
 use crate::source::UsageSnapshot;
 use crate::ui::TrayCore;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+use tray_icon::menu::MenuEvent;
+use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
-/// Placeholder for the handle the real backend will hand the poll loop. Never
-/// constructed today: [`run`] fails before a tray exists.
-pub struct TrayHandle;
+/// Everything the event loop can be asked to do, from wherever it is asked.
+///
+/// `tray-icon` and `muda` deliver their events through global handlers that
+/// may fire on any thread, and the poll loop lives on a worker thread, so both
+/// arrive the same way: as one of these, handled on the main thread.
+enum UserEvent {
+    /// A click on the status item.
+    Tray(TrayIconEvent),
+    /// A click on a menu row.
+    Menu(MenuEvent),
+    /// The poll loop read a new snapshot.
+    Snapshot(Box<UsageSnapshot>),
+    /// The poll loop wants a repaint from shared state.
+    Refresh,
+    /// The poll loop returned, so the program is over.
+    PollFinished,
+}
+
+/// The poll loop's remote control over the running tray: a proxy back to the
+/// main thread's event loop. Every method is a message, never a direct AppKit
+/// call, because this type only ever exists on the poll-loop thread.
+pub struct TrayHandle {
+    proxy: EventLoopProxy<UserEvent>,
+    /// Set once the event loop has stopped accepting events, which is the only
+    /// way this side finds out that the tray is gone.
+    closed: Arc<AtomicBool>,
+}
 
 impl TrayHandle {
-    /// Publishes a new snapshot (icon, tooltip and menu).
-    pub fn set_snapshot(&self, _snapshot: UsageSnapshot) {}
+    fn send(&self, event: UserEvent) {
+        if self.proxy.send_event(event).is_err() {
+            self.closed.store(true, Ordering::Relaxed);
+        }
+    }
 
-    /// Re-publishes from shared state without a new snapshot.
-    pub fn refresh(&self) {}
+    /// Publishes a new snapshot: new icon, new tooltip, new menu labels.
+    pub fn set_snapshot(&self, snapshot: UsageSnapshot) {
+        self.send(UserEvent::Snapshot(Box::new(snapshot)));
+    }
 
-    /// Whether the tray is gone and the poll loop should stop.
+    /// Re-publishes without changing the snapshot, for the things the tray
+    /// reads out of shared state on every render: the resolved icon appearance
+    /// and the update-available row.
+    pub fn refresh(&self) {
+        self.send(UserEvent::Refresh);
+    }
+
+    /// Whether the event loop is gone and the poll loop should stop.
     pub fn is_closed(&self) -> bool {
-        true
+        self.closed.load(Ordering::Relaxed)
     }
 }
 
-/// Fails: there is no macOS tray yet.
-pub fn run<F>(_core: TrayCore, _poll: F) -> Result<(), BackendError>
+/// Runs the event loop on this thread, with the poll loop on a worker thread.
+///
+/// Never returns: `tao`'s `run` diverges, exiting the process when the loop
+/// stops. That is also why a status item that fails to build reports itself
+/// here rather than through the [`BackendError`] in the signature — by the
+/// time it can be built, `run`'s caller is no longer reachable. The message is
+/// worded and prefixed exactly as `main.rs` would have printed it.
+pub fn run<F>(core: TrayCore, poll: F) -> Result<(), BackendError>
 where
     F: FnOnce(TrayHandle) + Send + 'static,
 {
-    Err(BackendError::new("macOS backend not implemented yet"))
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // A menu bar app, not an application: no Dock icon, no app menu, and no
+    // stealing focus from whatever the user is doing when the tray starts.
+    event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    event_loop.set_dock_visibility(false);
+    event_loop.set_activate_ignoring_other_apps(false);
+
+    // Forward the two global event sources into the loop, so that everything
+    // is handled in one place on the main thread.
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        let _ = proxy.send_event(UserEvent::Tray(event));
+    }));
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        let _ = proxy.send_event(UserEvent::Menu(event));
+    }));
+
+    let proxy = event_loop.create_proxy();
+    let closed = Arc::new(AtomicBool::new(false));
+    let mut tray = tray::MacTray::new(core);
+    // Taken on the first `Init`, which is the only place it can be started:
+    // the poll loop must not run before there is a status item to push to.
+    let mut poll = Some(poll);
+
+    event_loop.run(move |event, _target, control_flow| {
+        // Nothing here polls: every wake is an event.
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                // Created here, with the loop already running, rather than
+                // before it: creating it earlier breaks over fullscreen apps
+                // (tauri-apps/tray-icon#90), which is why the crate's own
+                // examples do exactly this.
+                if let Err(err) = tray.create() {
+                    eprintln!("claude-usage-tray: could not create the menu bar icon: {err}");
+                    std::process::exit(1);
+                }
+                // The icon does not actually appear until the run loop turns
+                // over once more; `tray-icon`'s tao example does the same.
+                if let Some(run_loop) = objc2_core_foundation::CFRunLoop::main() {
+                    objc2_core_foundation::CFRunLoop::wake_up(&run_loop);
+                }
+
+                if let Some(poll) = poll.take() {
+                    let handle = TrayHandle {
+                        proxy: proxy.clone(),
+                        closed: Arc::clone(&closed),
+                    };
+                    let done = proxy.clone();
+                    std::thread::spawn(move || {
+                        poll(handle);
+                        // The poll loop only returns when the program is over
+                        // (the `Quit` row, or a dead channel), so this is what
+                        // stops the event loop.
+                        let _ = done.send_event(UserEvent::PollFinished);
+                    });
+                }
+            }
+
+            // Left click: a worded summary of current usage, matching the
+            // Linux tray. Filtered to the button release so the press does not
+            // report it a second time; right clicks open the menu and are
+            // handled by AppKit, not here.
+            Event::UserEvent(UserEvent::Tray(TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            })) => tray.on_left_click(),
+
+            Event::UserEvent(UserEvent::Menu(event)) => tray.on_menu_event(event.id.as_ref()),
+            Event::UserEvent(UserEvent::Snapshot(snapshot)) => tray.set_snapshot(*snapshot),
+            Event::UserEvent(UserEvent::Refresh) => tray.refresh(),
+            Event::UserEvent(UserEvent::PollFinished) => *control_flow = ControlFlow::Exit,
+
+            _ => {}
+        }
+    })
 }
 
-/// No-op until a notification backend is wired up; see the module docs.
-pub fn notify(_toast: &Toast) {}
+/// Posts a Notification Center notification.
+///
+/// [`Toast::urgency`] and [`Toast::transient`] are dropped: they are
+/// freedesktop concepts with no Notification Center equivalent, and
+/// `notify-rust` only compiles those builders on Linux. Failures (an
+/// unbundled binary whose notifications the user has denied, most likely) are
+/// ignored on purpose: a missing notification must never take the tray with
+/// it.
+pub fn notify(toast: &Toast) {
+    let _ = notify_rust::Notification::new()
+        .summary(&toast.summary)
+        .body(&toast.body)
+        .show();
+}
 
-/// No-op: the dark-assuming default in [`crate::ui::AppearanceHandle`] stands
-/// until `NSApp.effectiveAppearance` is observed here.
+/// Does nothing, on purpose.
+///
+/// On Linux this watches the desktop portal so a monochrome icon can be
+/// re-rendered when the user switches theme. macOS needs no such thing: a
+/// monochrome icon is published as an AppKit *template* image (see
+/// `tray::MacTray::icon_image`), which the system tints for the menu bar
+/// itself, in both appearances, without the icon being re-rendered at all.
+/// Never calling `on_change` leaves the dark-assuming default standing, and
+/// nothing reads it.
 pub fn watch_appearance<F>(_on_change: F)
 where
     F: Fn(bool) + Send + 'static,

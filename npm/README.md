@@ -1,12 +1,11 @@
 # @patrickdappollonio/claude-usage-tray
 
-A minimal **Linux** tray icon (StatusNotifierItem) that shows your Claude Code
-subscription usage: the 5-hour session percentage and the 7-day weekly
-percentage, with reset times.
+A minimal tray icon that shows your Claude Code subscription usage: the 5-hour
+session percentage and the 7-day weekly percentage, with reset times. It lives
+in the Linux system tray (StatusNotifierItem) and in the macOS menu bar.
 
-This package ships prebuilt, statically linked binaries for `linux-x64` and
-`linux-arm64`. It is **Linux only** — the tray icon uses the freedesktop
-StatusNotifierItem protocol, so there is nothing to run on macOS or Windows.
+This package ships prebuilt binaries for `linux-x64`, `linux-arm64`,
+`darwin-x64` and `darwin-arm64`. The Linux ones are statically linked.
 
 ## Usage
 
@@ -33,6 +32,8 @@ re-run it after upgrading the package.
   or MATE work out of the box. GNOME needs the
   [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
   extension.
+- Or macOS 12 or newer, where the icon goes in the menu bar. Notifications work
+  but are basic, because the binary is not shipped inside an app bundle.
 - Claude Code >= 2.1.80 (the version that added `rate_limits` to the statusline
   JSON), on a Pro/Max subscription account.
 

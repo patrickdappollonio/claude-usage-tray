@@ -2,7 +2,7 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/patrickdappollonio/claude-usage-tray)](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest) [![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/patrickdappollonio/claude-usage-tray/total)](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest) [![NPM Version](https://img.shields.io/npm/v/%40patrickdappollonio%2Fclaude-usage-tray)](https://www.npmjs.com/package/@patrickdappollonio/claude-usage-tray) [![CI](https://img.shields.io/github/actions/workflow/status/patrickdappollonio/claude-usage-tray/ci.yml?branch=main&label=ci)](https://github.com/patrickdappollonio/claude-usage-tray/actions/workflows/ci.yml) [![GitHub License](https://img.shields.io/github/license/patrickdappollonio/claude-usage-tray)](LICENSE)
 
-Know how much Claude Code you have left, without asking. **claude-usage-tray** puts a tiny gauge in your Linux system tray showing your 5-hour session usage and your weekly usage, with the times they reset.
+Know how much Claude Code you have left, without asking. **claude-usage-tray** puts a tiny gauge in your Linux system tray or your macOS menu bar showing your 5-hour session usage and your weekly usage, with the times they reset.
 
 No window. No dashboard. Just an icon that changes color as you get closer to the limit, and a menu when you want the details.
 
@@ -28,9 +28,9 @@ The only network request the program can make is an optional update check, once 
 
 ### Install
 
-Every release ships statically linked binaries for x86_64 and arm64. No runtime dependencies, no glibc version to match.
+Every release ships binaries for x86_64 and arm64, on both Linux and macOS. The Linux ones are statically linked: no runtime dependencies, no glibc version to match.
 
-**Homebrew (Linuxbrew):**
+**Homebrew (macOS and Linuxbrew):**
 
 ```bash
 brew install patrickdappollonio/tap/claude-usage-tray
@@ -42,7 +42,7 @@ brew install patrickdappollonio/tap/claude-usage-tray
 npm install -g @patrickdappollonio/claude-usage-tray
 ```
 
-The npm package bundles the same prebuilt binaries and is Linux only. For a one-off run, use `npx -y @patrickdappollonio/claude-usage-tray`.
+The npm package bundles the same prebuilt binaries for Linux and macOS. For a one-off run, use `npx -y @patrickdappollonio/claude-usage-tray`.
 
 **Debian, Ubuntu and derivatives:**
 
@@ -72,13 +72,24 @@ curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest
 sudo apk add --allow-untrusted claude-usage-tray_<version>_linux_<arch>.apk
 ```
 
-**Plain tarball:**
+**Plain tarball (Linux):**
 
 ```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.tar.gz
 tar xzf claude-usage-tray_<version>_linux_<arch>.tar.gz
 sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
 ```
+
+**Plain tarball (macOS):**
+
+```bash
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_darwin_<arch>.tar.gz
+tar xzf claude-usage-tray_<version>_darwin_<arch>.tar.gz
+xattr -d com.apple.quarantine claude-usage-tray
+sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
+```
+
+The `xattr` line is needed because the binaries are not signed with an Apple certificate, so macOS quarantines direct downloads. Homebrew and npm installs skip the quarantine, no extra step there.
 
 Replace `<version>` with the release you want (for example `0.1.0`) and `<arch>` with `amd64` or `arm64`. Every release also carries a `checksums.txt` with SHA-256 sums for each file. Grab any of these from the [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest).
 
@@ -134,9 +145,10 @@ Settings are saved to `~/.config/claude-usage-tray/config.toml`. If the tray can
 
 ### Desktop compatibility
 
-The icon uses StatusNotifierItem, the freedesktop tray standard.
+On Linux the icon uses StatusNotifierItem, the freedesktop tray standard. On macOS it lives in the menu bar through the native APIs.
 
-- **Works out of the box:** KDE Plasma, XFCE 4.16+, LXQt, Cinnamon, MATE.
+- **Works out of the box:** KDE Plasma, XFCE 4.16+, LXQt, Cinnamon, MATE, and macOS.
+- **macOS notes:** the icon adapts to light and dark menu bars automatically. Notifications work, though they stay basic until the app ships as a full application bundle.
 - **GNOME:** needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension. Without it GNOME has no tray to draw into, and no icon will appear. The tray tells you and exits rather than running invisibly.
 - **Notifications** use the standard desktop notification service, which every desktop above ships by default, GNOME included, no extension needed.
 

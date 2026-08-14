@@ -2,13 +2,13 @@
 name = "claude-usage-tray"
 version = "0.1.0"
 edition = "2024"
-description = "Linux tray icon showing Claude Code 5-hour and weekly usage"
+description = "Tray icon showing Claude Code 5-hour and weekly usage, for Linux and macOS"
 authors = ["Patrick D'appollonio"]
 license = "MIT"
 repository = "https://github.com/patrickdappollonio/claude-usage-tray"
 homepage = "https://github.com/patrickdappollonio/claude-usage-tray"
 readme = "README.md"
-keywords = ["tray", "statusnotifieritem", "claude", "usage", "linux"]
+keywords = ["tray", "statusnotifieritem", "claude", "usage", "menubar"]
 categories = ["command-line-utilities", "gui", "visualization"]
 
 [profile.release]
@@ -32,14 +32,30 @@ ureq = { version = "3.4.0", default-features = false, features = ["rustls", "gzi
 # portal, freedesktop notifications.
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
-# `notify-rust` also supports macOS, but its macOS path pulls in
-# `mac-notification-sys`, whose build script compiles Objective-C — which
-# cannot be done from a Linux host, so `cargo check --target
-# aarch64-apple-darwin` fails on it. It is therefore gated to Linux until the
-# macOS backend is written on a Mac; the toast type the core passes around
-# (`platform::Toast`) is deliberately ours rather than notify-rust's, so
-# re-adding it under a macOS target section is a one-line change.
 notify-rust = "4.18.0"
 # Same zbus ksni already brings in (its `async-io` feature enables that
 # backend); used only for the desktop portal's color-scheme setting.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+# The macOS backend (`src/platform/macos/`): an `NSStatusItem` in the menu
+# bar, its `NSMenu`, and Notification Center toasts.
+#
+# `tray-icon` owns the status item and re-exports `muda` (as
+# `tray_icon::menu`) for the menu; both insist on the main thread with a
+# running event loop, which is what `tao` is here for — it is the event loop
+# the crate's own examples use, and it is also how the poll-loop thread
+# marshals work back onto the main thread (`EventLoopProxy::send_event`).
+# Default features are left on deliberately: the GTK/libxdo ones only pull
+# dependencies in under `cfg(linux)`, so they cost nothing here.
+#
+# `notify-rust` is the same crate the Linux backend uses; its macOS path pulls
+# in `mac-notification-sys`, whose build script compiles Objective-C, so this
+# section cannot be type-checked from a Linux host (`cargo check --target
+# aarch64-apple-darwin` fails on it) and is proven by the macOS CI job instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+notify-rust = "4.18.0"
+# Only for `CFRunLoop::wake_up` after the status item is created; see
+# `platform/macos/mod.rs`.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"] }
+tao = "0.36.0"
+tray-icon = "0.24.2"

@@ -156,9 +156,78 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  build-darwin:
+    name: Build darwin/${{ matrix.goarch }}
+    needs: prepare-release
+    # One runner builds both: an Apple Silicon macOS runner is a first-class
+    # cross-compilation host for x86_64 Macs (the SDK ships both slices), so
+    # there is no second runner and no cross toolchain to install.
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            goarch: arm64
+          - target: x86_64-apple-darwin
+            goarch: amd64
+
+    env:
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+
+      - name: Set version from tag
+        run: cargo set-version "$VERSION"
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # macOS `strip` needs `-x` on a Mach-O binary: without it, it strips
+      # symbols the dynamic linker still needs.
+      - name: Strip binary
+        run: strip -x target/${{ matrix.target }}/release/claude-usage-tray
+
+      - name: Build tarball
+        run: |
+          set -euo pipefail
+          STAGE="claude-usage-tray_${VERSION}_darwin_${{ matrix.goarch }}"
+          mkdir -p "dist/$STAGE"
+          cp target/${{ matrix.target }}/release/claude-usage-tray "dist/$STAGE/"
+          cp LICENSE README.md "dist/$STAGE/"
+          tar czf "dist/${STAGE}.tar.gz" -C "dist/$STAGE" .
+          rm -rf "dist/$STAGE"
+
+      # No .deb/.rpm/.apk/.pkg equivalents here: nfpm builds Linux packages
+      # only, and macOS is served by the tarball, Homebrew and npm.
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/claude-usage-tray_*
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin-${{ matrix.goarch }}
+          path: dist/claude-usage-tray_${{ needs.prepare-release.outputs.version }}_darwin_${{ matrix.goarch }}.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
   build-npm-package:
     name: Build npm package
-    needs: [prepare-release, build]
+    needs: [prepare-release, build, build-darwin]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -240,7 +309,7 @@ jobs:
 
   checksums:
     name: Publish checksums
-    needs: [prepare-release, build, build-npm-package]
+    needs: [prepare-release, build, build-darwin, build-npm-package]
     runs-on: ubuntu-latest
     steps:
       - name: Download every release asset and checksum it
