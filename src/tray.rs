@@ -99,30 +99,63 @@ fn metric_line(label: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZo
     }
 }
 
+/// Age of a cache written at `at`, in seconds, as seen from `now`.
+///
+/// Clamped at zero: a cache written "in the future" only means the writer's
+/// clock ran slightly ahead, not that time moved back.
+fn age_secs(at: Timestamp, now: Timestamp) -> i64 {
+    (now.as_second() - at.as_second()).max(0)
+}
+
+/// Turns an age in seconds into a short elapsed-time phrase: `45 min`, `12 h`,
+/// `3 d`.
+///
+/// A wall-clock time is a poor way to describe a long gap — `Stale since
+/// 21:13` reads as "an hour ago" whether the cache is one hour or three days
+/// old, and the reader has to do the subtraction. The unit widens as the gap
+/// grows so the number stays small and immediately meaningful: minutes below
+/// an hour, whole hours (rounded to the nearest) up to two days, whole days
+/// beyond that.
+fn humanize_age(secs: i64) -> String {
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 86_400;
+    if secs < HOUR {
+        return format!("{} min", secs / 60);
+    }
+    // Rounded, not truncated: 119 minutes is much better described as "2 h"
+    // than as "1 h".
+    let hours = (secs + HOUR / 2) / HOUR;
+    if hours < 48 {
+        format!("{hours} h")
+    } else {
+        format!("{} d", (secs + DAY / 2) / DAY)
+    }
+}
+
 /// The third menu row: freshness of the cache, or an explanation of why there
 /// is nothing to show.
-pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> String {
+///
+/// `_tz` is unused now that every branch reports an elapsed duration rather
+/// than a wall-clock time, but it stays in the signature: it is a public
+/// helper alongside `session_line`/`weekly_line`, and dropping the parameter
+/// would break their symmetry for no gain.
+pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, _tz: &TimeZone) -> String {
     match snapshot.state {
         // First-run wording: the actionable `Install hook` item sits directly
         // under this row, so the row states the diagnosis and the item is the
         // instruction.
         SnapshotState::Missing => "⚠ Hook not installed — no data".to_string(),
         SnapshotState::Stale => match snapshot.written_at {
-            Some(at) => format!("⚠ Stale since {}", humanize_reset(at, now, tz)),
+            Some(at) => format!("⚠ Last updated {} ago", humanize_age(age_secs(at, now))),
             None => "⚠ Stale".to_string(),
         },
         SnapshotState::Fresh => match snapshot.written_at {
-            Some(at) => {
-                // Clamp at zero: a cache written "in the future" only means the
-                // writer's clock ran slightly ahead, not that time moved back.
-                let age_secs = (now.as_second() - at.as_second()).max(0);
-                match age_secs / 60 {
-                    0 => "Updated just now".to_string(),
-                    1 => "Updated 1 min ago".to_string(),
-                    mins if mins < 60 => format!("Updated {mins} min ago"),
-                    mins => format!("Updated {} hr ago", mins / 60),
-                }
-            }
+            Some(at) => match age_secs(at, now) / 60 {
+                0 => "Updated just now".to_string(),
+                1 => "Updated 1 min ago".to_string(),
+                mins if mins < 60 => format!("Updated {mins} min ago"),
+                mins => format!("Updated {} hr ago", mins / 60),
+            },
             None => "Updated recently".to_string(),
         },
     }
@@ -1032,9 +1065,61 @@ mod tests {
     }
 
     #[test]
-    fn status_line_stale_shows_since_time() {
+    fn status_line_stale_under_an_hour_counts_minutes() {
+        // Stale starts at 10 minutes, so this is the shortest gap the branch
+        // ever has to describe.
+        let s = snapshot(SnapshotState::Stale, Some(BASE - 11 * 60));
+        assert_eq!(
+            status_line(&s, ts(BASE), &utc()),
+            "⚠ Last updated 11 min ago"
+        );
+        let s = snapshot(SnapshotState::Stale, Some(BASE - 59 * 60));
+        assert_eq!(
+            status_line(&s, ts(BASE), &utc()),
+            "⚠ Last updated 59 min ago"
+        );
+    }
+
+    #[test]
+    fn status_line_stale_switches_to_hours_at_one_hour() {
         let s = snapshot(SnapshotState::Stale, Some(BASE - 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Stale since 21:13");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 1 h ago");
+        let s = snapshot(SnapshotState::Stale, Some(BASE - 12 * 3600));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 12 h ago");
+    }
+
+    #[test]
+    fn status_line_stale_rounds_hours_to_the_nearest() {
+        // 1 h 45 min is "2 h", not "1 h".
+        let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 45 * 60)));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 2 h ago");
+        // ...and 1 h 10 min still rounds down.
+        let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 10 * 60)));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 1 h ago");
+    }
+
+    #[test]
+    fn status_line_stale_switches_to_days_at_forty_eight_hours() {
+        // 47 h stays in hours; 48 h is the first "2 d".
+        let s = snapshot(SnapshotState::Stale, Some(BASE - 47 * 3600));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 47 h ago");
+        let s = snapshot(SnapshotState::Stale, Some(BASE - 48 * 3600));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 2 d ago");
+        let s = snapshot(SnapshotState::Stale, Some(BASE - 9 * 86_400));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 9 d ago");
+    }
+
+    #[test]
+    fn status_line_stale_without_a_timestamp_just_says_stale() {
+        let s = snapshot(SnapshotState::Stale, None);
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Stale");
+    }
+
+    #[test]
+    fn status_line_stale_with_clock_skew_does_not_go_negative() {
+        // A cache "written in the future" is a skewed clock, not time travel.
+        let s = snapshot(SnapshotState::Stale, Some(BASE + 300));
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 0 min ago");
     }
 
     #[test]

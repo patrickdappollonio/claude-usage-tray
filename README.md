@@ -34,8 +34,9 @@ session's pre-first-turn statusline paint can't clobber the previous
 session's numbers.
 
 There is no timestamp *inside* the file: **freshness comes from the file's
-mtime**. Older than 10 minutes and the tray treats the data as stale (dimmed
-icon, `⚠ Stale since HH:MM`).
+mtime**. Older than 10 minutes and the tray treats the data as stale: the
+gauge keeps showing the numbers it has, a question mark replaces the weekly
+dot in the middle of the icon, and the menu reads `⚠ Last updated 12 h ago`.
 
 Earlier versions used a different file (`usage-tray-cache.json`) written by a
 shell snippet. `claude-usage-tray hook install` deletes that file and strips
@@ -316,10 +317,23 @@ out of your statusline script (backing the script up as
 
 - **Outer arc**: sweeps clockwise with 5-hour session usage percentage.
 - **Inner dot**: 7-day weekly usage percentage, same color bands.
-- **Color bands**: green below 60%, amber below 80%, orange below 95%, red
-  at 95% and above.
-- **Dimmed icon**: cache file is older than 10 minutes (stale) — usage may
-  have changed since the last time Claude Code ran.
+- **Color bands**: green below 50%, yellow below 75%, orange below 90%, red
+  at 90% and above. The edges are the same numbers as the
+  [notification thresholds](#notifications), so the icon changes color at
+  exactly the moments the tray also speaks up.
+- **Question mark in the center**: the cache file is older than 10 minutes
+  (stale) — usage may have changed since the last time Claude Code ran. The
+  ring and the session arc stay at full strength and keep showing the last
+  known numbers; only the weekly dot is swapped for the `?`, which says "this
+  might not be current" without hiding the reading. The menu's third row
+  spells the gap out — `⚠ Last updated 45 min ago`, `⚠ Last updated 12 h
+  ago`, `⚠ Last updated 2 d ago`.
+- **Stale does not mean wrong.** Reset times are absolute timestamps, so the
+  tray keeps counting down to them from its own clock without any new data —
+  and once a 5-hour window's `resets_at` has passed, the session percentage
+  **drops itself back to 0%** even while the cache is stale. A stale icon
+  showing `Session: 0%` after a long break is telling you the truth, not
+  showing you a frozen number.
 - **Gray icon**: no cache file found, or it couldn't be parsed. The menu then
   reads `⚠ Hook not installed — no data` and offers a clickable **Install
   hook** item that does the same thing as `claude-usage-tray hook install`,
@@ -342,8 +356,10 @@ applies the moment you pick it.
 
 In monochrome mode the ring, the session arc and the weekly dot are all drawn
 in the same color, and the **length of the arc sweep alone** carries the usage
-signal — there is no green/amber/red to read. Everything else behaves exactly
-as in color mode: a stale cache still dims the icon, and a missing cache still
+signal — there is no green/yellow/orange/red to read. Everything else behaves
+exactly as in color mode: a stale cache still swaps the center dot for a
+question mark (drawn in the same foreground color as the rest of the icon,
+since a second gray would vanish against the ring), and a missing cache still
 renders the gray "no data" ring and dot.
 
 **The names describe your UI, not the icon.** `Monochrome dark` means "my
@@ -411,9 +427,11 @@ Effective refresh interval, highest priority first:
 ## Limitations
 
 - Usage data only refreshes while Claude Code is actively running a session
-  (the statusline only runs then). When no session is running, the icon
-  will go stale and dim, but reset-time countdowns remain accurate
-  regardless.
+  (the statusline only runs then). When no session is running, the icon goes
+  stale and grows a `?` in the middle, but it keeps showing the last known
+  numbers, reset-time countdowns remain accurate regardless, and a session
+  window that rolls over in the meantime still drops the session percentage
+  back to 0%.
 - Requires Claude Code >= 2.1.80 (the version that added `rate_limits` to
   the statusline JSON).
 - Only works for Pro/Max subscription accounts authenticated via Claude
