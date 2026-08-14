@@ -3,13 +3,6 @@
 //! See `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md` for the
 //! cache contract. This module never panics on bad input: every failure mode
 //! maps to a `SnapshotState` value.
-//!
-//! The public items here are not yet consumed outside tests: `icon.rs` and
-//! `tray.rs`/`main.rs` (Tasks 2-3) wire them into the running binary. Until
-//! then a plain (non-test) build sees them as unused, so this module is
-//! exempted from `dead_code` at the module level, matching the convention
-//! used by the other not-yet-wired placeholder modules.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

@@ -10,12 +10,6 @@
 //! renders identically to `Fresh` but with every pixel's alpha scaled down,
 //! so the icon visibly dims while data ages.
 
-// This module's public API (`render_icons`, `band_color`) is wired into the
-// running tray by `tray.rs`/`main.rs` in Task 3, which don't exist yet — so
-// clippy currently sees everything here as dead code from the bin target's
-// point of view. Tests already exercise it. Drop this once Task 3 lands.
-#![allow(dead_code)]
-
 use crate::source::{SnapshotState, UsageSnapshot};
 use tiny_skia::{LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
