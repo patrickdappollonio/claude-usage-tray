@@ -102,13 +102,13 @@ impl MacTray {
             .with_menu(Box::new(menu.clone()))
             .with_tooltip(self.core.tooltip())
             .with_icon_as_template(is_template)
-            // Left click is a status readout and right click opens the menu,
-            // which is what the Linux tray does (`Activate` versus
-            // `ContextMenu` in StatusNotifierItem) and therefore what the
-            // product is documented to do. Leaving the menu on left click as
-            // well would fire both, so every menu opening would also raise a
-            // notification.
-            .with_menu_on_left_click(false)
+            // Any click opens the menu — the macOS menu bar convention (user
+            // decision 2026-08-14). The Linux tray keeps its split behavior
+            // (left click = summary toast, right click = menu) because that's
+            // the StatusNotifierItem convention; here the menu's info rows
+            // already say what the toast would, so a toast on top of an
+            // opening menu would just be noise.
+            .with_menu_on_left_click(true)
             .with_menu_on_right_click(true);
         if let Some(icon) = icon {
             builder = builder.with_icon(icon);
@@ -155,11 +155,6 @@ impl MacTray {
             Dispatch::Select(group, index) => self.core.select(group, index),
         }
         self.rebuild_menu();
-    }
-
-    /// Left click: show a worded summary of current usage.
-    pub fn on_left_click(&self) {
-        self.core.clicked();
     }
 
     /// Builds a fresh menu and hands it to the status item, dropping the old

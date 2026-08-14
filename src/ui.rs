@@ -901,6 +901,10 @@ impl TrayCore {
 
     /// Left-click: show a worded summary of current usage. Unlike "Check for
     /// new data" this never reports whether the cache moved.
+    ///
+    /// Linux-only in practice: on macOS every click opens the menu (the menu
+    /// bar convention), whose info rows already carry this summary.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn clicked(&self) {
         self.send(Wake::ShowStatus);
     }

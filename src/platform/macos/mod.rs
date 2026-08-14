@@ -45,7 +45,7 @@ use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::MenuEvent;
-use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+use tray_icon::TrayIconEvent;
 
 /// Everything the event loop can be asked to do, from wherever it is asked.
 ///
@@ -172,15 +172,11 @@ where
                 }
             }
 
-            // Left click: a worded summary of current usage, matching the
-            // Linux tray. Filtered to the button release so the press does not
-            // report it a second time; right clicks open the menu and are
-            // handled by AppKit, not here.
-            Event::UserEvent(UserEvent::Tray(TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            })) => tray.on_left_click(),
+            // Clicks open the menu, handled entirely by AppKit via
+            // `with_menu_on_left_click(true)`; nothing to do here. The worded
+            // usage summary that Linux toasts on left click is redundant on
+            // macOS because the opened menu leads with the same info rows.
+            Event::UserEvent(UserEvent::Tray(TrayIconEvent::Click { .. })) => {}
 
             Event::UserEvent(UserEvent::Menu(event)) => tray.on_menu_event(event.id.as_ref()),
             Event::UserEvent(UserEvent::Snapshot(snapshot)) => tray.set_snapshot(*snapshot),
