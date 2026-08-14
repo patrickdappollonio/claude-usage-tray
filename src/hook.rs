@@ -97,10 +97,7 @@ pub fn shell_split(command: &str) -> Option<Vec<String>> {
             }
             '\\' => {
                 has_token = true;
-                match chars.next() {
-                    Some(c) => current.push(c),
-                    None => return None,
-                }
+                current.push(chars.next()?);
             }
             c => {
                 has_token = true;
