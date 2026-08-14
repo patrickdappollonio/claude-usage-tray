@@ -91,6 +91,10 @@ pub use imp::TrayHandle;
 pub struct BackendError(String);
 
 impl BackendError {
+    // Only the Linux backend constructs errors through this today; the macOS
+    // event loop reports failures via panics inside tao. Keep the constructor
+    // for both so backends stay symmetric.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn new(message: impl Into<String>) -> Self {
         BackendError(message.into())
     }
