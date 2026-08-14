@@ -31,15 +31,25 @@ pub enum Wake {
     Quit,
 }
 
+/// Furthest a reset time may be from `now` before `humanize_reset` stops
+/// using the weekday form: past this many days the `%a` abbreviation reads
+/// as "this week", which is misleading for something further out.
+const WEEKDAY_FORM_MAX_DAYS: i32 = 6;
+
 /// Formats a reset timestamp for display: `HH:MM` when it falls on the same
-/// local day as `now`, otherwise `Day HH:MM` (e.g. `Mon 12:59`).
+/// local day as `now`; `Day HH:MM` (e.g. `Mon 12:59`) when it's within the
+/// next `WEEKDAY_FORM_MAX_DAYS` days, since a bare weekday reads as "this
+/// week"; otherwise `Mon DD HH:MM` (e.g. `Aug 20 09:00`) so a target further
+/// out doesn't get misread as being within the week.
 pub fn humanize_reset(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
     let at = at.to_zoned(tz.clone());
     let now = now.to_zoned(tz.clone());
     if at.date() == now.date() {
         at.strftime("%H:%M").to_string()
-    } else {
+    } else if (at.date() - now.date()).get_days().abs() <= WEEKDAY_FORM_MAX_DAYS {
         at.strftime("%a %H:%M").to_string()
+    } else {
+        at.strftime("%b %d %H:%M").to_string()
     }
 }
 
@@ -263,6 +273,13 @@ impl ksni::Tray for UsageTray {
         self.send(Wake::Refresh);
     }
 
+    /// Overriding this (even as a no-op) opts out of ksni's `NO_ABOUT_TO_SHOW`
+    /// default, which otherwise skips the update_properties/update_menu pass
+    /// before the menu opens. Without this override, rows like "Updated N min
+    /// ago" only refresh when the poll loop happens to push a changed
+    /// snapshot, so the menu can show stale text while open.
+    fn menu_about_to_show(&mut self) {}
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let now = Timestamp::now();
         let info = |label: String| {
@@ -337,6 +354,35 @@ mod tests {
         assert_eq!(
             humanize_reset(ts(BASE + 12 * 3600), ts(BASE), &utc()),
             "Wed 10:13"
+        );
+    }
+
+    #[test]
+    fn humanize_reset_six_days_out_still_uses_weekday_form() {
+        // BASE is Tue 2023-11-14; +6 days is Mon 2023-11-20 — still "this
+        // week enough" to read unambiguously as a weekday.
+        assert_eq!(
+            humanize_reset(ts(BASE + 6 * 86_400), ts(BASE), &utc()),
+            "Mon 22:13"
+        );
+    }
+
+    #[test]
+    fn humanize_reset_more_than_six_days_out_uses_month_day_form() {
+        // BASE is Tue 2023-11-14; +7 days is Tue 2023-11-21 — a bare "Tue"
+        // would misleadingly read as "this week", so fall back to Mon DD.
+        assert_eq!(
+            humanize_reset(ts(BASE + 7 * 86_400), ts(BASE), &utc()),
+            "Nov 21 22:13"
+        );
+    }
+
+    #[test]
+    fn humanize_reset_far_future_uses_month_day_form() {
+        // BASE + 8 days -> Wed 2023-11-22.
+        assert_eq!(
+            humanize_reset(ts(BASE + 8 * 86_400), ts(BASE), &utc()),
+            "Nov 22 22:13"
         );
     }
 

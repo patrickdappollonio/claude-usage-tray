@@ -72,11 +72,12 @@ fn render_one(size: u32, snapshot: &UsageSnapshot) -> ksni::Icon {
     }
 }
 
-fn extract_percent(metric: Option<&crate::source::Metric>) -> f64 {
-    metric
-        .and_then(|m| m.percent)
-        .unwrap_or(0.0)
-        .clamp(0.0, 100.0)
+/// `None` means "no reading" — either the metric itself is absent or its
+/// `percent` field is. Callers must not treat that the same as an actual 0%:
+/// see `draw_gauge`, which renders it in neutral gray rather than the green
+/// that `band_color(0.0)` would otherwise (wrongly) imply.
+fn extract_percent(metric: Option<&crate::source::Metric>) -> Option<f64> {
+    metric.and_then(|m| m.percent).map(|p| p.clamp(0.0, 100.0))
 }
 
 fn draw_missing(pixmap: &mut Pixmap, center: f32, radius: f32, stroke_width: f32) {
@@ -89,31 +90,53 @@ fn draw_gauge(
     center: f32,
     radius: f32,
     stroke_width: f32,
-    session_percent: f64,
-    weekly_percent: f64,
+    session_percent: Option<f64>,
+    weekly_percent: Option<f64>,
 ) {
     // Dim background ring, always full circle.
     stroke_circle(pixmap, center, center, radius, stroke_width, GRAY, 70);
 
-    // Foreground arc: sweeps clockwise from the top, proportional to session%.
-    let sweep_deg = (session_percent / 100.0 * 360.0) as f32;
-    if sweep_deg > 0.0
-        && let Some(path) = arc_path(center, center, radius, -90.0, sweep_deg)
-    {
-        let color = band_color(session_percent);
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(color.0, color.1, color.2, 255);
-        paint.anti_alias = true;
-        let stroke = Stroke {
-            width: stroke_width,
-            line_cap: LineCap::Round,
-            ..Default::default()
-        };
-        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    match session_percent {
+        Some(session_percent) => {
+            // Foreground arc: sweeps clockwise from the top, proportional to
+            // session%.
+            let sweep_deg = (session_percent / 100.0 * 360.0) as f32;
+            if sweep_deg > 0.0
+                && let Some(path) = arc_path(center, center, radius, -90.0, sweep_deg)
+            {
+                let color = band_color(session_percent);
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(color.0, color.1, color.2, 255);
+                paint.anti_alias = true;
+                let stroke = Stroke {
+                    width: stroke_width,
+                    line_cap: LineCap::Round,
+                    ..Default::default()
+                };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
+        // No reading: draw a full gray ring rather than staying silent (which
+        // would be indistinguishable from an actual 0%) or drawing a
+        // confident colored arc for data we don't have.
+        None => {
+            if let Some(path) = arc_path(center, center, radius, -90.0, 359.999) {
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(GRAY.0, GRAY.1, GRAY.2, 255);
+                paint.anti_alias = true;
+                let stroke = Stroke {
+                    width: stroke_width,
+                    line_cap: LineCap::Round,
+                    ..Default::default()
+                };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
     }
 
-    // Small inner weekly dot, banded the same way.
-    let weekly_color = band_color(weekly_percent);
+    // Small inner weekly dot, banded the same way — gray when there is no
+    // reading, so "no data" never reads as a confident green 0%.
+    let weekly_color = weekly_percent.map(band_color).unwrap_or(GRAY);
     fill_dot(pixmap, center, center, stroke_width * 0.55, weekly_color, 255);
 }
 
@@ -320,5 +343,71 @@ mod tests {
         let snap = snapshot(SnapshotState::Fresh, Some(0.0), Some(0.0));
         let icons = render_icons(&snap);
         assert!(icons[2].data.chunks_exact(4).any(|px| px[0] != 0));
+    }
+
+    /// A `None` percent must render as neutral gray, never as the green that
+    /// `band_color(0.0)` would produce for an actual 0% reading — otherwise
+    /// "we don't know" is indistinguishable from "definitely zero usage".
+    #[test]
+    fn unknown_percent_renders_gray_not_green() {
+        let snap = snapshot(SnapshotState::Fresh, None, None);
+        let icon = &render_icons(&snap)[2]; // 48px: largest, most stable sampling
+
+        let green = (67u8, 160u8, 71u8);
+        let mut green_like = 0usize;
+        let mut visible = 0usize;
+        for px in icon.data.chunks_exact(4) {
+            let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
+            if a == 0 {
+                continue;
+            }
+            visible += 1;
+            let dist = (r as i32 - green.0 as i32).abs()
+                + (g as i32 - green.1 as i32).abs()
+                + (b as i32 - green.2 as i32).abs();
+            if dist < 30 {
+                green_like += 1;
+            }
+        }
+        assert!(visible > 0, "unknown-percent icon should still draw something");
+        assert_eq!(
+            green_like, 0,
+            "expected no green pixels when percent is unknown, got {green_like}/{visible}"
+        );
+    }
+
+    /// The weekly dot specifically must not be a confident green when its
+    /// percent is unknown, even if the session percent (drawn as the outer
+    /// arc, far from the center) is known and happens to band green.
+    #[test]
+    fn unknown_weekly_percent_dot_is_not_green() {
+        let size = 48u32;
+        let snap = snapshot(SnapshotState::Fresh, Some(10.0), None);
+        let icon = &render_icons(&snap)[2];
+
+        // Sample only the small central region the dot occupies, well clear
+        // of the outer arc/ring.
+        let center = size as i64 / 2;
+        let sample_radius: i64 = 3;
+        let green = (67u8, 160u8, 71u8);
+        let mut saw_center_pixel = false;
+        for y in (center - sample_radius)..=(center + sample_radius) {
+            for x in (center - sample_radius)..=(center + sample_radius) {
+                let idx = (y as usize * size as usize + x as usize) * 4;
+                let px = &icon.data[idx..idx + 4];
+                let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
+                if a == 0 {
+                    continue;
+                }
+                saw_center_pixel = true;
+                assert_ne!(
+                    (r, g, b),
+                    green,
+                    "weekly dot pixel at ({x},{y}) should not render band_color(0.0) \
+                     (green) when its percent is unknown"
+                );
+            }
+        }
+        assert!(saw_center_pixel, "expected the weekly dot to draw something at the center");
     }
 }

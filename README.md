@@ -55,10 +55,11 @@ The binary is at `target/release/claude-usage-tray`.
 ./target/release/claude-usage-tray
 ```
 
-It parks on the tray event loop; a background thread re-reads the cache file
-on an interval (see `CLAUDE_TRAY_POLL_SECS` below) and updates the icon when
-the content changes. Left-click the icon or use "Refresh now" in the menu to
-force an immediate re-read. "Quit" exits cleanly.
+The ksni tray service runs on its own thread; the main thread runs the poll
+loop, re-reading the cache file on an interval (see `CLAUDE_TRAY_POLL_SECS`
+below) and updating the icon when the content changes. Left-click the icon or
+use "Refresh now" in the menu to force an immediate re-read. "Quit" exits
+cleanly.
 
 ## Installing the statusline hook
 

@@ -233,7 +233,6 @@ dependencies = [
  "jiff",
  "ksni",
  "notify-rust",
- "serde",
  "serde_json",
  "tiny-skia",
 ]
