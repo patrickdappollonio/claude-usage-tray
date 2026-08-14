@@ -7,9 +7,6 @@ times. This is a proof of concept: a status icon and a menu, nothing more.
 No windows, no charts, no separate settings window (the handful of settings
 live in the menu itself), no multi-account profiles.
 
-Inspired by [hamed-elfayome/Claude-Usage-Tracker](https://github.com/hamed-elfayome/Claude-Usage-Tracker)
-(macOS), but built on a different, sanctioned data source — see below.
-
 ## How data flows
 
 ```
