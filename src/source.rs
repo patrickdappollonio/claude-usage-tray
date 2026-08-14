@@ -152,7 +152,9 @@ pub fn should_write_cache(incoming: &[u8], existing: Option<&[u8]>) -> bool {
 
 /// The cache file's mtime, or `None` when it cannot be read.
 pub fn cache_mtime(path: &Path) -> Option<jiff::Timestamp> {
-    let modified = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
     let secs = match modified.duration_since(std::time::UNIX_EPOCH) {
         Ok(since) => i64::try_from(since.as_secs()).ok()?,
         // A pre-1970 mtime is nonsense in practice, but it must not panic.
@@ -167,6 +169,100 @@ pub fn read_snapshot(path: &Path, now: jiff::Timestamp) -> UsageSnapshot {
     match std::fs::read_to_string(path) {
         Ok(body) => snapshot_from(&body, cache_mtime(path), now),
         Err(_) => UsageSnapshot::missing(),
+    }
+}
+
+/// Name of the "kayfabe" fixture file: wrestling jargon for a staged event
+/// presented as real, which is exactly the joke here. When this file exists
+/// next to `config.toml`, the tray presents its contents as the real usage
+/// snapshot — handy for demoing every visual state (fresh/stale/missing,
+/// arbitrary percentages, upcoming resets) without waiting on real usage data
+/// or hand-editing the real cache. Delete it and reality resumes on the next
+/// poll tick. Deliberately unadvertised: not in `--help`, not in the README,
+/// source-visible only.
+pub const KAYFABE_FILE_NAME: &str = "kayfabe.json";
+
+/// Default kayfabe fixture path: `<config dir>/claude-usage-tray/kayfabe.json`
+/// — the same directory `config.toml` lives in, so it inherits the same
+/// `$XDG_CONFIG_HOME` resolution.
+pub fn default_kayfabe_path() -> PathBuf {
+    crate::config::config_dir().join(KAYFABE_FILE_NAME)
+}
+
+/// Like [`read_snapshot`], but probes `kayfabe_path` first (a cheap stat +
+/// read on every poll tick, so no state to go stale across the process
+/// lifetime):
+///
+/// * kayfabe file absent → completely inert; falls through to the normal
+///   `read_snapshot(path, now)` path, unchanged from today.
+/// * kayfabe file present and readable → its contents go through
+///   [`fake_snapshot`] and *become* the snapshot, real cache ignored.
+/// * kayfabe file present but unreadable (permissions, race, etc.) →
+///   `Missing`, same as a missing real cache would be.
+pub fn read_snapshot_or_kayfabe(
+    path: &Path,
+    kayfabe_path: &Path,
+    now: jiff::Timestamp,
+) -> UsageSnapshot {
+    match std::fs::read_to_string(kayfabe_path) {
+        Ok(body) => fake_snapshot(&body, now),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => read_snapshot(path, now),
+        Err(_) => UsageSnapshot::missing(),
+    }
+}
+
+/// Builds a snapshot from a `kayfabe.json` fixture body. Pure and
+/// unit-testable independent of any filesystem probing.
+///
+/// * `session`/`weekly` (0-100, omitted → `None`) become each metric's
+///   `percent` directly, with no other validation.
+/// * `age_minutes` (default 0) sets `written_at = now - age_minutes` minutes;
+///   staleness is classified by the same 600 s rule as real cache reads, so
+///   720 renders as "Stale" ("12 h ago").
+/// * `session_resets_in_minutes` (default 180) and `weekly_resets_in_days`
+///   (default 4) set each metric's `resets_at` relative to `now`. Both accept
+///   negative values (a reset already in the past).
+///
+/// Unlike `parse_metric`, this deliberately does **not** zero a percent whose
+/// `resets_at` has already passed: the fake file is authoritative for every
+/// field it sets, including a percent paired with a past reset, so that
+/// combination can itself be used to demo the real zeroing rule's *absence*
+/// or exercised end to end by simply setting `session_resets_in_minutes`
+/// negative alongside `session: 0`.
+///
+/// Missing/unreadable is handled by the caller ([`read_snapshot_or_kayfabe`]);
+/// this function only has to decide `Missing` for unparseable JSON.
+pub fn fake_snapshot(body: &str, now: jiff::Timestamp) -> UsageSnapshot {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return UsageSnapshot::missing();
+    };
+    // Plain `serde_json::Value` lookups rather than a derived struct: `serde`
+    // isn't a direct dependency (only `serde_json`/`toml` pull it in), and
+    // this fixture format is small enough not to earn one.
+    let field_f64 = |key: &str| value.get(key).and_then(|v| v.as_f64());
+    let field_i64 = |key: &str| value.get(key).and_then(|v| v.as_i64());
+
+    let age_minutes = field_i64("age_minutes").unwrap_or(0);
+    let written_at = jiff::Timestamp::from_second(now.as_second() - age_minutes * 60).ok();
+
+    let session_resets_in_minutes = field_i64("session_resets_in_minutes").unwrap_or(180);
+    let weekly_resets_in_days = field_i64("weekly_resets_in_days").unwrap_or(4);
+    let session_resets_at =
+        jiff::Timestamp::from_second(now.as_second() + session_resets_in_minutes * 60).ok();
+    let weekly_resets_at =
+        jiff::Timestamp::from_second(now.as_second() + weekly_resets_in_days * 86400).ok();
+
+    UsageSnapshot {
+        session: Some(Metric {
+            percent: field_f64("session"),
+            resets_at: session_resets_at,
+        }),
+        weekly: Some(Metric {
+            percent: field_f64("weekly"),
+            resets_at: weekly_resets_at,
+        }),
+        written_at,
+        state: classify(written_at, now),
     }
 }
 
@@ -524,5 +620,140 @@ mod tests {
         let path = default_cache_path();
         assert!(path.ends_with(CACHE_FILE_NAME));
         assert!(path.to_string_lossy().contains(".claude"));
+    }
+
+    // -- kayfabe -----------------------------------------------------------
+
+    #[test]
+    fn fake_snapshot_full_file_sets_every_field() {
+        let now = ts(1_700_000_000);
+        let body = r#"{"session": 82, "weekly": 45, "age_minutes": 10,
+                        "session_resets_in_minutes": 30, "weekly_resets_in_days": 2}"#;
+        let snap = fake_snapshot(body, now);
+
+        assert_eq!(snap.state, SnapshotState::Fresh);
+        assert_eq!(snap.written_at, Some(ts(1_700_000_000 - 600)));
+
+        let session = snap.session.expect("session present");
+        assert_eq!(session.percent, Some(82.0));
+        assert_eq!(session.resets_at, Some(ts(1_700_000_000 + 30 * 60)));
+
+        let weekly = snap.weekly.expect("weekly present");
+        assert_eq!(weekly.percent, Some(45.0));
+        assert_eq!(weekly.resets_at, Some(ts(1_700_000_000 + 2 * 86_400)));
+    }
+
+    #[test]
+    fn fake_snapshot_empty_object_uses_every_default() {
+        let now = ts(1_700_000_000);
+        let snap = fake_snapshot("{}", now);
+
+        assert_eq!(snap.state, SnapshotState::Fresh);
+        assert_eq!(snap.written_at, Some(now)); // age_minutes defaults to 0
+
+        let session = snap.session.expect("session present, percent unknown");
+        assert_eq!(session.percent, None);
+        assert_eq!(session.resets_at, Some(ts(1_700_000_000 + 180 * 60)));
+
+        let weekly = snap.weekly.expect("weekly present, percent unknown");
+        assert_eq!(weekly.percent, None);
+        assert_eq!(weekly.resets_at, Some(ts(1_700_000_000 + 4 * 86_400)));
+    }
+
+    #[test]
+    fn fake_snapshot_session_omitted_is_none_percent_but_weekly_still_set() {
+        let now = ts(1_700_000_000);
+        let snap = fake_snapshot(r#"{"weekly": 45}"#, now);
+        assert_eq!(snap.session.expect("session present").percent, None);
+        assert_eq!(snap.weekly.expect("weekly present").percent, Some(45.0));
+    }
+
+    #[test]
+    fn fake_snapshot_weekly_omitted_is_none_percent_but_session_still_set() {
+        let now = ts(1_700_000_000);
+        let snap = fake_snapshot(r#"{"session": 82}"#, now);
+        assert_eq!(snap.session.expect("session present").percent, Some(82.0));
+        assert_eq!(snap.weekly.expect("weekly present").percent, None);
+    }
+
+    #[test]
+    fn fake_snapshot_age_crossing_stale_boundary() {
+        let now = ts(1_700_000_000);
+        let fresh = fake_snapshot(r#"{"age_minutes": 9}"#, now); // 540s < 600s
+        assert_eq!(fresh.state, SnapshotState::Fresh);
+
+        let stale = fake_snapshot(r#"{"age_minutes": 12}"#, now); // 720s > 600s
+        assert_eq!(stale.state, SnapshotState::Stale);
+        assert_eq!(stale.written_at, Some(ts(1_700_000_000 - 12 * 60)));
+    }
+
+    #[test]
+    fn fake_snapshot_negative_resets_in_are_kept_as_past_timestamps() {
+        let now = ts(1_700_000_000);
+        let snap = fake_snapshot(
+            r#"{"session": 0, "session_resets_in_minutes": -5, "weekly_resets_in_days": -1}"#,
+            now,
+        );
+        // The fake file is authoritative: percent is NOT re-zeroed by the
+        // real cache's past-resets-at rule, it's simply whatever was set.
+        let session = snap.session.expect("session present");
+        assert_eq!(session.percent, Some(0.0));
+        assert_eq!(session.resets_at, Some(ts(1_700_000_000 - 5 * 60)));
+        let weekly = snap.weekly.expect("weekly present");
+        assert_eq!(weekly.resets_at, Some(ts(1_700_000_000 - 86_400)));
+    }
+
+    #[test]
+    fn fake_snapshot_garbage_json_is_missing() {
+        let now = ts(1_700_000_000);
+        let snap = fake_snapshot("not json", now);
+        assert_eq!(snap.state, SnapshotState::Missing);
+        assert!(snap.session.is_none());
+        assert!(snap.weekly.is_none());
+        assert!(snap.written_at.is_none());
+    }
+
+    #[test]
+    fn read_snapshot_or_kayfabe_falls_through_to_real_cache_when_kayfabe_absent() {
+        let temp = TempDir::new("kayfabe-absent");
+        let body = read_fixture("valid_full.json");
+        let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
+        let kayfabe_path = temp.path().join("kayfabe.json"); // never created
+
+        let snap = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_000 + 5));
+        assert_eq!(snap.state, SnapshotState::Fresh);
+        assert_eq!(snap.session.expect("session").percent, Some(42.0));
+    }
+
+    #[test]
+    fn read_snapshot_or_kayfabe_uses_kayfabe_when_present() {
+        let temp = TempDir::new("kayfabe-present");
+        let body = read_fixture("valid_full.json");
+        let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
+        let kayfabe_path = temp.path().join("kayfabe.json");
+        std::fs::write(&kayfabe_path, r#"{"session": 82}"#).expect("write kayfabe");
+
+        let now = ts(1_700_000_000 + 5);
+        let snap = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, now);
+        // The real cache says 42%; the kayfabe file wins.
+        assert_eq!(snap.session.expect("session").percent, Some(82.0));
+    }
+
+    #[test]
+    fn read_snapshot_or_kayfabe_missing_file_content_yields_missing_state() {
+        let temp = TempDir::new("kayfabe-garbage");
+        let body = read_fixture("valid_full.json");
+        let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
+        let kayfabe_path = temp.path().join("kayfabe.json");
+        std::fs::write(&kayfabe_path, "not json").expect("write kayfabe");
+
+        let snap = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_000 + 5));
+        assert_eq!(snap.state, SnapshotState::Missing);
+    }
+
+    #[test]
+    fn default_kayfabe_path_sits_next_to_config_toml() {
+        let path = default_kayfabe_path();
+        assert!(path.ends_with("claude-usage-tray/kayfabe.json"));
     }
 }

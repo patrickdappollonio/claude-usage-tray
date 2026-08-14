@@ -194,7 +194,7 @@ pub fn default_config_path() -> PathBuf {
 }
 
 /// Directory holding the config file.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("claude-usage-tray")

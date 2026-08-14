@@ -223,6 +223,7 @@ enum PostRead {
 
 fn run_tray() {
     let cache_path = source::default_cache_path();
+    let kayfabe_path = source::default_kayfabe_path();
     let stored = config::load();
     let env_secs = config::env_override(std::env::var("CLAUDE_TRAY_POLL_SECS").ok().as_deref());
     let settings = tray::Settings::new(stored, env_secs);
@@ -248,7 +249,8 @@ fn run_tray() {
         });
     }
 
-    let mut snapshot = source::read_snapshot(&cache_path, Timestamp::now());
+    let mut snapshot =
+        source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
 
     let handle = match tray::UsageTray::new(snapshot.clone(), settings, wake_tx).spawn() {
         Ok(handle) => handle,
@@ -289,7 +291,8 @@ fn run_tray() {
             // re-read reports the fresh one (the reader zeroes a percentage
             // whose `resets_at` has passed), so the icon follows the
             // notification instead of lagging a whole interval behind it.
-            let next = source::read_snapshot(&cache_path, Timestamp::now());
+            let next =
+                source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
             if tray::snapshot_changed(&snapshot, &next) {
                 let pushed = next.clone();
                 handle.update(move |tray| tray.snapshot = pushed);
@@ -343,7 +346,7 @@ fn run_tray() {
             break;
         }
 
-        let next = source::read_snapshot(&cache_path, Timestamp::now());
+        let next = source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
         if tray::snapshot_changed(&snapshot, &next) {
             let pushed = next.clone();
             handle.update(move |tray| tray.snapshot = pushed);
