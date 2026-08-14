@@ -50,7 +50,7 @@ pub struct UsageSnapshot {
     /// When Claude Code last wrote the cache — under contract v2 this is the
     /// cache file's mtime rather than a field inside the file. The name is
     /// kept because that is still exactly what it means to every reader
-    /// ("Updated 3 min ago", "Stale since 14:02").
+    /// ("Updated 3 min ago", "Last updated 12 h ago").
     pub written_at: Option<jiff::Timestamp>,
     pub state: SnapshotState,
 }
