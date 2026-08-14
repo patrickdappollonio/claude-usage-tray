@@ -14,11 +14,11 @@ categories = ["command-line-utilities", "gui", "visualization"]
 [profile.release]
 strip = true
 
+# Portable dependencies: everything the platform-independent core needs (see
+# `src/platform/mod.rs` for where the boundary runs).
 [dependencies]
 dirs = "6.0.0"
 jiff = "0.2.35"
-ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
-notify-rust = "4.18.0"
 serde_json = "1.0.151"
 tiny-skia = "0.12.0"
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
@@ -27,6 +27,19 @@ toml = { version = "1.1.4", default-features = false, features = ["parse", "serd
 # binaries stay statically linked; no default features, so no cookies, no
 # proxy stack, no JSON layer.
 ureq = { version = "3.4.0", default-features = false, features = ["rustls", "gzip"] }
+
+# The Linux backend (`src/platform/linux/`): StatusNotifierItem tray, XDG
+# portal, freedesktop notifications.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+# `notify-rust` also supports macOS, but its macOS path pulls in
+# `mac-notification-sys`, whose build script compiles Objective-C — which
+# cannot be done from a Linux host, so `cargo check --target
+# aarch64-apple-darwin` fails on it. It is therefore gated to Linux until the
+# macOS backend is written on a Mac; the toast type the core passes around
+# (`platform::Toast`) is deliberately ours rather than notify-rust's, so
+# re-adding it under a macOS target section is a one-line change.
+notify-rust = "4.18.0"
 # Same zbus ksni already brings in (its `async-io` feature enables that
 # backend); used only for the desktop portal's color-scheme setting.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }

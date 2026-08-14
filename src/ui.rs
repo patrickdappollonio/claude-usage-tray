@@ -1,20 +1,24 @@
-//! The StatusNotifierItem tray implementation and its pure label/notification
-//! logic.
+//! The portable half of the tray: every decision, every piece of user-visible
+//! text, and the menu model — with nothing platform-specific in it.
 //!
 //! Everything that produces user-visible text lives here as a free function
 //! taking `now` and a `TimeZone` explicitly, so it can be unit-tested without a
 //! desktop, a D-Bus session, or a dependency on the machine's clock and locale.
-//! [`UsageTray`] is a thin shell that calls those helpers with the real clock.
+//! [`TrayCore`] is a thin shell that calls those helpers with the real clock,
+//! and the platform backend in [`crate::platform`] is a thin shell around
+//! *that*: it renders [`TrayCore::menu`] with its native menu API and hands
+//! clicks back through [`TrayCore::activate`].
 //!
 //! The notification logic is likewise a pure state machine ([`Notifier`]): it
 //! decides *whether* an alert should fire and returns a description of it. The
-//! actual notify-rust emission happens in `main.rs`, which keeps this module
-//! free of side effects.
+//! actual toast emission happens in `main.rs` via
+//! [`crate::platform::notify`], which keeps this module free of side effects.
 //!
 //! See `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md`.
 
 use crate::config::{self, Config, IconStyle, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
 use crate::icon::IconAppearance;
+use crate::menu::{MenuAction, MenuRow, RadioGroup, RadioOption};
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
 use crate::update::Update;
 use jiff::{Timestamp, tz::TimeZone};
@@ -667,7 +671,7 @@ impl UpdateHandle {
 /// means "my desktop is dark", which is drawn with the light foreground.
 /// `portal_dark` is only consulted for `mono-auto`, and is itself already the
 /// dark-assuming fallback when the portal said nothing (see
-/// [`crate::portal::dark_ui_from_scheme`]).
+/// the portal watcher’s `dark_ui_from_scheme`).
 pub fn resolve_appearance(style: IconStyle, portal_dark: bool) -> IconAppearance {
     match style {
         IconStyle::Color => IconAppearance::Color,
@@ -810,18 +814,56 @@ impl Settings {
     }
 }
 
-/// The tray item itself: holds the latest snapshot, the settings, and a
-/// channel back to the poll loop for the menu actions.
-pub struct UsageTray {
+/// The host capabilities the menu is drawn from.
+///
+/// Probed fresh on every menu build (all three checks are cheap: a
+/// `create_dir_all` plus one tiny file, and two `stat`s), so fixing a
+/// permissions problem un-grays the entries without restarting the tray. Taken
+/// as a parameter by [`TrayCore::menu_with`] rather than read inside it, which
+/// is what lets the row model be unit-tested without touching the real home
+/// directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuEnv {
+    /// Whether the config file can actually be written. Everything that
+    /// persists a setting renders grayed when it cannot.
+    pub can_persist: bool,
+    /// Whether the platform's autostart mechanism is usable.
+    pub autostart_available: bool,
+    /// Whether autostart is currently on, read from the platform rather than
+    /// from the config mirror: the entry is the thing the session manager acts
+    /// on, and the user may have removed it behind our back.
+    pub autostart_enabled: bool,
+}
+
+impl MenuEnv {
+    /// Asks the config file and the platform's autostart backend.
+    pub fn probe() -> Self {
+        MenuEnv {
+            can_persist: config::is_writable(),
+            autostart_available: crate::platform::autostart::is_available(),
+            autostart_enabled: crate::platform::autostart::is_enabled(),
+        }
+    }
+}
+
+/// The portable half of the tray: the latest snapshot, the settings, and a
+/// channel back to the poll loop.
+///
+/// Platform backends own one of these and do three things with it: render its
+/// [`icons`](TrayCore::icons) and [`tooltip`](TrayCore::tooltip), map its
+/// [`menu`](TrayCore::menu) onto the native menu API, and hand user input back
+/// through [`activate`](TrayCore::activate), [`select`](TrayCore::select) and
+/// [`clicked`](TrayCore::clicked). No decision lives in a backend.
+pub struct TrayCore {
     pub snapshot: UsageSnapshot,
     settings: Settings,
     tz: TimeZone,
     wake: Sender<Wake>,
 }
 
-impl UsageTray {
+impl TrayCore {
     pub fn new(snapshot: UsageSnapshot, settings: Settings, wake: Sender<Wake>) -> Self {
-        UsageTray {
+        TrayCore {
             snapshot,
             settings,
             tz: TimeZone::system(),
@@ -833,6 +875,22 @@ impl UsageTray {
         // A closed channel means the poll loop is already gone; there is
         // nothing useful to do about it and panicking would kill the tray.
         let _ = self.wake.send(wake);
+    }
+
+    /// The icon pixmaps for the current snapshot and appearance.
+    pub fn icons(&self) -> Vec<crate::icon::IconImage> {
+        crate::icon::render_icons(&self.snapshot, self.settings.appearance.resolved())
+    }
+
+    /// The tooltip body: the same three lines the menu opens with.
+    pub fn tooltip(&self) -> String {
+        tooltip_text(&self.snapshot, Timestamp::now(), &self.tz)
+    }
+
+    /// Left-click: show a worded summary of current usage. Unlike "Check for
+    /// new data" this never reports whether the cache moved.
+    pub fn clicked(&self) {
+        self.send(Wake::ShowStatus);
     }
 
     /// Radio-group handler: persist the chosen interval and, unless the
@@ -872,12 +930,12 @@ impl UsageTray {
         }
     }
 
-    /// Checkbox handler: flip the XDG autostart entry, then mirror the new
-    /// state into the config file. If writing the entry failed, nothing is
+    /// Checkbox handler: flip the platform's autostart entry, then mirror the
+    /// new state into the config file. If writing the entry failed, nothing is
     /// recorded and the checkbox stays where it was.
     fn toggle_launch_at_login(&mut self) {
-        let wanted = !crate::autostart::is_enabled();
-        if !crate::autostart::set_enabled(wanted) {
+        let wanted = !crate::platform::autostart::is_enabled();
+        if !crate::platform::autostart::set_enabled(wanted) {
             return;
         }
         self.settings.config.launch_at_login = wanted;
@@ -916,240 +974,158 @@ impl UsageTray {
         let enabled = !self.settings.config.check_updates;
         self.settings.config.check_updates = enabled;
         config::save(&self.settings.config);
-        self.settings
-            .check_updates
-            .store(enabled, Ordering::Relaxed);
+        self.settings.check_updates.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Runs the action behind a menu row. Called by the backend from whatever
+    /// thread its menu callbacks arrive on, so everything here is either
+    /// in-memory or a small config write — the two slow things (the hook
+    /// install and the cache re-read) are deferred to the poll loop through a
+    /// [`Wake`].
+    pub fn activate(&mut self, action: &MenuAction) {
+        match action {
+            MenuAction::InstallHook => self.send(Wake::InstallHook),
+            // `xdg-open` (or its platform equivalent) is spawned and never
+            // waited on, so a slow browser cannot block the callback thread.
+            MenuAction::OpenUrl(url) => crate::update::open_url(url),
+            MenuAction::Refresh => self.send(Wake::Refresh),
+            MenuAction::Quit => self.send(Wake::Quit),
+            MenuAction::ToggleLaunchAtLogin => self.toggle_launch_at_login(),
+            MenuAction::ToggleThreshold(threshold) => self.toggle_threshold(*threshold),
+            MenuAction::ToggleNotifyOnReset => self.toggle_notify_on_reset(),
+            MenuAction::ToggleCheckUpdates => self.toggle_check_updates(),
+        }
+    }
+
+    /// Runs a radio-group selection.
+    pub fn select(&mut self, group: RadioGroup, index: usize) {
+        match group {
+            RadioGroup::RefreshInterval => self.select_refresh(index),
+            RadioGroup::IconStyle => self.select_icon_style(index),
+        }
+    }
+
+    /// The menu as the user should see it right now.
+    pub fn menu(&self) -> Vec<MenuRow> {
+        self.menu_with(Timestamp::now(), MenuEnv::probe())
+    }
+
+    /// The menu for an explicit clock and host capability set, so every row can
+    /// be pinned by a test.
+    pub fn menu_with(&self, now: Timestamp, env: MenuEnv) -> Vec<MenuRow> {
+        let mut rows = vec![
+            MenuRow::info(session_line(self.snapshot.session.as_ref(), now, &self.tz)),
+            MenuRow::info(weekly_line(self.snapshot.weekly.as_ref(), now, &self.tz)),
+            MenuRow::info(status_line(&self.snapshot, now, &self.tz)),
+        ];
+        if shows_install_item(&self.snapshot.state) {
+            // The one enabled row in the no-data state: everything else here
+            // is a label, and a first-run user needs exactly one thing to do.
+            rows.push(MenuRow::action("Install hook", MenuAction::InstallHook));
+        }
+        rows.push(MenuRow::Separator);
+        if let Some(update) = self.settings.update.get() {
+            // Enabled, unlike the three info rows above it: this one does
+            // something.
+            rows.push(MenuRow::action(
+                update.label(),
+                MenuAction::OpenUrl(update.url.clone()),
+            ));
+        }
+        rows.extend([
+            self.settings_menu(env),
+            MenuRow::action("Check for new data", MenuAction::Refresh),
+            MenuRow::action("Quit", MenuAction::Quit),
+        ]);
+        rows
     }
 
     /// The `Notifications` sub-submenu. `enabled` is the capability probe
     /// result: with an unwritable config directory every toggle here would
     /// silently fail to persist, so they render grayed instead.
-    fn notifications_menu(&self, enabled: bool) -> ksni::MenuItem<Self> {
-        let mut submenu: Vec<ksni::MenuItem<Self>> = NOTIFY_THRESHOLDS
+    fn notifications_menu(&self, enabled: bool) -> MenuRow {
+        let mut rows: Vec<MenuRow> = NOTIFY_THRESHOLDS
             .iter()
-            .map(|&threshold| {
-                ksni::menu::CheckmarkItem {
-                    label: format!("At {threshold}%"),
-                    enabled,
-                    checked: self.settings.config.notifies_at(threshold),
-                    activate: Box::new(move |tray: &mut Self| tray.toggle_threshold(threshold)),
-                    ..Default::default()
-                }
-                .into()
+            .map(|&threshold| MenuRow::Check {
+                label: format!("At {threshold}%"),
+                action: MenuAction::ToggleThreshold(threshold),
+                checked: self.settings.config.notifies_at(threshold),
+                enabled,
             })
             .collect();
-        submenu.push(ksni::MenuItem::Separator);
-        submenu.push(
-            ksni::menu::CheckmarkItem {
-                label: "When quota resets".into(),
-                enabled,
-                checked: self.settings.config.notify_on_reset,
-                activate: Box::new(|tray: &mut Self| tray.toggle_notify_on_reset()),
-                ..Default::default()
-            }
-            .into(),
-        );
-        ksni::menu::SubMenu {
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::Check {
+            label: "When quota resets".into(),
+            action: MenuAction::ToggleNotifyOnReset,
+            checked: self.settings.config.notify_on_reset,
+            enabled,
+        });
+        MenuRow::SubMenu {
             label: "Notifications".into(),
-            submenu,
-            ..Default::default()
+            rows,
         }
-        .into()
     }
 
     /// The `Settings` submenu.
-    fn settings_menu(&self) -> ksni::MenuItem<Self> {
-        // Probed on every menu build (cheap: a create_dir_all plus one tiny
-        // file), so fixing a permissions problem un-grays the entries without
-        // restarting the tray.
-        let can_persist = config::is_writable();
-        let can_autostart = crate::autostart::is_available();
-        let mut submenu: Vec<ksni::MenuItem<Self>> = vec![
-            ksni::menu::CheckmarkItem {
+    fn settings_menu(&self, env: MenuEnv) -> MenuRow {
+        let can_persist = env.can_persist;
+        let mut rows: Vec<MenuRow> = vec![
+            MenuRow::Check {
                 label: "Launch at login".into(),
-                enabled: can_autostart,
-                // Read from disk, not from the config mirror: the file is the
-                // thing the session manager actually acts on, and the user may
-                // have removed it behind our back.
-                checked: crate::autostart::is_enabled(),
-                activate: Box::new(|tray: &mut Self| tray.toggle_launch_at_login()),
-                ..Default::default()
-            }
-            .into(),
-            ksni::MenuItem::Separator,
+                action: MenuAction::ToggleLaunchAtLogin,
+                checked: env.autostart_enabled,
+                enabled: env.autostart_available,
+            },
+            MenuRow::Separator,
             self.notifications_menu(can_persist),
-            ksni::MenuItem::Separator,
-            ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label: "Refresh interval".into(),
-                enabled: false,
-                ..Default::default()
-            }),
-            ksni::menu::RadioGroup {
+            MenuRow::Separator,
+            MenuRow::info("Refresh interval"),
+            MenuRow::Radio {
+                group: RadioGroup::RefreshInterval,
                 selected: self.settings.config.refresh_choice(),
-                select: Box::new(|tray: &mut Self, index: usize| tray.select_refresh(index)),
                 options: REFRESH_CHOICES
                     .iter()
-                    .map(|secs| ksni::menu::RadioItem {
+                    .map(|secs| RadioOption {
                         label: format!("{secs} s"),
                         enabled: can_persist,
-                        ..Default::default()
                     })
                     .collect(),
-            }
-            .into(),
-            ksni::MenuItem::Separator,
-            ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label: "Icon style".into(),
-                enabled: false,
-                ..Default::default()
-            }),
-            ksni::menu::RadioGroup {
+            },
+            MenuRow::Separator,
+            MenuRow::info("Icon style"),
+            MenuRow::Radio {
+                group: RadioGroup::IconStyle,
                 selected: self.settings.config.icon_style.choice(),
-                select: Box::new(|tray: &mut Self, index: usize| tray.select_icon_style(index)),
                 options: IconStyle::ALL
                     .iter()
-                    .map(|style| ksni::menu::RadioItem {
+                    .map(|style| RadioOption {
                         label: style.label().to_string(),
                         enabled: can_persist,
-                        ..Default::default()
                     })
                     .collect(),
-            }
-            .into(),
+            },
         ];
         if self.settings.env_locked {
             // Without this the radio group would look broken: the choice is
             // saved, but the tray keeps polling at the environment's cadence.
-            submenu.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label: format!(
-                    "(CLAUDE_TRAY_POLL_SECS={} is in effect)",
-                    self.settings.interval.load(Ordering::Relaxed)
-                ),
-                enabled: false,
-                ..Default::default()
-            }));
+            rows.push(MenuRow::info(format!(
+                "(CLAUDE_TRAY_POLL_SECS={} is in effect)",
+                self.settings.interval.load(Ordering::Relaxed)
+            )));
         }
-        submenu.push(ksni::MenuItem::Separator);
-        submenu.push(
-            ksni::menu::CheckmarkItem {
-                label: "Check for updates".into(),
-                // Grayed with the rest of the persisted settings: a toggle
-                // that cannot be written would silently revert on restart.
-                enabled: can_persist,
-                checked: self.settings.config.check_updates,
-                activate: Box::new(|tray: &mut Self| tray.toggle_check_updates()),
-                ..Default::default()
-            }
-            .into(),
-        );
-        ksni::menu::SubMenu {
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::Check {
+            label: "Check for updates".into(),
+            action: MenuAction::ToggleCheckUpdates,
+            // Grayed with the rest of the persisted settings: a toggle that
+            // cannot be written would silently revert on restart.
+            checked: self.settings.config.check_updates,
+            enabled: can_persist,
+        });
+        MenuRow::SubMenu {
             label: "Settings".into(),
-            submenu,
-            ..Default::default()
+            rows,
         }
-        .into()
-    }
-}
-
-impl ksni::Tray for UsageTray {
-    fn id(&self) -> String {
-        "claude-usage-tray".into()
-    }
-
-    fn title(&self) -> String {
-        "Claude usage".into()
-    }
-
-    fn category(&self) -> ksni::Category {
-        ksni::Category::ApplicationStatus
-    }
-
-    fn status(&self) -> ksni::Status {
-        ksni::Status::Active
-    }
-
-    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        crate::icon::render_icons(&self.snapshot, self.settings.appearance.resolved())
-    }
-
-    fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip {
-            title: "Claude usage".into(),
-            description: tooltip_text(&self.snapshot, Timestamp::now(), &self.tz),
-            ..Default::default()
-        }
-    }
-
-    /// Left-click: show a worded summary of current usage. Unlike "Check for
-    /// new data" this never reports whether the cache moved.
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.send(Wake::ShowStatus);
-    }
-
-    /// Overriding this (even as a no-op) opts out of ksni's `NO_ABOUT_TO_SHOW`
-    /// default, which otherwise skips the update_properties/update_menu pass
-    /// before the menu opens. Without this override, rows like "Updated N min
-    /// ago" only refresh when the poll loop happens to push a changed
-    /// snapshot, so the menu can show stale text while open.
-    fn menu_about_to_show(&mut self) {}
-
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        let now = Timestamp::now();
-        let info = |label: String| {
-            ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label,
-                enabled: false,
-                ..Default::default()
-            })
-        };
-        let mut items = vec![
-            info(session_line(self.snapshot.session.as_ref(), now, &self.tz)),
-            info(weekly_line(self.snapshot.weekly.as_ref(), now, &self.tz)),
-            info(status_line(&self.snapshot, now, &self.tz)),
-        ];
-        if shows_install_item(&self.snapshot.state) {
-            // The one enabled row in the no-data state: everything else here
-            // is a label, and a first-run user needs exactly one thing to do.
-            items.push(
-                ksni::menu::StandardItem {
-                    label: "Install hook".into(),
-                    activate: Box::new(|tray: &mut Self| tray.send(Wake::InstallHook)),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        items.push(ksni::MenuItem::Separator);
-        if let Some(update) = self.settings.update.get() {
-            // Enabled, unlike the three info rows above it: this one does
-            // something. `xdg-open` is spawned and never waited on, so a slow
-            // browser cannot block the D-Bus thread this callback runs on.
-            let url = update.url.clone();
-            items.push(
-                ksni::menu::StandardItem {
-                    label: update.label(),
-                    activate: Box::new(move |_tray: &mut Self| crate::update::open_url(&url)),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        items.extend([
-            self.settings_menu(),
-            ksni::menu::StandardItem {
-                label: "Check for new data".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(Wake::Refresh)),
-                ..Default::default()
-            }
-            .into(),
-            ksni::menu::StandardItem {
-                label: "Quit".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(Wake::Quit)),
-                ..Default::default()
-            }
-            .into(),
-        ]);
-        items
     }
 }
 
@@ -2190,5 +2166,329 @@ mod tests {
         };
         settings.notify.set(changed.clone());
         assert_eq!(handle.get(), changed);
+    }
+
+    // ---- the menu model -------------------------------------------------
+    //
+    // The rows are what the user actually sees, and every backend renders
+    // them verbatim, so these pin the model rather than any one platform's
+    // menu API.
+
+    /// A core with a channel kept alive (dropping the receiver would make
+    /// every `send` a silent no-op, which these tests do not exercise).
+    fn core_for(
+        snapshot: UsageSnapshot,
+        config: Config,
+        env_secs: Option<u64>,
+    ) -> (TrayCore, std::sync::mpsc::Receiver<Wake>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            TrayCore::new(snapshot, Settings::new(config, env_secs), tx),
+            rx,
+        )
+    }
+
+    /// Everything available: the state a healthy desktop reports.
+    fn all_available() -> MenuEnv {
+        MenuEnv {
+            can_persist: true,
+            autostart_available: true,
+            autostart_enabled: false,
+        }
+    }
+
+    /// One row, flattened to something a test can assert on. Separators and
+    /// radio groups have no label of their own.
+    fn label_of(row: &MenuRow) -> String {
+        match row {
+            MenuRow::Info { label }
+            | MenuRow::Action { label, .. }
+            | MenuRow::Check { label, .. }
+            | MenuRow::SubMenu { label, .. } => label.clone(),
+            MenuRow::Radio { .. } => "<radio>".to_string(),
+            MenuRow::Separator => "---".to_string(),
+        }
+    }
+
+    fn labels(rows: &[MenuRow]) -> Vec<String> {
+        rows.iter().map(label_of).collect()
+    }
+
+    fn submenu<'a>(rows: &'a [MenuRow], label: &str) -> &'a [MenuRow] {
+        rows.iter()
+            .find_map(|row| match row {
+                MenuRow::SubMenu { label: l, rows } if l == label => Some(rows.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {label:?} submenu"))
+    }
+
+    /// A snapshot with percentages but no reset times, so the labels do not
+    /// depend on the machine's time zone.
+    fn timeless(state: SnapshotState) -> UsageSnapshot {
+        UsageSnapshot {
+            session: Some(metric(Some(42.0), None)),
+            weekly: Some(metric(Some(61.0), None)),
+            written_at: Some(ts(BASE - 60)),
+            state,
+        }
+    }
+
+    #[test]
+    fn the_menu_opens_with_the_three_info_rows_and_ends_with_the_actions() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        let rows = core.menu_with(ts(BASE), all_available());
+        assert_eq!(
+            labels(&rows),
+            vec![
+                "Session: 42%",
+                "Weekly: 61%",
+                "Updated 1 min ago",
+                "---",
+                "Settings",
+                "Check for new data",
+                "Quit",
+            ]
+        );
+        // The first three are labels, not controls.
+        assert!(matches!(rows[0], MenuRow::Info { .. }));
+        assert!(matches!(rows[1], MenuRow::Info { .. }));
+        assert!(matches!(rows[2], MenuRow::Info { .. }));
+        assert_eq!(
+            rows[5],
+            MenuRow::action("Check for new data", MenuAction::Refresh)
+        );
+        assert_eq!(rows[6], MenuRow::action("Quit", MenuAction::Quit));
+    }
+
+    #[test]
+    fn the_install_row_appears_only_while_there_is_no_data() {
+        for state in [SnapshotState::Fresh, SnapshotState::Stale] {
+            let (core, _rx) = core_for(timeless(state.clone()), Config::default(), None);
+            let rows = core.menu_with(ts(BASE), all_available());
+            assert!(
+                !labels(&rows).contains(&"Install hook".to_string()),
+                "{state:?} must not offer the install item"
+            );
+        }
+
+        let (core, _rx) = core_for(
+            snapshot(SnapshotState::Missing, None),
+            Config::default(),
+            None,
+        );
+        let rows = core.menu_with(ts(BASE), all_available());
+        // Directly under the diagnosis row it explains.
+        assert_eq!(
+            rows[3],
+            MenuRow::action("Install hook", MenuAction::InstallHook)
+        );
+    }
+
+    #[test]
+    fn the_update_row_appears_once_a_release_is_found() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        assert!(
+            !labels(&core.menu_with(ts(BASE), all_available()))
+                .iter()
+                .any(|label| label.contains("Update available")),
+            "nothing to advertise before the checker runs"
+        );
+
+        let update = Update {
+            version: "0.2.0".into(),
+            url: "https://example.test/releases/tag/v0.2.0".into(),
+        };
+        core.settings.update.set(Some(update.clone()));
+        let rows = core.menu_with(ts(BASE), all_available());
+        // Between the separator and the `Settings` submenu, and clickable.
+        assert_eq!(
+            rows[4],
+            MenuRow::action(update.label(), MenuAction::OpenUrl(update.url.clone()))
+        );
+    }
+
+    #[test]
+    fn the_settings_submenu_lists_every_control_in_order() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        let rows = core.menu_with(ts(BASE), all_available());
+        assert_eq!(
+            labels(submenu(&rows, "Settings")),
+            vec![
+                "Launch at login",
+                "---",
+                "Notifications",
+                "---",
+                "Refresh interval",
+                "<radio>",
+                "---",
+                "Icon style",
+                "<radio>",
+                "---",
+                "Check for updates",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_radio_groups_offer_every_choice_and_mark_the_configured_one() {
+        let config = Config {
+            refresh_secs: REFRESH_CHOICES[1],
+            icon_style: IconStyle::MonoLight,
+            ..Config::default()
+        };
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), config, None);
+        let rows = core.menu_with(ts(BASE), all_available());
+        let settings = submenu(&rows, "Settings");
+
+        match &settings[5] {
+            MenuRow::Radio {
+                group,
+                selected,
+                options,
+            } => {
+                assert_eq!(*group, RadioGroup::RefreshInterval);
+                assert_eq!(*selected, 1);
+                assert_eq!(options.len(), REFRESH_CHOICES.len());
+                assert_eq!(options[0].label, format!("{} s", REFRESH_CHOICES[0]));
+            }
+            other => panic!("expected the interval radio group, got {other:?}"),
+        }
+        match &settings[8] {
+            MenuRow::Radio {
+                group,
+                selected,
+                options,
+            } => {
+                assert_eq!(*group, RadioGroup::IconStyle);
+                assert_eq!(*selected, IconStyle::MonoLight.choice());
+                assert_eq!(options.len(), IconStyle::ALL.len());
+            }
+            other => panic!("expected the icon-style radio group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_notifications_submenu_mirrors_the_configured_thresholds() {
+        let mut config = Config::default();
+        config.set_notifies_at(NOTIFY_THRESHOLDS[0], false);
+        config.notify_on_reset = false;
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), config, None);
+        let rows = core.menu_with(ts(BASE), all_available());
+        let notifications = submenu(submenu(&rows, "Settings"), "Notifications");
+
+        assert_eq!(notifications.len(), NOTIFY_THRESHOLDS.len() + 2);
+        assert_eq!(
+            notifications[0],
+            MenuRow::Check {
+                label: format!("At {}%", NOTIFY_THRESHOLDS[0]),
+                action: MenuAction::ToggleThreshold(NOTIFY_THRESHOLDS[0]),
+                checked: false,
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            notifications[1],
+            MenuRow::Check {
+                label: format!("At {}%", NOTIFY_THRESHOLDS[1]),
+                action: MenuAction::ToggleThreshold(NOTIFY_THRESHOLDS[1]),
+                checked: true,
+                enabled: true,
+            }
+        );
+        assert!(matches!(
+            notifications[NOTIFY_THRESHOLDS.len()],
+            MenuRow::Separator
+        ));
+        assert_eq!(
+            notifications[NOTIFY_THRESHOLDS.len() + 1],
+            MenuRow::Check {
+                label: "When quota resets".into(),
+                action: MenuAction::ToggleNotifyOnReset,
+                checked: false,
+                enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unwritable_config_grays_every_persisted_control() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        let env = MenuEnv {
+            can_persist: false,
+            autostart_available: true,
+            autostart_enabled: true,
+        };
+        let rows = core.menu_with(ts(BASE), env);
+        let settings = submenu(&rows, "Settings");
+
+        // Autostart is a separate capability: it stays usable, and reports the
+        // state read from the platform rather than from the config mirror.
+        assert_eq!(
+            settings[0],
+            MenuRow::Check {
+                label: "Launch at login".into(),
+                action: MenuAction::ToggleLaunchAtLogin,
+                checked: true,
+                enabled: true,
+            }
+        );
+        for row in [&settings[5], &settings[8]] {
+            match row {
+                MenuRow::Radio { options, .. } => {
+                    assert!(options.iter().all(|option| !option.enabled));
+                }
+                other => panic!("expected a radio group, got {other:?}"),
+            }
+        }
+        for row in submenu(settings, "Notifications") {
+            if let MenuRow::Check { enabled, label, .. } = row {
+                assert!(!enabled, "{label} should be grayed");
+            }
+        }
+        match &settings[10] {
+            MenuRow::Check { label, enabled, .. } => {
+                assert_eq!(label, "Check for updates");
+                assert!(!enabled);
+            }
+            other => panic!("expected the update checkbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unavailable_autostart_directory_grays_only_that_checkbox() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        let env = MenuEnv {
+            can_persist: true,
+            autostart_available: false,
+            autostart_enabled: false,
+        };
+        let settings = submenu(&core.menu_with(ts(BASE), env), "Settings").to_vec();
+        match &settings[0] {
+            MenuRow::Check { enabled, .. } => assert!(!enabled),
+            other => panic!("expected the autostart checkbox, got {other:?}"),
+        }
+        match &settings[10] {
+            MenuRow::Check { enabled, .. } => assert!(enabled, "the rest stays usable"),
+            other => panic!("expected the update checkbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_env_override_note_appears_only_while_the_environment_wins() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        assert!(
+            !labels(submenu(&core.menu_with(ts(BASE), all_available()), "Settings"))
+                .iter()
+                .any(|label| label.contains("CLAUDE_TRAY_POLL_SECS"))
+        );
+
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), Some(7));
+        let settings = submenu(&core.menu_with(ts(BASE), all_available()), "Settings").to_vec();
+        // Right after the icon-style group, before the final separator.
+        assert_eq!(
+            settings[9],
+            MenuRow::info("(CLAUDE_TRAY_POLL_SECS=7 is in effect)")
+        );
     }
 }

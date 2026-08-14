@@ -8,58 +8,64 @@
 //! subcommand) and its own installer (`hook install|uninstall|status`), so
 //! there is no shell snippet anywhere in the design.
 //!
-//! Threading (tray mode): `ksni::blocking::TrayMethods::spawn` runs the D-Bus
-//! service on its own thread and hands back a `Handle`. The main thread then
-//! *is* the poll loop, waiting on an mpsc channel with a timeout so that
-//! "Check for new data", left-click (a worded usage summary), "Quit",
-//! "Install hook", and interval changes take effect immediately instead of on
-//! the next tick.
+//! Threading (tray mode): the platform backend decides which thread the poll
+//! loop gets ([`platform::run`] takes it as a closure precisely so that
+//! neither side has to assume). On Linux the tray service runs on its own
+//! thread and the main thread *is* the poll loop, waiting on an mpsc channel
+//! with a timeout so that "Check for new data", left-click (a worded usage
+//! summary), "Quit", "Install hook", and interval changes take effect
+//! immediately instead of on the next tick.
 
-mod autostart;
+// The macOS backend is still a stub (`src/platform/macos/`), so it never calls
+// into the portable core and almost everything below `platform` looks unused
+// when type-checking for Darwin. Expected until the real backend lands; the
+// Linux build is unaffected.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 mod config;
 mod hook;
 mod icon;
-mod portal;
+mod menu;
+mod platform;
 mod source;
 #[cfg(test)]
 mod testutil;
-mod tray;
+mod ui;
 mod update;
 
 use jiff::{Timestamp, tz::TimeZone};
-use ksni::blocking::TrayMethods;
+use platform::{Toast, Urgency};
 use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
-use tray::{ResetAlert, UsageAlert, Wake};
+use ui::{ResetAlert, UsageAlert, Wake};
 
 /// Emits a threshold notification. Failures (no notification daemon, D-Bus
-/// down) are ignored: a missing notification must never take the tray with it.
+/// down) are ignored by the backend: a missing notification must never take
+/// the tray with it.
 fn notify(alert: &UsageAlert) {
-    let mut notification = notify_rust::Notification::new();
-    notification
-        .appname("Claude usage tray")
-        .summary(&alert.summary())
-        .body(&alert.body())
-        .urgency(if alert.critical {
-            notify_rust::Urgency::Critical
+    platform::notify(&Toast {
+        summary: alert.summary(),
+        body: alert.body(),
+        urgency: if alert.critical {
+            Urgency::Critical
         } else {
-            notify_rust::Urgency::Normal
-        });
-    let _ = notification.show();
+            Urgency::Normal
+        },
+        transient: false,
+    });
 }
 
 /// Emits the "your 5-hour window rolled over" notification. Normal urgency:
 /// it is good news, not a warning.
 fn notify_reset(alert: &ResetAlert) {
-    let mut notification = notify_rust::Notification::new();
-    notification
-        .appname("Claude usage tray")
-        .summary(&alert.summary())
-        .body(&alert.body())
-        .urgency(notify_rust::Urgency::Normal);
-    let _ = notification.show();
+    platform::notify(&Toast {
+        summary: alert.summary(),
+        body: alert.body(),
+        urgency: Urgency::Normal,
+        transient: false,
+    });
 }
 
 /// Emits the toast that follows a *user-initiated* action ("Check for new
@@ -67,14 +73,12 @@ fn notify_reset(alert: &ResetAlert) {
 /// urgency and transient, so it acknowledges the click without piling up in
 /// notification history the way the threshold alerts (deliberately) do.
 fn notify_refresh(body: &str) {
-    let mut notification = notify_rust::Notification::new();
-    notification
-        .appname("Claude usage tray")
-        .summary("Claude usage tray")
-        .body(body)
-        .urgency(notify_rust::Urgency::Low)
-        .hint(notify_rust::Hint::Transient(true));
-    let _ = notification.show();
+    platform::notify(&Toast {
+        summary: "Claude usage tray".to_string(),
+        body: body.to_string(),
+        urgency: Urgency::Low,
+        transient: true,
+    });
 }
 
 const USAGE: &str = "\
@@ -237,7 +241,7 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// and the process exits out from under it when the user quits.
 fn spawn_update_checker(
     enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    found: tray::UpdateHandle,
+    found: ui::UpdateHandle,
     wake: mpsc::Sender<Wake>,
 ) {
     std::thread::spawn(move || {
@@ -280,7 +284,7 @@ fn run_tray() {
     let kayfabe_path = source::default_kayfabe_path();
     let stored = config::load();
     let env_secs = config::env_override(std::env::var("CLAUDE_TRAY_POLL_SECS").ok().as_deref());
-    let settings = tray::Settings::new(stored, env_secs);
+    let settings = ui::Settings::new(stored, env_secs);
     let interval = settings.interval_handle();
     let notify_prefs = settings.notify_handle();
     let appearance = settings.appearance_handle();
@@ -302,33 +306,59 @@ fn run_tray() {
     {
         let appearance = appearance.clone();
         let wake_tx = wake_tx.clone();
-        portal::spawn_watcher(move |dark_ui| {
+        platform::watch_appearance(move |dark_ui| {
             if appearance.set_portal_dark(dark_ui) {
                 let _ = wake_tx.send(Wake::AppearanceChanged);
             }
         });
     }
 
-    let mut snapshot =
-        source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
+    let snapshot = source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
 
-    let handle = match tray::UsageTray::new(snapshot.clone(), settings, wake_tx).spawn() {
-        Ok(handle) => handle,
-        Err(err) => {
-            eprintln!(
-                "claude-usage-tray: could not start the tray service: {err}\n\
-                 Is a StatusNotifierItem host (KDE Plasma, or GNOME with the \
-                 AppIndicator extension) running?"
-            );
-            std::process::exit(1);
-        }
-    };
+    let core = ui::TrayCore::new(snapshot.clone(), settings, wake_tx);
+    // Blocks for the rest of the program: on Linux the closure below runs on
+    // this thread and the tray service gets one of its own; another backend may
+    // do the reverse. Nothing after this call may assume it came back early.
+    let started = platform::run(core, move |handle| {
+        poll_loop(
+            handle,
+            snapshot,
+            &cache_path,
+            &kayfabe_path,
+            &wake_rx,
+            &interval,
+            &notify_prefs,
+            &tz,
+        );
+    });
+    if let Err(err) = started {
+        eprintln!("claude-usage-tray: {err}");
+        std::process::exit(1);
+    }
+}
 
+/// The poll loop: re-reads the cache on a timer, on demand, and whenever a
+/// pending quota reset comes due, pushing anything that changed to the tray and
+/// emitting the notifications the pure state machines in [`ui`] ask for.
+///
+/// Returning ends the program — the backend shuts the tray down and
+/// [`platform::run`] returns.
+#[allow(clippy::too_many_arguments)]
+fn poll_loop(
+    handle: platform::TrayHandle,
+    mut snapshot: source::UsageSnapshot,
+    cache_path: &std::path::Path,
+    kayfabe_path: &std::path::Path,
+    wake_rx: &mpsc::Receiver<Wake>,
+    interval: &std::sync::atomic::AtomicU64,
+    notify_prefs: &ui::NotifyHandle,
+    tz: &TimeZone,
+) {
     // The first cycle's reading becomes the notifier's baseline rather than a
     // volley of alerts for crossings that happened before this process
     // existed; see `Notifier`.
-    let mut notifier = tray::Notifier::new(&notify_prefs.get().thresholds);
-    let mut reset_notifier = tray::ResetNotifier::new();
+    let mut notifier = ui::Notifier::new(&notify_prefs.get().thresholds);
+    let mut reset_notifier = ui::ResetNotifier::new();
 
     loop {
         // Re-read the preferences every cycle so a menu toggle applies live.
@@ -355,10 +385,9 @@ fn run_tray() {
             // whose `resets_at` has passed), so the icon follows the
             // notification instead of lagging a whole interval behind it.
             let next =
-                source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
-            if tray::snapshot_changed(&snapshot, &next) {
-                let pushed = next.clone();
-                handle.update(move |tray| tray.snapshot = pushed);
+                source::read_snapshot_or_kayfabe(cache_path, kayfabe_path, Timestamp::now());
+            if ui::snapshot_changed(&snapshot, &next) {
+                handle.set_snapshot(next.clone());
             }
             snapshot = next;
             continue;
@@ -366,7 +395,7 @@ fn run_tray() {
 
         // Re-read the interval every cycle so a settings change applies live,
         // and never sleep past a pending quota reset.
-        let wait = tray::poll_wait(
+        let wait = ui::poll_wait(
             interval.load(Ordering::Relaxed),
             reset_notifier.deadline(),
             Timestamp::now(),
@@ -386,22 +415,22 @@ fn run_tray() {
             Ok(Wake::NotifyChanged) => continue,
             // The icon style changed, or the desktop switched theme under
             // `mono-auto`. The appearance is shared state that `icon_pixmap`
-            // reads, so an empty update is enough to make ksni re-render and
-            // push the new pixmaps.
+            // reads, so a bare refresh is enough to make the backend re-render
+            // and push the new pixmaps.
             Ok(Wake::AppearanceChanged) => {
-                handle.update(|_tray| {});
+                handle.refresh();
                 continue;
             }
             // A newer release was found. The release itself is already in
-            // shared state that `menu` reads, so an empty update is enough to
+            // shared state that `menu` reads, so a bare refresh is enough to
             // make the extra row appear. No toast: a version banner is not
             // worth interrupting anyone for.
             Ok(Wake::UpdateAvailable) => {
-                handle.update(|_tray| {});
+                handle.refresh();
                 continue;
             }
             // The first-run menu item. The install itself runs here, off the
-            // D-Bus callback, then falls through to a re-read: the cache will
+            // menu callback, then falls through to a re-read: the cache will
             // still be missing until Claude Code next refreshes, which is
             // exactly what the toast says.
             Ok(Wake::InstallHook) => {
@@ -417,27 +446,24 @@ fn run_tray() {
             break;
         }
 
-        let next = source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
-        if tray::snapshot_changed(&snapshot, &next) {
-            let pushed = next.clone();
-            handle.update(move |tray| tray.snapshot = pushed);
+        let next = source::read_snapshot_or_kayfabe(cache_path, kayfabe_path, Timestamp::now());
+        if ui::snapshot_changed(&snapshot, &next) {
+            handle.set_snapshot(next.clone());
         }
         match post_read {
             PostRead::RefreshToast => {
-                notify_refresh(&tray::refresh_message(
+                notify_refresh(&ui::refresh_message(
                     &snapshot,
                     &next,
                     Timestamp::now(),
-                    &tz,
+                    tz,
                 ));
             }
             PostRead::StatusToast => {
-                notify_refresh(&tray::status_message(&next, Timestamp::now(), &tz));
+                notify_refresh(&ui::status_message(&next, Timestamp::now(), tz));
             }
             PostRead::Silent => {}
         }
         snapshot = next;
     }
-
-    handle.shutdown().wait();
 }

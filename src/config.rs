@@ -49,7 +49,7 @@ pub fn is_critical(threshold: u8) -> bool {
 /// The two pinned monochrome options are named for *the user's UI*, not for
 /// the icon: `MonoDark` means "my desktop is dark", which needs a light icon.
 /// `MonoAuto` asks the XDG desktop portal which one it is (see
-/// [`crate::portal`]).
+/// the XDG portal watcher in `platform/linux/portal.rs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IconStyle {
     /// The severity-banded color gauge (green/amber/orange/red).
