@@ -145,15 +145,25 @@ running one differ.
 
 The ksni tray service runs on its own thread; the main thread runs the poll
 loop, re-reading the cache file on an interval (see [Settings](#settings)
-below) and updating the icon when the content changes. Left-click the icon or
-use "Check for new data" in the menu to force an immediate re-read. "Quit"
-exits cleanly.
+below) and updating the icon when the content changes. Left-click shows a
+summary of your current usage; use "Check for new data" in the menu to force
+a re-read. "Quit" exits cleanly.
+
+Left-click re-reads the cache and pops a short, low-priority notification
+worded from what it finds, for example:
+
+- `You've used 32% of your 5-hour session (resets at 03:50) and 33% of your
+  weekly limit (resets Tue 09:00).`
+- The same sentence with `Last updated 12 h ago.` appended if the cache is
+  stale.
+- `No usage data — install the statusline hook.` if there is no readable
+  cache file at all.
 
 The menu item is called "Check for new data" rather than "Refresh" on
 purpose: it re-reads the local cache file, which only moves forward when
 Claude Code itself runs your statusline. Clicking it cannot make Claude Code
-report sooner. To tell you which of the two happened, a user-initiated
-re-read pops a short, low-priority notification:
+report sooner. To tell you which of the two happened, it pops its own
+notification instead of the summary above:
 
 - `Updated — Session 7%, Weekly 28%` — the cache had newer data.
 - `No new data — Claude Code last reported at 14:32` — the cache is
@@ -161,8 +171,8 @@ re-read pops a short, low-priority notification:
 - `No data — install the statusline hook` — there is no readable cache file
   at all.
 
-These are marked transient, so they disappear on their own and do not pile
-up in your notification history. Timer-driven polls never notify.
+Both kinds of toast are marked transient, so they disappear on their own and
+do not pile up in your notification history. Timer-driven polls never notify.
 
 ## Desktop compatibility
 

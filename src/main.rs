@@ -9,8 +9,9 @@
 //! Threading (tray mode): `ksni::blocking::TrayMethods::spawn` runs the D-Bus
 //! service on its own thread and hands back a `Handle`. The main thread then
 //! *is* the poll loop, waiting on an mpsc channel with a timeout so that
-//! "Check for new data", left-click, "Quit", "Install hook", and interval
-//! changes take effect immediately instead of on the next tick.
+//! "Check for new data", left-click (a worded usage summary), "Quit",
+//! "Install hook", and interval changes take effect immediately instead of on
+//! the next tick.
 
 mod autostart;
 mod config;
@@ -57,10 +58,10 @@ fn notify_reset(alert: &ResetAlert) {
     let _ = notification.show();
 }
 
-/// Emits the toast that follows a *user-initiated* action (a refresh or the
-/// `Install hook` item): low urgency and transient, so it acknowledges the
-/// click without piling up in notification history the way the threshold
-/// alerts (deliberately) do.
+/// Emits the toast that follows a *user-initiated* action ("Check for new
+/// data", the `Install hook` item, or a left-click status readout): low
+/// urgency and transient, so it acknowledges the click without piling up in
+/// notification history the way the threshold alerts (deliberately) do.
 fn notify_refresh(body: &str) {
     let mut notification = notify_rust::Notification::new();
     notification
@@ -209,6 +210,17 @@ fn install_hook_now() -> String {
     hook::install_toast(&result)
 }
 
+/// What the poll loop should do with a fresh read once a wake reason has been
+/// handled.
+enum PostRead {
+    /// No toast: a timer tick, or an action that already emitted its own.
+    Silent,
+    /// "Check for new data": report whether the cache moved forward.
+    RefreshToast,
+    /// A left-click: report a worded summary of current usage.
+    StatusToast,
+}
+
 fn run_tray() {
     let cache_path = source::default_cache_path();
     let stored = config::load();
@@ -293,12 +305,15 @@ fn run_tray() {
             reset_notifier.deadline(),
             Timestamp::now(),
         );
-        let user_initiated = match wake_rx.recv_timeout(wait) {
-            // "Check for new data" or a left-click: re-read *and* tell the
-            // user what came of it.
-            Ok(Wake::Refresh) => true,
+        let post_read = match wake_rx.recv_timeout(wait) {
+            // "Check for new data": re-read *and* tell the user whether the
+            // cache moved forward.
+            Ok(Wake::Refresh) => PostRead::RefreshToast,
+            // Left-click: re-read (cheap) and show a worded summary of
+            // current usage — never a "did it change" report.
+            Ok(Wake::ShowStatus) => PostRead::StatusToast,
             // The timer expired: re-read silently.
-            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Timeout) => PostRead::Silent,
             // The interval changed mid-wait: start a fresh wait with it.
             Ok(Wake::IntervalChanged) => continue,
             // A notification toggle changed: pick it up at the top of the loop.
@@ -317,7 +332,7 @@ fn run_tray() {
             // exactly what the toast says.
             Ok(Wake::InstallHook) => {
                 notify_refresh(&install_hook_now());
-                false
+                PostRead::Silent
             }
             Ok(Wake::Quit) => break,
             // Every sender is gone, which can only mean the tray service died.
@@ -333,13 +348,19 @@ fn run_tray() {
             let pushed = next.clone();
             handle.update(move |tray| tray.snapshot = pushed);
         }
-        if user_initiated {
-            notify_refresh(&tray::refresh_message(
-                &snapshot,
-                &next,
-                Timestamp::now(),
-                &tz,
-            ));
+        match post_read {
+            PostRead::RefreshToast => {
+                notify_refresh(&tray::refresh_message(
+                    &snapshot,
+                    &next,
+                    Timestamp::now(),
+                    &tz,
+                ));
+            }
+            PostRead::StatusToast => {
+                notify_refresh(&tray::status_message(&next, Timestamp::now(), &tz));
+            }
+            PostRead::Silent => {}
         }
         snapshot = next;
     }

@@ -25,10 +25,13 @@ use std::time::Duration;
 /// Messages the tray sends to the poll loop in `main.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
-    /// Re-read the cache immediately because the *user* asked (menu
-    /// "Check for new data" or left-click). This is the only wake reason that
-    /// produces a refresh notification.
+    /// Re-read the cache immediately because the *user* asked via the menu's
+    /// "Check for new data" item. This is the only wake reason that produces
+    /// a refresh notification (which says whether the cache moved forward).
     Refresh,
+    /// Left-click: re-read the cache (cheap, no "did it change" toast) and
+    /// show a transient, worded summary of the current usage instead.
+    ShowStatus,
     /// The refresh interval changed: re-arm the timer with the new value
     /// instead of finishing the current (possibly 60 s) wait. Not a refresh —
     /// it neither re-reads the cache nor notifies.
@@ -210,6 +213,66 @@ pub fn refresh_message(
         ),
         None => "No new data — Claude Code has not reported yet".to_string(),
     }
+}
+
+/// One metric's contribution to [`status_message`]: `32% of your 5-hour
+/// session (resets at 03:50)`. `None` when the percentage itself is unknown —
+/// a window that exists in the cache but carries no percentage is treated the
+/// same as no window at all, matching [`short_metric`].
+fn status_clause(noun: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> Option<String> {
+    let percent = metric?.percent?;
+    let base = format!("{}% of your {noun}", percent.round());
+    match metric?.resets_at {
+        Some(at) => Some(format!("{base} ({})", status_reset_clause(at, now, tz))),
+        None => Some(base),
+    }
+}
+
+/// `resets at 03:50` for a same-day reset, `resets Tue 09:00` for a further
+/// one — `humanize_reset` already drops the weekday for same-day resets, so
+/// "at" only reads naturally in that first form; prefixing it onto "Tue
+/// 09:00" would misparse as "at Tuesday".
+fn status_reset_clause(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
+    let text = humanize_reset(at, now, tz);
+    let same_day = at.to_zoned(tz.clone()).date() == now.to_zoned(tz.clone()).date();
+    if same_day {
+        format!("resets at {text}")
+    } else {
+        format!("resets {text}")
+    }
+}
+
+/// Body of the notification shown after a left-click: a worded readout of the
+/// current usage rather than a "did the cache change" report.
+///
+/// Pure so every combination of known/unknown/stale is unit-testable. Unlike
+/// [`refresh_message`], this never compares against a previous snapshot — a
+/// left-click re-reads the cache but does not care whether it moved.
+pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> String {
+    if snapshot.state == SnapshotState::Missing {
+        return "No usage data — install the statusline hook.".to_string();
+    }
+
+    let session = status_clause("5-hour session", snapshot.session.as_ref(), now, tz);
+    let weekly = status_clause("weekly limit", snapshot.weekly.as_ref(), now, tz);
+
+    let mut sentence = match (session, weekly) {
+        (Some(session), Some(weekly)) => format!("You've used {session} and {weekly}."),
+        (Some(session), None) => format!("You've used {session}; weekly usage is unknown."),
+        (None, Some(weekly)) => format!("You've used {weekly}; session usage is unknown."),
+        (None, None) => "No usage data reported.".to_string(),
+    };
+
+    if snapshot.state == SnapshotState::Stale
+        && let Some(at) = snapshot.written_at
+    {
+        sentence.push_str(&format!(
+            " Last updated {} ago.",
+            humanize_age(age_secs(at, now))
+        ));
+    }
+
+    sentence
 }
 
 /// Whether the menu should offer the `Install hook` item. Only while there is
@@ -867,9 +930,10 @@ impl ksni::Tray for UsageTray {
         }
     }
 
-    /// Left-click: re-read the cache immediately.
+    /// Left-click: show a worded summary of current usage. Unlike "Check for
+    /// new data" this never reports whether the cache moved.
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.send(Wake::Refresh);
+        self.send(Wake::ShowStatus);
     }
 
     /// Overriding this (even as a no-op) opts out of ksni's `NO_ABOUT_TO_SHOW`
@@ -1232,6 +1296,119 @@ mod tests {
         assert_eq!(
             refresh_message(&before, &after, ts(BASE), &utc()),
             "No data — install the statusline hook"
+        );
+    }
+
+    #[test]
+    fn status_message_missing_points_at_the_hook() {
+        let s = snapshot(SnapshotState::Missing, None);
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "No usage data — install the statusline hook."
+        );
+    }
+
+    #[test]
+    fn status_message_fresh_with_both_percents() {
+        // BASE is 22:13:20 UTC (Tue); +1000s -> 22:30 same day (session);
+        // +12h -> Wed 10:13 (weekly), well past `WEEKDAY_FORM_MAX_DAYS`... no,
+        // within it, so it takes the weekday form.
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
+             of your weekly limit (resets Wed 10:13)."
+        );
+    }
+
+    #[test]
+    fn status_message_rounds_percents_like_the_menu_lines() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(Some(32.4), Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(32.5), Some(BASE + 1000)));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
+             of your weekly limit (resets at 22:30)."
+        );
+    }
+
+    #[test]
+    fn status_message_stale_appends_the_age() {
+        let mut s = snapshot(SnapshotState::Stale, Some(BASE - 12 * 3600));
+        s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
+             of your weekly limit (resets Wed 10:13). Last updated 12 h ago."
+        );
+    }
+
+    #[test]
+    fn status_message_stale_without_a_written_at_omits_the_age_clause() {
+        let mut s = snapshot(SnapshotState::Stale, None);
+        s.session = Some(metric(Some(32.0), None));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session; weekly usage is unknown."
+        );
+    }
+
+    #[test]
+    fn status_message_weekly_missing_says_so() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session (resets at 22:30); weekly \
+             usage is unknown."
+        );
+    }
+
+    #[test]
+    fn status_message_session_missing_says_so() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 33% of your weekly limit (resets Wed 10:13); session \
+             usage is unknown."
+        );
+    }
+
+    #[test]
+    fn status_message_session_percent_absent_counts_as_unknown() {
+        // A window present in the cache but with no percentage (an em dash in
+        // the menu) is worded the same as no window at all.
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(None, Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 33% of your weekly limit (resets Wed 10:13); session \
+             usage is unknown."
+        );
+    }
+
+    #[test]
+    fn status_message_no_metrics_at_all_but_not_missing() {
+        // Valid JSON with no `rate_limits` at all (API-key billing): neither
+        // window is known, but the hook is demonstrably installed and working.
+        let s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        assert_eq!(status_message(&s, ts(BASE), &utc()), "No usage data reported.");
+    }
+
+    #[test]
+    fn status_message_reset_without_a_resets_at_omits_the_parenthetical() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(Some(32.0), None));
+        s.weekly = Some(metric(Some(33.0), None));
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session and 33% of your weekly limit."
         );
     }
 
