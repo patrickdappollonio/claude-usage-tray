@@ -1,0 +1,32 @@
+{
+  "name": "@patrickdappollonio/claude-usage-tray",
+  "version": "0.0.0-dev",
+  "description": "Linux tray icon showing Claude Code 5-hour and weekly usage.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "claude-usage-tray": "bin/claude-usage-tray.js"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/patrickdappollonio/claude-usage-tray"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "usage",
+    "tray",
+    "statusnotifieritem",
+    "linux",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
