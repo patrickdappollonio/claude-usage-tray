@@ -65,3 +65,16 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Convenience artifact so branch builds can be hand-tested on a real
+      # Mac before any release exists. Apple Silicon only (the runner's
+      # native arch); unsigned, so testers clear quarantine with xattr.
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload macOS binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-usage-tray-darwin-arm64
+          path: target/release/claude-usage-tray
+          retention-days: 7
