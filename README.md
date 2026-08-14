@@ -11,27 +11,38 @@ live in the menu itself), no multi-account profiles.
 
 ```
 Claude Code statusline JSON (stdin, includes rate_limits since v2.1.80)
-  -> statusline-hook.snippet.sh tees rate_limits into
-     ~/.claude/usage-tray-cache.json (atomic write: temp file + mv)
+  -> claude-usage-tray statusline  (this same binary, configured as your
+     statusLine.command) writes that JSON verbatim to
+     ~/.claude/usage-tray-statusline.json (atomic: temp file + rename)
   -> claude-usage-tray reads that cache file every few seconds and
      renders the tray icon, tooltip, and menu from it
 ```
 
-The cache file contains exactly:
+There is **no shell script and no `jq`** anywhere in this path: the binary is
+both the transport and the parser.
 
-```json
-{"written_at": 1700000000, "rate_limits": {"five_hour": {...}, "seven_day": {...}}}
-```
+**Cache contract (v2).** The cache file at
+`${CLAUDE_CONFIG_DIR:-~/.claude}/usage-tray-statusline.json` is a byte-for-byte
+copy of the JSON Claude Code sends its statusline command on stdin — the whole
+document, `model`, `workspace`, `cost` and all. The tray reads
+`rate_limits.five_hour` and `rate_limits.seven_day`
+(`used_percentage`, `resets_at`) out of it and ignores everything else.
 
-`written_at` is a Unix timestamp (seconds); `rate_limits` is the verbatim
-object Claude Code puts in the statusline JSON.
+There is no timestamp *inside* the file: **freshness comes from the file's
+mtime**. Older than 10 minutes and the tray treats the data as stale (dimmed
+icon, `⚠ Stale since HH:MM`).
+
+Earlier versions used a different file (`usage-tray-cache.json`) written by a
+shell snippet. `claude-usage-tray hook install` deletes that file and strips
+the old injected shell block out of your statusline script automatically; you
+do not need to clean anything up by hand.
 
 ## No network calls, no credentials — ever
 
 This tray makes **zero network requests** and **never reads or touches your
 Claude credentials** (`.credentials.json`, OAuth tokens, or any cookie). It
-only reads a local JSON file that Claude Code itself already writes via your
-statusline script. This matters because Anthropic's January 2026 Terms of
+only reads a local JSON file — the data Claude Code itself already hands to
+your statusline on stdin. This matters because Anthropic's January 2026 Terms of
 Service update prohibits using subscription OAuth outside Claude Code, and
 tools that impersonate a browser or spoof the Claude Code user agent to poll
 usage over the network have gotten accounts auto-banned. This tool never
@@ -49,8 +60,23 @@ The binary is at `target/release/claude-usage-tray`.
 ## Run
 
 ```sh
-./target/release/claude-usage-tray
+./target/release/claude-usage-tray            # run the tray
+./target/release/claude-usage-tray hook install
 ```
+
+The binary has three modes, dispatched from its first argument:
+
+| Command | What it does |
+| --- | --- |
+| *(no arguments)* | Runs the tray. |
+| `statusline [--exec CMD]` | Claude Code's statusline command: caches the stdin JSON, optionally running `CMD` and passing its output through. See [below](#the-statusline-subcommand). |
+| `hook install` / `hook uninstall` / `hook status` | Manages the `settings.json` entry. See [below](#installing-the-statusline-hook). |
+
+Anything else prints a short usage message and exits 2. Because the tray
+binary is also its own installer and its own statusline command, `hook
+install` records an **absolute path** — reinstall (or re-run `hook install`)
+after moving the binary; `hook status` says so when the recorded path and the
+running one differ.
 
 The ksni tray service runs on its own thread; the main thread runs the poll
 loop, re-reading the cache file on an interval (see [Settings](#settings)
@@ -137,54 +163,77 @@ respected as "no threshold alerts".
 ## Installing the statusline hook
 
 The tray is only useful once something is writing the cache file. That
-something is a couple of lines added to your Claude Code statusline script,
-copied from `statusline-hook.snippet.sh` in this repo.
-
-### If you already have a statusline script
-
-Open your existing statusline script (referenced by `statusLine.command` in
-`~/.claude/settings.json`) and find the line near the top that reads:
+something is this same binary, configured as your Claude Code statusline
+command. One command installs it:
 
 ```sh
-input=$(cat)
+claude-usage-tray hook install
 ```
 
-Paste the contents of `statusline-hook.snippet.sh` immediately after that
-line, then leave the rest of your statusline script (whatever prints your
-prompt) unchanged below it.
+That edits `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` and nothing else.
+Concretely:
 
-### If you don't have a statusline script yet
+- **No statusline configured yet** → `statusLine.command` becomes
+  `"/abs/path/claude-usage-tray statusline"`. Your statusline then prints
+  nothing (it printed nothing before, and the tray deliberately does not add
+  anything of its own).
+- **You already have a statusline** → yours is wrapped, not replaced:
+  `"/abs/path/claude-usage-tray statusline --exec '~/.claude/statusline-command.sh'"`.
+  Your command still receives the same JSON on stdin and its output still goes
+  to the statusline, byte for byte.
+- **Already installed** → the entry is refreshed in place (handy after moving
+  or rebuilding the binary). It is never wrapped twice: an existing entry is
+  recognized by its `statusline` argument, whatever the binary is called.
 
-1. Create `~/.claude/statusline-command.sh`:
+Every other key in `settings.json` is preserved (it is a JSON
+read-modify-write, pretty-printed and written atomically). The first install
+copies the original file to `settings.json.bak-usage-tray`; later installs
+keep that first backup rather than overwriting it with an already-modified
+copy.
 
-   ```sh
-   #!/bin/bash
-   input=$(cat)
+Then start a new Claude Code session (or wait for the statusline to refresh)
+and the tray picks up data.
 
-   # paste the contents of statusline-hook.snippet.sh here
+### Checking and removing it
 
-   # your normal statusline output, e.g.:
-   echo "$(echo "$input" | jq -r '.model.display_name // "Claude"')"
-   ```
+```sh
+claude-usage-tray hook status      # what is wired up, and how fresh the cache is
+claude-usage-tray hook uninstall   # put your original command back
+```
 
-2. Make it executable: `chmod +x ~/.claude/statusline-command.sh`
+`uninstall` restores the command that was wrapped in `--exec`, or removes the
+`statusLine` key entirely if there was nothing to restore, and deletes the
+cache file. A `statusLine.command` that isn't ours is left untouched.
 
-3. Point Claude Code at it in `~/.claude/settings.json`:
+### The `statusline` subcommand
 
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "~/.claude/statusline-command.sh"
-     }
-   }
-   ```
+You can also wire it up by hand — this is all `hook install` does:
 
-4. Restart Claude Code (or start a new session) so the statusline runs.
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/abs/path/claude-usage-tray statusline --exec '~/.claude/statusline-command.sh'"
+  }
+}
+```
 
-The hook requires `jq`. If `jq` is missing, or the statusline JSON has no
-`rate_limits` field, the hook is a safe no-op: it writes nothing rather than
-a malformed cache file, and never breaks your statusline output.
+Drop the `--exec '...'` part if you have no statusline command of your own.
+
+The subcommand is deliberately boring: it reads stdin to EOF, writes those
+bytes verbatim to the cache file, and then, with `--exec`, runs your command
+via `sh -c` with the same bytes on stdin and lets its stdout through
+unmodified. **It always exits 0 and never prints anything of its own**, even
+if the cache write fails or your command is missing or fails — a usage tray
+must not be able to break your statusline.
+
+### Upgrading from the old shell hook
+
+Nothing to do: run `claude-usage-tray hook install`. It strips the old
+`# --- claude-usage-tray hook … # --- end claude-usage-tray hook ---` block
+out of your statusline script (backing the script up as
+`<script>.bak-usage-tray` first) and deletes the obsolete
+`usage-tray-cache.json`.
 
 ## Icon legend
 
@@ -194,8 +243,11 @@ a malformed cache file, and never breaks your statusline output.
   at 95% and above.
 - **Dimmed icon**: cache file is older than 10 minutes (stale) — usage may
   have changed since the last time Claude Code ran.
-- **Gray icon**: no cache file found, or it couldn't be parsed — install the
-  statusline hook (see above).
+- **Gray icon**: no cache file found, or it couldn't be parsed. The menu then
+  reads `⚠ Hook not installed — no data` and offers a clickable **Install
+  hook** item that does the same thing as `claude-usage-tray hook install`,
+  followed by a `Hook installed — data appears next time Claude Code
+  refreshes` toast. That item is only there while there is no data.
 
 ## Notifications
 
@@ -234,9 +286,10 @@ data" toast described above is transient.
   radio group still saves your choice to the config file — it just doesn't
   change the running interval, and the submenu says so. Removing the
   variable and restarting makes the saved choice take effect.
-- `CLAUDE_CONFIG_DIR` — overrides where both the statusline hook writes and
-  the tray reads the cache file (`$CLAUDE_CONFIG_DIR/usage-tray-cache.json`).
-  Defaults to `~/.claude`.
+- `CLAUDE_CONFIG_DIR` — Claude Code's own config-directory override, honoured
+  here too: it decides where `hook install` edits `settings.json` and where
+  the cache file (`$CLAUDE_CONFIG_DIR/usage-tray-statusline.json`) is written
+  and read. Defaults to `~/.claude`.
 
 Effective refresh interval, highest priority first:
 `CLAUDE_TRAY_POLL_SECS` → `refresh_secs` in `config.toml` → `5`.

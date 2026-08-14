@@ -1,15 +1,20 @@
 //! Claude usage tray: reads the statusline usage cache on a timer and renders
 //! it as a StatusNotifierItem tray icon. No network, no credentials, no writes
-//! outside its own config and autostart files.
+//! outside its own config, the Claude config directory, and autostart files.
 //!
-//! Threading: `ksni::blocking::TrayMethods::spawn` runs the D-Bus service on
-//! its own thread and hands back a `Handle`. The main thread then *is* the poll
-//! loop, waiting on an mpsc channel with a timeout so that "Check for new
-//! data", left-click, "Quit", and interval changes take effect immediately
-//! instead of on the next tick.
+//! The same binary is also the statusline command itself (`statusline`
+//! subcommand) and its own installer (`hook install|uninstall|status`), so
+//! there is no shell snippet anywhere in the design.
+//!
+//! Threading (tray mode): `ksni::blocking::TrayMethods::spawn` runs the D-Bus
+//! service on its own thread and hands back a `Handle`. The main thread then
+//! *is* the poll loop, waiting on an mpsc channel with a timeout so that
+//! "Check for new data", left-click, "Quit", "Install hook", and interval
+//! changes take effect immediately instead of on the next tick.
 
 mod autostart;
 mod config;
+mod hook;
 mod icon;
 mod source;
 #[cfg(test)]
@@ -18,6 +23,7 @@ mod tray;
 
 use jiff::{Timestamp, tz::TimeZone};
 use ksni::blocking::TrayMethods;
+use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use tray::{ResetAlert, UsageAlert, Wake};
@@ -50,9 +56,10 @@ fn notify_reset(alert: &ResetAlert) {
     let _ = notification.show();
 }
 
-/// Emits the toast that follows a *user-initiated* refresh: low urgency and
-/// transient, so it acknowledges the click without piling up in notification
-/// history the way the threshold alerts (deliberately) do.
+/// Emits the toast that follows a *user-initiated* action (a refresh or the
+/// `Install hook` item): low urgency and transient, so it acknowledges the
+/// click without piling up in notification history the way the threshold
+/// alerts (deliberately) do.
 fn notify_refresh(body: &str) {
     let mut notification = notify_rust::Notification::new();
     notification
@@ -64,7 +71,140 @@ fn notify_refresh(body: &str) {
     let _ = notification.show();
 }
 
+const USAGE: &str = "\
+claude-usage-tray — Claude Code usage in the system tray
+
+  claude-usage-tray                      run the tray
+  claude-usage-tray statusline [--exec CMD]
+                                         Claude Code statusline command: caches
+                                         the stdin JSON, optionally running CMD
+                                         and passing its output through
+  claude-usage-tray hook install         point statusLine.command at this binary
+  claude-usage-tray hook uninstall       undo that
+  claude-usage-tray hook status          report what is currently wired up
+";
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match args.first().map(String::as_str) {
+        None => {
+            run_tray();
+            0
+        }
+        Some("statusline") => run_statusline(&args[1..]),
+        Some("hook") => run_hook(&args[1..]),
+        _ => {
+            eprint!("{USAGE}");
+            2
+        }
+    };
+    std::process::exit(code);
+}
+
+/// The `statusline` subcommand: pure transport. Reads Claude Code's statusline
+/// JSON from stdin, writes it verbatim to the cache, and — with `--exec` —
+/// hands the same bytes to the user's own statusline command and lets its
+/// stdout through untouched.
+///
+/// It exits 0 whatever happens short of a usage error: a broken cache write or
+/// a failing child must never make somebody's statusline worse, and this
+/// command never prints anything of its own.
+fn run_statusline(args: &[String]) -> i32 {
+    let exec = match args {
+        [] => None,
+        [flag, command] if flag == "--exec" => Some(command.clone()),
+        _ => {
+            eprint!("{USAGE}");
+            return 2;
+        }
+    };
+
+    let mut input = Vec::new();
+    // A read error leaves whatever arrived before it; there is nothing better
+    // to do with it than carry on.
+    let _ = std::io::stdin().read_to_end(&mut input);
+    let _ = source::write_cache(&source::default_cache_path(), &input);
+
+    if let Some(command) = exec {
+        // stdout is inherited rather than piped and copied, so the child's
+        // bytes reach Claude Code exactly as written — no added newline, no
+        // buffering surprises.
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&input);
+                // Dropping closes the pipe, so a child reading to EOF finishes.
+                drop(stdin);
+            }
+            let _ = child.wait();
+        }
+    }
+    0
+}
+
+/// The `hook` subcommand family. Prints a human-readable report; a nonzero
+/// exit means the settings file could not be read or written.
+fn run_hook(args: &[String]) -> i32 {
+    let config_dir = source::claude_config_dir();
+    match args.first().map(String::as_str) {
+        Some("install") if args.len() == 1 => {
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(err) => {
+                    eprintln!("claude-usage-tray: cannot determine my own path: {err}");
+                    return 1;
+                }
+            };
+            match hook::install_in(&config_dir, &exe) {
+                Ok(report) => {
+                    println!("{}", report.render());
+                    0
+                }
+                Err(err) => {
+                    eprintln!("claude-usage-tray: hook install failed: {err}");
+                    1
+                }
+            }
+        }
+        Some("uninstall") if args.len() == 1 => match hook::uninstall_in(&config_dir) {
+            Ok(report) => {
+                println!("{}", report.render());
+                0
+            }
+            Err(err) => {
+                eprintln!("claude-usage-tray: hook uninstall failed: {err}");
+                1
+            }
+        },
+        Some("status") if args.len() == 1 => {
+            let report = hook::status_in(&config_dir, Timestamp::now());
+            let exe = std::env::current_exe().ok();
+            println!("{}", report.render(exe.as_deref(), Timestamp::now()));
+            0
+        }
+        _ => {
+            eprint!("{USAGE}");
+            2
+        }
+    }
+}
+
+/// Runs the hook installer from the tray's menu item and returns the toast to
+/// show. Deliberately called from the poll loop rather than from the D-Bus
+/// callback, so the filesystem work never blocks the menu.
+fn install_hook_now() -> String {
+    let result = std::env::current_exe()
+        .and_then(|exe| hook::install_in(&source::claude_config_dir(), &exe));
+    hook::install_toast(&result)
+}
+
+fn run_tray() {
     let cache_path = source::default_cache_path();
     let stored = config::load();
     let env_secs = config::env_override(std::env::var("CLAUDE_TRAY_POLL_SECS").ok().as_deref());
@@ -141,6 +281,14 @@ fn main() {
             Ok(Wake::IntervalChanged) => continue,
             // A notification toggle changed: pick it up at the top of the loop.
             Ok(Wake::NotifyChanged) => continue,
+            // The first-run menu item. The install itself runs here, off the
+            // D-Bus callback, then falls through to a re-read: the cache will
+            // still be missing until Claude Code next refreshes, which is
+            // exactly what the toast says.
+            Ok(Wake::InstallHook) => {
+                notify_refresh(&install_hook_now());
+                false
+            }
             Ok(Wake::Quit) => break,
             // Every sender is gone, which can only mean the tray service died.
             Err(RecvTimeoutError::Disconnected) => break,

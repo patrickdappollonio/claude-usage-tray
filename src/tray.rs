@@ -37,6 +37,10 @@ pub enum Wake {
     /// rather than up to a minute later. Like `IntervalChanged`, it neither
     /// re-reads the cache nor notifies.
     NotifyChanged,
+    /// Install the statusline hook (menu "Install hook", offered only while
+    /// there is no data). The install itself runs in the poll loop rather than
+    /// in the D-Bus callback, so the menu never blocks on filesystem work.
+    InstallHook,
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
@@ -92,7 +96,10 @@ fn metric_line(label: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZo
 /// is nothing to show.
 pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> String {
     match snapshot.state {
-        SnapshotState::Missing => "⚠ No data — install statusline hook".to_string(),
+        // First-run wording: the actionable `Install hook` item sits directly
+        // under this row, so the row states the diagnosis and the item is the
+        // instruction.
+        SnapshotState::Missing => "⚠ Hook not installed — no data".to_string(),
         SnapshotState::Stale => match snapshot.written_at {
             Some(at) => format!("⚠ Stale since {}", humanize_reset(at, now, tz)),
             None => "⚠ Stale".to_string(),
@@ -163,6 +170,13 @@ pub fn refresh_message(
         ),
         None => "No new data — Claude Code has not reported yet".to_string(),
     }
+}
+
+/// Whether the menu should offer the `Install hook` item. Only while there is
+/// no data at all: once the cache exists (even a stale one) the hook is
+/// demonstrably installed and the item would be noise.
+pub fn shows_install_item(state: &SnapshotState) -> bool {
+    *state == SnapshotState::Missing
 }
 
 /// True when two snapshots differ in anything the tray displays. Used to avoid
@@ -709,10 +723,24 @@ impl ksni::Tray for UsageTray {
                 ..Default::default()
             })
         };
-        vec![
+        let mut items = vec![
             info(session_line(self.snapshot.session.as_ref(), now, &self.tz)),
             info(weekly_line(self.snapshot.weekly.as_ref(), now, &self.tz)),
             info(status_line(&self.snapshot, now, &self.tz)),
+        ];
+        if shows_install_item(&self.snapshot.state) {
+            // The one enabled row in the no-data state: everything else here
+            // is a label, and a first-run user needs exactly one thing to do.
+            items.push(
+                ksni::menu::StandardItem {
+                    label: "Install hook".into(),
+                    activate: Box::new(|tray: &mut Self| tray.send(Wake::InstallHook)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.extend([
             ksni::MenuItem::Separator,
             self.settings_menu(),
             ksni::menu::StandardItem {
@@ -727,7 +755,8 @@ impl ksni::Tray for UsageTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 }
 
@@ -855,12 +884,19 @@ mod tests {
     }
 
     #[test]
-    fn status_line_missing_tells_user_to_install_hook() {
+    fn status_line_missing_says_the_hook_is_not_installed() {
         let s = snapshot(SnapshotState::Missing, None);
         assert_eq!(
             status_line(&s, ts(BASE), &utc()),
-            "⚠ No data — install statusline hook"
+            "⚠ Hook not installed — no data"
         );
+    }
+
+    #[test]
+    fn the_install_item_appears_only_while_there_is_no_data() {
+        assert!(shows_install_item(&SnapshotState::Missing));
+        assert!(!shows_install_item(&SnapshotState::Stale));
+        assert!(!shows_install_item(&SnapshotState::Fresh));
     }
 
     #[test]
