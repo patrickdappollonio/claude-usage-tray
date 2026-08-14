@@ -13,8 +13,11 @@
 //!
 //! See `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md`.
 
+use crate::config::{self, Config, REFRESH_CHOICES};
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
 use jiff::{Timestamp, tz::TimeZone};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 /// Session-usage percentage at which a normal-urgency alert fires.
@@ -25,8 +28,14 @@ const CRITICAL_THRESHOLD: f64 = 95.0;
 /// Messages the tray sends to the poll loop in `main.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
-    /// Re-read the cache immediately (menu "Refresh now" or left-click).
+    /// Re-read the cache immediately because the *user* asked (menu
+    /// "Check for new data" or left-click). This is the only wake reason that
+    /// produces a refresh notification.
     Refresh,
+    /// The refresh interval changed: re-arm the timer with the new value
+    /// instead of finishing the current (possibly 60 s) wait. Not a refresh —
+    /// it neither re-reads the cache nor notifies.
+    IntervalChanged,
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
@@ -112,6 +121,47 @@ pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> 
         weekly_line(snapshot.weekly.as_ref(), now, tz),
         status_line(snapshot, now, tz)
     )
+}
+
+/// `Session 7%` / `Session —` — the compact form used in the refresh toast.
+fn short_metric(label: &str, metric: Option<&Metric>) -> String {
+    match metric.and_then(|metric| metric.percent) {
+        Some(percent) => format!("{label} {}%", percent.round()),
+        None => format!("{label} —"),
+    }
+}
+
+/// Body of the notification shown after a *user-initiated* refresh.
+///
+/// Pure so the three outcomes are unit-testable: the cache moved forward, it
+/// didn't, or there is no cache at all. Timer-driven polls never call this —
+/// see the poll loop in `main.rs`.
+pub fn refresh_message(
+    previous: &UsageSnapshot,
+    current: &UsageSnapshot,
+    now: Timestamp,
+    tz: &TimeZone,
+) -> String {
+    if current.state == SnapshotState::Missing {
+        return "No data — install the statusline hook".to_string();
+    }
+    // `written_at` is the hook's own timestamp, so a change in it is the only
+    // reliable evidence that Claude Code reported something new; percentages
+    // can legitimately stay identical between two real reports.
+    if current.written_at.is_some() && current.written_at != previous.written_at {
+        return format!(
+            "Updated — {}, {}",
+            short_metric("Session", current.session.as_ref()),
+            short_metric("Weekly", current.weekly.as_ref())
+        );
+    }
+    match current.written_at {
+        Some(at) => format!(
+            "No new data — Claude Code last reported at {}",
+            humanize_reset(at, now, tz)
+        ),
+        None => "No new data — Claude Code has not reported yet".to_string(),
+    }
 }
 
 /// True when two snapshots differ in anything the tray displays. Used to avoid
@@ -215,18 +265,52 @@ impl Notifier {
     }
 }
 
-/// The tray item itself: holds the latest snapshot and a channel back to the
-/// poll loop for the menu actions.
+/// Settings shared between the menu (which changes them) and the poll loop
+/// (which reads the interval every cycle, so changes apply live).
+pub struct Settings {
+    /// Last-loaded/last-saved config file contents.
+    config: Config,
+    /// The interval the poll loop actually waits, in seconds. Shared so a
+    /// radio-group change takes effect without restarting anything.
+    interval: Arc<AtomicU64>,
+    /// True when `CLAUDE_TRAY_POLL_SECS` is set to a usable value. The radio
+    /// group then still persists the user's choice, but the effective interval
+    /// stays the environment's.
+    env_locked: bool,
+}
+
+impl Settings {
+    /// Builds the shared settings from the loaded config and the environment
+    /// override, returning the handle the poll loop reads.
+    pub fn new(config: Config, env_secs: Option<u64>) -> Self {
+        let effective = env_secs.unwrap_or(config.refresh_secs);
+        Settings {
+            config,
+            interval: Arc::new(AtomicU64::new(effective)),
+            env_locked: env_secs.is_some(),
+        }
+    }
+
+    /// Handle for the poll loop; `load` it once per cycle.
+    pub fn interval_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.interval)
+    }
+}
+
+/// The tray item itself: holds the latest snapshot, the settings, and a
+/// channel back to the poll loop for the menu actions.
 pub struct UsageTray {
     pub snapshot: UsageSnapshot,
+    settings: Settings,
     tz: TimeZone,
     wake: Sender<Wake>,
 }
 
 impl UsageTray {
-    pub fn new(snapshot: UsageSnapshot, wake: Sender<Wake>) -> Self {
+    pub fn new(snapshot: UsageSnapshot, settings: Settings, wake: Sender<Wake>) -> Self {
         UsageTray {
             snapshot,
+            settings,
             tz: TimeZone::system(),
             wake,
         }
@@ -236,6 +320,89 @@ impl UsageTray {
         // A closed channel means the poll loop is already gone; there is
         // nothing useful to do about it and panicking would kill the tray.
         let _ = self.wake.send(wake);
+    }
+
+    /// Radio-group handler: persist the chosen interval and, unless the
+    /// environment overrides it, apply it to the running poll loop.
+    fn select_refresh(&mut self, index: usize) {
+        let Some(&secs) = REFRESH_CHOICES.get(index) else {
+            // The index comes from the menu host; an out-of-range one is not
+            // worth crashing over.
+            return;
+        };
+        if self.settings.config.refresh_secs == secs {
+            return;
+        }
+        self.settings.config.refresh_secs = secs;
+        config::save(&self.settings.config);
+        if !self.settings.env_locked {
+            self.settings.interval.store(secs, Ordering::Relaxed);
+            self.send(Wake::IntervalChanged);
+        }
+    }
+
+    /// Checkbox handler: flip the XDG autostart entry, then mirror the new
+    /// state into the config file. If writing the entry failed, nothing is
+    /// recorded and the checkbox stays where it was.
+    fn toggle_launch_at_login(&mut self) {
+        let wanted = !crate::autostart::is_enabled();
+        if !crate::autostart::set_enabled(wanted) {
+            return;
+        }
+        self.settings.config.launch_at_login = wanted;
+        config::save(&self.settings.config);
+    }
+
+    /// The `Settings` submenu.
+    fn settings_menu(&self) -> ksni::MenuItem<Self> {
+        let mut submenu: Vec<ksni::MenuItem<Self>> = vec![
+            ksni::menu::CheckmarkItem {
+                label: "Launch at login".into(),
+                // Read from disk, not from the config mirror: the file is the
+                // thing the session manager actually acts on, and the user may
+                // have removed it behind our back.
+                checked: crate::autostart::is_enabled(),
+                activate: Box::new(|tray: &mut Self| tray.toggle_launch_at_login()),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: "Refresh interval".into(),
+                enabled: false,
+                ..Default::default()
+            }),
+            ksni::menu::RadioGroup {
+                selected: self.settings.config.refresh_choice(),
+                select: Box::new(|tray: &mut Self, index: usize| tray.select_refresh(index)),
+                options: REFRESH_CHOICES
+                    .iter()
+                    .map(|secs| ksni::menu::RadioItem {
+                        label: format!("{secs} s"),
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .into(),
+        ];
+        if self.settings.env_locked {
+            // Without this the radio group would look broken: the choice is
+            // saved, but the tray keeps polling at the environment's cadence.
+            submenu.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: format!(
+                    "(CLAUDE_TRAY_POLL_SECS={} is in effect)",
+                    self.settings.interval.load(Ordering::Relaxed)
+                ),
+                enabled: false,
+                ..Default::default()
+            }));
+        }
+        ksni::menu::SubMenu {
+            label: "Settings".into(),
+            submenu,
+            ..Default::default()
+        }
+        .into()
     }
 }
 
@@ -294,8 +461,9 @@ impl ksni::Tray for UsageTray {
             info(weekly_line(self.snapshot.weekly.as_ref(), now, &self.tz)),
             info(status_line(&self.snapshot, now, &self.tz)),
             ksni::MenuItem::Separator,
+            self.settings_menu(),
             ksni::menu::StandardItem {
-                label: "Refresh now".into(),
+                label: "Check for new data".into(),
                 activate: Box::new(|tray: &mut Self| tray.send(Wake::Refresh)),
                 ..Default::default()
             }
@@ -481,6 +649,110 @@ mod tests {
             tooltip_text(&s, ts(BASE), &utc()),
             "Session: 42% · resets 22:30\nWeekly: 61% · resets 22:30\nUpdated just now"
         );
+    }
+
+    /// Builds a snapshot with both metrics populated.
+    fn full(state: SnapshotState, written_at: i64, session: f64, weekly: f64) -> UsageSnapshot {
+        let mut s = snapshot(state, Some(written_at));
+        s.session = Some(metric(Some(session), Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(weekly), Some(BASE + 1000)));
+        s
+    }
+
+    #[test]
+    fn refresh_message_reports_updated_when_written_at_moved() {
+        let before = full(SnapshotState::Fresh, BASE - 300, 5.0, 27.0);
+        let after = full(SnapshotState::Fresh, BASE - 10, 7.0, 28.0);
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE), &utc()),
+            "Updated — Session 7%, Weekly 28%"
+        );
+    }
+
+    #[test]
+    fn refresh_message_reports_updated_even_when_percentages_are_unchanged() {
+        // A new report with identical numbers is still new data.
+        let before = full(SnapshotState::Fresh, BASE - 300, 7.0, 28.0);
+        let after = full(SnapshotState::Fresh, BASE - 10, 7.0, 28.0);
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE), &utc()),
+            "Updated — Session 7%, Weekly 28%"
+        );
+    }
+
+    #[test]
+    fn refresh_message_without_percentages_uses_dashes() {
+        let before = snapshot(SnapshotState::Fresh, Some(BASE - 300));
+        let after = snapshot(SnapshotState::Fresh, Some(BASE - 10));
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE), &utc()),
+            "Updated — Session —, Weekly —"
+        );
+    }
+
+    #[test]
+    fn refresh_message_reports_no_new_data_with_the_last_report_time() {
+        let before = full(SnapshotState::Fresh, BASE - 3600, 7.0, 28.0);
+        let after = before.clone();
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE), &utc()),
+            "No new data — Claude Code last reported at 21:13"
+        );
+    }
+
+    #[test]
+    fn refresh_message_no_new_data_applies_to_a_stale_cache_too() {
+        let before = full(SnapshotState::Stale, BASE - 3600, 7.0, 28.0);
+        let mut after = before.clone();
+        after.state = SnapshotState::Stale;
+        assert!(refresh_message(&before, &after, ts(BASE), &utc()).starts_with("No new data — "));
+    }
+
+    #[test]
+    fn refresh_message_for_a_missing_cache_points_at_the_hook() {
+        let before = snapshot(SnapshotState::Missing, None);
+        let after = snapshot(SnapshotState::Missing, None);
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE), &utc()),
+            "No data — install the statusline hook"
+        );
+    }
+
+    #[test]
+    fn refresh_message_missing_wins_even_if_written_at_changed() {
+        // A cache that became unreadable must not be announced as an update.
+        let before = full(SnapshotState::Fresh, BASE - 300, 7.0, 28.0);
+        let after = snapshot(SnapshotState::Missing, None);
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE), &utc()),
+            "No data — install the statusline hook"
+        );
+    }
+
+    #[test]
+    fn settings_use_the_config_interval_when_the_env_is_unset() {
+        let settings = Settings::new(
+            Config {
+                refresh_secs: 30,
+                launch_at_login: false,
+            },
+            None,
+        );
+        assert!(!settings.env_locked);
+        assert_eq!(settings.interval_handle().load(Ordering::Relaxed), 30);
+    }
+
+    #[test]
+    fn settings_let_the_env_override_win_and_lock_the_interval() {
+        let settings = Settings::new(
+            Config {
+                refresh_secs: 30,
+                launch_at_login: false,
+            },
+            Some(2),
+        );
+        assert!(settings.env_locked);
+        assert_eq!(settings.interval_handle().load(Ordering::Relaxed), 2);
     }
 
     #[test]

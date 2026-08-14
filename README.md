@@ -4,8 +4,8 @@ A minimal Linux tray icon (StatusNotifierItem — KDE Plasma primary, GNOME via
 the AppIndicator extension) that shows your Claude Code subscription usage:
 the 5-hour session percentage and the 7-day weekly percentage, with reset
 times. This is a proof of concept: a status icon and a menu, nothing more.
-No windows, no charts, no settings UI, no multi-account profiles, no
-autostart packaging.
+No windows, no charts, no separate settings window (the handful of settings
+live in the menu itself), no multi-account profiles.
 
 Inspired by [hamed-elfayome/Claude-Usage-Tracker](https://github.com/hamed-elfayome/Claude-Usage-Tracker)
 (macOS), but built on a different, sanctioned data source — see below.
@@ -56,10 +56,67 @@ The binary is at `target/release/claude-usage-tray`.
 ```
 
 The ksni tray service runs on its own thread; the main thread runs the poll
-loop, re-reading the cache file on an interval (see `CLAUDE_TRAY_POLL_SECS`
+loop, re-reading the cache file on an interval (see [Settings](#settings)
 below) and updating the icon when the content changes. Left-click the icon or
-use "Refresh now" in the menu to force an immediate re-read. "Quit" exits
-cleanly.
+use "Check for new data" in the menu to force an immediate re-read. "Quit"
+exits cleanly.
+
+The menu item is called "Check for new data" rather than "Refresh" on
+purpose: it re-reads the local cache file, which only moves forward when
+Claude Code itself runs your statusline. Clicking it cannot make Claude Code
+report sooner. To tell you which of the two happened, a user-initiated
+re-read pops a short, low-priority notification:
+
+- `Updated — Session 7%, Weekly 28%` — the cache had newer data.
+- `No new data — Claude Code last reported at 14:32` — the cache is
+  unchanged since that time (usually: no Claude Code session is running).
+- `No data — install the statusline hook` — there is no readable cache file
+  at all.
+
+These are marked transient, so they disappear on their own and do not pile
+up in your notification history. Timer-driven polls never notify.
+
+## Desktop compatibility
+
+The tray icon uses StatusNotifierItem (SNI), the freedesktop tray protocol:
+
+- **Works out of the box**: KDE Plasma, XFCE 4.16+, LXQt, Cinnamon, MATE.
+- **GNOME**: requires the
+  [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
+  shell extension. Without it GNOME does not implement SNI at all and **no
+  icon will appear** — the process runs fine, it just has nowhere to draw.
+  The tray prints an error and exits if no SNI host is available at startup.
+- **Notifications** (threshold alerts and the refresh toast) use the
+  freedesktop desktop-notification standard, which every one of the above
+  ships by default, GNOME included, with no extension needed.
+
+## Settings
+
+The tray menu has a `Settings` submenu with everything that is configurable:
+
+- **Launch at login** — a checkbox. Checking it writes an XDG autostart
+  entry to `~/.config/autostart/claude-usage-tray.desktop` pointing at the
+  running binary's absolute path; unchecking it deletes that file. This is
+  the standard mechanism honoured by KDE, GNOME, XFCE, LXQt, Cinnamon and
+  MATE alike, so it works the same everywhere. The checkbox reflects whether
+  that file currently exists, so removing it by hand is picked up too. If
+  the file can't be written (read-only home, for instance), an error is
+  printed and the checkbox stays as it was. Note the entry records the path
+  of the binary you enabled it from — if you move the binary, re-toggle the
+  checkbox.
+- **Refresh interval** — 5 s / 15 s / 30 s / 60 s. Changes take effect
+  immediately; no restart.
+
+Both settings are saved to `~/.config/claude-usage-tray/config.toml`
+(`$XDG_CONFIG_HOME` is respected if set), written atomically:
+
+```toml
+refresh_secs = 5
+launch_at_login = false
+```
+
+A missing or corrupt config file is not an error: the tray falls back to the
+defaults above.
 
 ## Installing the statusline hook
 
@@ -129,15 +186,24 @@ a malformed cache file, and never breaks your statusline output.
 A desktop notification fires once when session usage crosses 80% (normal
 priority) and again at 95% (critical priority). Each threshold re-arms only
 when the 5-hour window resets or usage drops back below it, so you won't be
-spammed on every poll tick.
+spammed on every poll tick. These are the only notifications that persist;
+the "Check for new data" toast described above is transient.
 
-## Configuration
+## Environment variables
 
 - `CLAUDE_TRAY_POLL_SECS` — how often (in seconds) the tray re-reads the
-  cache file. Default: `5`.
+  cache file. **Takes precedence over the configured refresh interval** when
+  it is set to a positive integer; anything else (unset, `0`, garbage) is
+  ignored and the config file wins. While the override is in effect the
+  radio group still saves your choice to the config file — it just doesn't
+  change the running interval, and the submenu says so. Removing the
+  variable and restarting makes the saved choice take effect.
 - `CLAUDE_CONFIG_DIR` — overrides where both the statusline hook writes and
   the tray reads the cache file (`$CLAUDE_CONFIG_DIR/usage-tray-cache.json`).
   Defaults to `~/.claude`.
+
+Effective refresh interval, highest priority first:
+`CLAUDE_TRAY_POLL_SECS` → `refresh_secs` in `config.toml` → `5`.
 
 ## Limitations
 
