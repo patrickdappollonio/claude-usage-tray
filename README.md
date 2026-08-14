@@ -1,513 +1,155 @@
 # claude-usage-tray
 
-A minimal Linux tray icon (StatusNotifierItem — KDE Plasma primary, GNOME via
-the AppIndicator extension) that shows your Claude Code subscription usage:
-the 5-hour session percentage and the 7-day weekly percentage, with reset
-times. This is a proof of concept: a status icon and a menu, nothing more.
-No windows, no charts, no separate settings window (the handful of settings
-live in the menu itself), no multi-account profiles.
+[![GitHub Release](https://img.shields.io/github/v/release/patrickdappollonio/claude-usage-tray)](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest) [![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/patrickdappollonio/claude-usage-tray/total)](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest) [![NPM Version](https://img.shields.io/npm/v/%40patrickdappollonio%2Fclaude-usage-tray)](https://www.npmjs.com/package/@patrickdappollonio/claude-usage-tray) [![CI](https://img.shields.io/github/actions/workflow/status/patrickdappollonio/claude-usage-tray/ci.yml?branch=main&label=ci)](https://github.com/patrickdappollonio/claude-usage-tray/actions/workflows/ci.yml) [![GitHub License](https://img.shields.io/github/license/patrickdappollonio/claude-usage-tray)](LICENSE)
 
-## How data flows
+Know how much Claude Code you have left, without asking. **claude-usage-tray** puts a tiny gauge in your Linux system tray showing your 5-hour session usage and your weekly usage, with the times they reset.
 
+No window. No dashboard. Just an icon that changes color as you get closer to the limit, and a menu when you want the details.
+
+<!-- screenshot -->
+
+### Why you might want this
+
+Claude Code already knows your usage. It just doesn't tell you until you go looking, and by then you are usually mid-thought on something important.
+
+This puts the number where you can glance at it. Green means you have room. Red means wrap it up. If you would rather be told than reminded, it can also notify you as you cross 50%, 75%, 90%, 99% and 100%.
+
+### It never talks to Anthropic
+
+This is the part worth reading slowly.
+
+The tray never reads your Claude credentials, never touches your OAuth tokens, and never contacts Anthropic at all. There is no account to create and nothing to log into.
+
+Here is the whole data flow. Claude Code already computes your usage numbers and hands them to whatever you have configured as your statusline. One command wires this tool into that statusline, where it quietly copies those numbers to a small file on your machine. The tray reads that file. That's it.
+
+Your own statusline keeps working exactly as before. If the tray ever fails to write its file, your statusline still prints what it always printed, because the piece that runs inside Claude Code is built to stay out of the way and never fail loudly.
+
+The only network request the program can make is an optional update check, once a day, against the GitHub releases API. It is anonymous, it sends nothing but the program name and version, and it only reads the latest release tag. Turn it off in `Settings > Check for updates` and the program makes zero network requests, ever.
+
+### Install
+
+Every release ships statically linked binaries for x86_64 and arm64. No runtime dependencies, no glibc version to match.
+
+**Homebrew (Linuxbrew):**
+
+```bash
+brew install patrickdappollonio/tap/claude-usage-tray
 ```
-Claude Code statusline JSON (stdin, includes rate_limits since v2.1.80)
-  -> claude-usage-tray statusline  (this same binary, configured as your
-     statusLine.command) writes that JSON verbatim to
-     ~/.claude/usage-tray-statusline.json (atomic: temp file + rename),
-     for repaints carrying usage data
-  -> claude-usage-tray reads that cache file every few seconds and
-     renders the tray icon, tooltip, and menu from it
+
+**npm:**
+
+```bash
+npm install -g @patrickdappollonio/claude-usage-tray
 ```
 
-There is **no shell script and no `jq`** anywhere in this path: the binary is
-both the transport and the parser.
+The npm package bundles the same prebuilt binaries and is Linux only. For a one-off run, use `npx -y @patrickdappollonio/claude-usage-tray`.
 
-**Cache contract (v2).** The cache file at
-`${CLAUDE_CONFIG_DIR:-~/.claude}/usage-tray-statusline.json` is a byte-for-byte
-copy of the JSON Claude Code sends its statusline command on stdin — the whole
-document, `model`, `workspace`, `cost` and all — for repaints that carry
-usage data. The tray reads `rate_limits.five_hour` and `rate_limits.seven_day`
-(`used_percentage`, `resets_at`) out of it and ignores everything else. A
-repaint whose `rate_limits` is absent or null does not overwrite a cache that
-already has real data (see [below](#the-statusline-subcommand)), so a
-session's pre-first-turn statusline paint can't clobber the previous
-session's numbers.
+**Debian, Ubuntu and derivatives:**
 
-There is no timestamp *inside* the file: **freshness comes from the file's
-mtime**. Older than 10 minutes and the tray treats the data as stale: the
-gauge keeps showing the numbers it has, a question mark replaces the weekly
-dot in the middle of the icon, and the menu reads `⚠ Last updated 12 h ago`.
-
-Earlier versions used a different file (`usage-tray-cache.json`) written by a
-shell snippet. `claude-usage-tray hook install` deletes that file and strips
-the old injected shell block out of your statusline script automatically; you
-do not need to clean anything up by hand.
-
-## No Anthropic network calls, no credentials — ever
-
-This tray **never reads or touches your Claude credentials**
-(`.credentials.json`, OAuth tokens, or any cookie) and **never talks to
-Anthropic at all**. Usage data comes from one local JSON file — the data Claude
-Code itself already hands to your statusline on stdin. This matters because
-Anthropic's January 2026 Terms of Service update prohibits using subscription
-OAuth outside Claude Code, and tools that impersonate a browser or spoof the
-Claude Code user agent to poll usage over the network have gotten accounts
-auto-banned. This tool never does that class of thing, by construction.
-
-The one network call it can make is unrelated to your usage: an **optional,
-once-daily update check** against the GitHub releases API
-(`api.github.com/repos/patrickdappollonio/claude-usage-tray/releases/latest`).
-It is anonymous — no account, no token, no identifier of any kind; the request
-sends nothing but a `User-Agent` naming the program and its version — and it
-only ever reads the latest release's tag and page URL. If a newer version
-exists, an `⬆ Update available: v0.2.0` row appears in the menu; clicking it
-opens that release page in your browser via `xdg-open`. A failed check (no
-network, a proxy, a rate limit) is silent: no toast, no log line, no row.
-
-Switch it off with `Settings ▸ Check for updates`, or set
-`check_updates = false` in `config.toml`. With it off the binary makes **zero
-network requests**, which is what it also does on any run before the first
-check is due.
-
-## Installation
-
-Every release ships statically linked binaries for **x86\_64** and **arm64** —
-no runtime dependencies, no glibc version to match. Pick whichever of these
-suits your system; replace `<version>` with the release you want (for example
-`0.1.0`) and `<arch>` with `amd64` or `arm64`.
-
-### Debian, Ubuntu and derivatives
-
-```sh
+```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.deb
 sudo dpkg -i claude-usage-tray_<version>_linux_<arch>.deb
 ```
 
-### Fedora, RHEL, openSUSE
+**Fedora, RHEL, openSUSE:**
 
-```sh
+```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.rpm
-sudo rpm -i claude-usage-tray_<version>_linux_<arch>.rpm
-# or, to let your package manager resolve it:
 sudo dnf install ./claude-usage-tray_<version>_linux_<arch>.rpm
 ```
 
-### Arch Linux
+**Arch Linux:**
 
-```sh
+```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.pkg.tar.zst
 sudo pacman -U claude-usage-tray_<version>_linux_<arch>.pkg.tar.zst
 ```
 
-### Alpine
+**Alpine:**
 
-```sh
+```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.apk
 sudo apk add --allow-untrusted claude-usage-tray_<version>_linux_<arch>.apk
 ```
 
-### npm
+**Plain tarball:**
 
-```sh
-npm install -g @patrickdappollonio/claude-usage-tray
-```
-
-Or run it without installing, with `npx @patrickdappollonio/claude-usage-tray`.
-The npm package bundles the same prebuilt binaries and is Linux-only.
-
-### Homebrew / Linuxbrew
-
-Once releases are published, the tap provides it:
-
-```sh
-brew install patrickdappollonio/tap/claude-usage-tray
-```
-
-### Plain tarball
-
-If none of the above fit, grab the archive and drop the binary somewhere on
-your `PATH`:
-
-```sh
+```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.tar.gz
 tar xzf claude-usage-tray_<version>_linux_<arch>.tar.gz
 sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
 ```
 
-Each release also carries a `checksums.txt` with SHA-256 sums for every asset.
+Replace `<version>` with the release you want (for example `0.1.0`) and `<arch>` with `amd64` or `arm64`. Every release also carries a `checksums.txt` with SHA-256 sums for each file. Grab any of these from the [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest).
 
-## Run
+### Getting started
 
-```sh
+Two commands and you're done:
+
+```bash
+claude-usage-tray hook install   # let Claude Code share its usage numbers
 claude-usage-tray               # run the tray
-claude-usage-tray hook install  # wire up the Claude Code statusline
 ```
 
-The binary has three modes, dispatched from its first argument:
+`hook install` edits your Claude Code `settings.json` and nothing else. If you already have a statusline, yours is wrapped rather than replaced, so it keeps running and printing exactly what it did before. If you had no statusline, you still don't get one, because the tray doesn't add anything of its own. Your original file is backed up the first time.
 
-| Command | What it does |
-| --- | --- |
-| *(no arguments)* | Runs the tray. |
-| `statusline [--exec CMD]` | Claude Code's statusline command: caches the stdin JSON, optionally running `CMD` and passing its output through. See [below](#the-statusline-subcommand). |
-| `hook install` / `hook uninstall` / `hook status` | Manages the `settings.json` entry. See [below](#installing-the-statusline-hook). |
+Then start a Claude Code session and the numbers show up.
 
-Anything else prints a short usage message and exits 2. Because the tray
-binary is also its own installer and its own statusline command, `hook
-install` records an **absolute path** — reinstall (or re-run `hook install`)
-after moving the binary; `hook status` says so when the recorded path and the
-running one differ.
+Two more commands, for when you need them:
 
-The ksni tray service runs on its own thread; the main thread runs the poll
-loop, re-reading the cache file on an interval (see [Settings](#settings)
-below) and updating the icon when the content changes. Left-click shows a
-summary of your current usage; use "Check for new data" in the menu to force
-a re-read. "Quit" exits cleanly.
-
-Left-click re-reads the cache and pops a short, low-priority notification
-worded from what it finds, for example:
-
-- `You've used 32% of your 5-hour session (resets at 03:50) and 33% of your
-  weekly limit (resets Tue 09:00).`
-- The same sentence with `Last updated 12 h ago.` appended if the cache is
-  stale.
-- `No usage data — install the statusline hook.` if there is no readable
-  cache file at all.
-
-The menu item is called "Check for new data" rather than "Refresh" on
-purpose: it re-reads the local cache file, which only moves forward when
-Claude Code itself runs your statusline. Clicking it cannot make Claude Code
-report sooner. To tell you which of the two happened, it pops its own
-notification instead of the summary above:
-
-- `Updated — Session 7%, Weekly 28%` — the cache had newer data.
-- `No new data — Claude Code last reported at 14:32` — the cache is
-  unchanged since that time (usually: no Claude Code session is running).
-- `No data — install the statusline hook` — there is no readable cache file
-  at all.
-
-Both kinds of toast are marked transient, so they disappear on their own and
-do not pile up in your notification history. Timer-driven polls never notify.
-
-## Desktop compatibility
-
-The tray icon uses StatusNotifierItem (SNI), the freedesktop tray protocol:
-
-- **Works out of the box**: KDE Plasma, XFCE 4.16+, LXQt, Cinnamon, MATE.
-- **GNOME**: requires the
-  [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
-  shell extension. Without it GNOME does not implement SNI at all and **no
-  icon will appear** — the process runs fine, it just has nowhere to draw.
-  The tray prints an error and exits if no SNI host is available at startup.
-- **Notifications** (threshold alerts and the refresh toast) use the
-  freedesktop desktop-notification standard, which every one of the above
-  ships by default, GNOME included, with no extension needed.
-
-## Settings
-
-The tray menu has a `Settings` submenu with everything that is configurable:
-
-- **Launch at login** — a checkbox. Checking it writes an XDG autostart
-  entry to `~/.config/autostart/claude-usage-tray.desktop` pointing at the
-  running binary's absolute path; unchecking it deletes that file. This is
-  the standard mechanism honoured by KDE, GNOME, XFCE, LXQt, Cinnamon and
-  MATE alike, so it works the same everywhere. The checkbox reflects whether
-  that file currently exists, so removing it by hand is picked up too. If
-  the file can't be written (read-only home, for instance), an error is
-  printed and the checkbox stays as it was. Note the entry records the path
-  of the binary you enabled it from — if you move the binary, re-toggle the
-  checkbox.
-- **Notifications** — a submenu with one checkbox per usage threshold
-  (`At 50%` … `At 100%`) plus `When quota resets`. See
-  [Notifications](#notifications) below for what each one does. Changes take
-  effect immediately; no restart.
-- **Refresh interval** — 5 s / 15 s / 30 s / 60 s. Changes take effect
-  immediately; no restart.
-- **Icon style** — `Color` / `Monochrome (auto)` / `Monochrome dark` /
-  `Monochrome light`. See [Icon style](#icon-style) below. Changes take
-  effect immediately; no restart.
-- **Check for updates** — a checkbox, on by default, and the only setting
-  that permits a network request. See
-  [Update checks](#update-checks) below. Unticking it stops the next check
-  without a restart.
-
-**Grayed-out entries**: the tray checks, each time you open the menu,
-whether it can actually act on these settings. If
-`~/.config/claude-usage-tray/` cannot be created or written to (read-only
-home, full disk, wrong ownership), the refresh-interval options and the
-notification checkboxes, the icon-style options and `Check for updates` are
-shown disabled rather than accepting a click
-that could not be saved. If `~/.config/autostart/` is unavailable, `Launch
-at login` is disabled the same way. Because the check runs on every menu
-open, fixing the permissions un-grays the entries without restarting the
-tray.
-
-Settings are saved to `~/.config/claude-usage-tray/config.toml`
-(`$XDG_CONFIG_HOME` is respected if set), written atomically:
-
-```toml
-refresh_secs = 5
-launch_at_login = false
-notify_thresholds = [50, 75, 90, 99, 100]
-notify_on_reset = true
-icon_style = "color"
-check_updates = true
+```bash
+claude-usage-tray hook status      # what's wired up, and how fresh the data is
+claude-usage-tray hook uninstall   # put things back exactly as they were
 ```
 
-A missing or corrupt config file is not an error: the tray falls back to the
-defaults above. `notify_thresholds` is the list of thresholds that are
-switched **on**; unknown or out-of-range entries are dropped on load, a value
-that is not a list at all falls back to the default set, and an empty list is
-respected as "no threshold alerts". An `icon_style` that is missing,
-misspelled or of the wrong type falls back to `"color"`. `check_updates` has
-to be a literal `false` to switch the update check off — a missing or
-wrong-typed value leaves it on.
+If you skip the install step, the tray notices. It shows a gray icon and offers an **Install hook** button right in the menu, which does the same thing as the command above.
 
-## Update checks
+One small note: the hook records the full path of the binary you ran it from. If you move the binary, run `hook install` again. `hook status` will tell you when the paths no longer match.
 
-Once a day (and once a few seconds after startup), the tray asks the GitHub
-releases API whether there is a newer version than the one running. It is the
-only network request this program makes, it is anonymous, and it sends nothing
-about you, your account or your usage — see
-[the section above](#no-anthropic-network-calls-no-credentials--ever).
+### Reading the icon
 
-When a newer release is found, one extra row appears in the menu, directly
-above `Settings`:
+The icon is a small gauge, and it tells you two things at once.
 
-```
-⬆ Update available: v0.2.0
-```
+- **The outer arc** is your 5-hour session, sweeping clockwise as you use it up.
+- **The dot in the middle** is your weekly usage.
+- **The color** is the warning: green under 50%, yellow under 75%, orange under 90%, red at 90% and above. Both parts use the same bands.
+- **A question mark in the middle** means the numbers haven't been updated recently. You still see the last known reading, it just might not be current.
+- **A gray icon** means there's no data yet, usually because the hook isn't installed.
 
-Clicking it opens that release's page on GitHub in your default browser (via
-`xdg-open`) and nothing else — the tray never downloads or installs anything.
-When there is no newer release, or the check simply did not get an answer, the
-row is absent and nothing is logged or notified; a version check is not worth
-interrupting anyone for.
+Left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets at 03:50) and 33% of your weekly limit (resets Tue 09:00)." It appears briefly and disappears on its own.
 
-Uncheck `Settings ▸ Check for updates` (or set `check_updates = false`) to
-stop it. The setting is read again before every check, so switching it off
-takes effect without restarting the tray. A row that is already showing stays
-until you restart — it is a link you have already been offered, not a nag.
+Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the countdowns stay accurate on their own. When a 5-hour window rolls over, the session percentage drops back to 0% even if nothing has reported in hours.
 
-Version comparison is on the numeric parts only (`0.10.0` really is newer than
-`0.9.0`), a leading `v` on the tag is ignored, and a prerelease tag such as
-`0.2.0-rc.1` counts as newer only if its *numbers* are newer — so running
-`0.1.0` you would be told about `0.2.0-rc.1`, but running `0.1.0-rc.1` you are
-not told to "update" to `0.1.0`.
+### Settings
 
-## Installing the statusline hook
+Everything configurable lives in the `Settings` submenu. Changes apply immediately, no restart.
 
-The tray is only useful once something is writing the cache file. That
-something is this same binary, configured as your Claude Code statusline
-command. One command installs it:
+- **Launch at login.** A checkbox. It writes a standard autostart entry, which KDE, GNOME, XFCE, LXQt, Cinnamon and MATE all honor.
+- **Notifications.** One checkbox per threshold (50%, 75%, 90%, 99%, 100%), plus one for when your quota resets. All on by default, all optional. You get one notification per crossing, the highest one only, and restarting the tray never counts as a crossing.
+- **Refresh interval.** How often the tray re-reads the numbers: 5, 15, 30 or 60 seconds.
+- **Icon style.** Color, or monochrome for panels where four colors are more noise than signal. Monochrome auto follows your desktop's light or dark preference and repaints live when you switch. There's also a manual dark and light option, named after your desktop rather than the icon, so pick the one matching your panel. In monochrome the arc length carries the signal instead of the color.
+- **Check for updates.** On by default, and the only setting that permits a network request. When a newer version exists, one row appears in the menu; clicking it opens the release page in your browser. Nothing is ever downloaded or installed for you. Uncheck it and the checks stop.
 
-```sh
-claude-usage-tray hook install
-```
+Settings are saved to `~/.config/claude-usage-tray/config.toml`. If the tray can't write there, the affected menu entries appear grayed out instead of pretending to accept your click.
 
-That edits `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` and nothing else.
-Concretely:
+### Desktop compatibility
 
-- **No statusline configured yet** → `statusLine.command` becomes
-  `"/abs/path/claude-usage-tray statusline"`. Your statusline then prints
-  nothing (it printed nothing before, and the tray deliberately does not add
-  anything of its own).
-- **You already have a statusline** → yours is wrapped, not replaced:
-  `"/abs/path/claude-usage-tray statusline --exec '~/.claude/statusline-command.sh'"`.
-  Your command still receives the same JSON on stdin and its output still goes
-  to the statusline, byte for byte.
-- **Already installed** → the entry is refreshed in place (handy after moving
-  or rebuilding the binary). It is never wrapped twice: an existing entry is
-  recognized by its `statusline` argument, whatever the binary is called.
+The icon uses StatusNotifierItem, the freedesktop tray standard.
 
-Every other key in `settings.json` is preserved (it is a JSON
-read-modify-write, pretty-printed and written atomically). The first install
-copies the original file to `settings.json.bak-usage-tray`; later installs
-keep that first backup rather than overwriting it with an already-modified
-copy.
+- **Works out of the box:** KDE Plasma, XFCE 4.16+, LXQt, Cinnamon, MATE.
+- **GNOME:** needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension. Without it GNOME has no tray to draw into, and no icon will appear. The tray tells you and exits rather than running invisibly.
+- **Notifications** use the standard desktop notification service, which every desktop above ships by default, GNOME included, no extension needed.
 
-Then start a new Claude Code session (or wait for the statusline to refresh)
-and the tray picks up data.
+### What it can't do
 
-### Checking and removing it
+Worth knowing before you install.
 
-```sh
-claude-usage-tray hook status      # what is wired up, and how fresh the cache is
-claude-usage-tray hook uninstall   # put your original command back
-```
+The numbers only move forward while Claude Code is running a session, because that's when it reports them. When nothing is running, the icon goes stale and grows a question mark, but it keeps showing the last reading and the countdowns stay correct. "Check for new data" in the menu re-reads the file, but it can't make Claude Code report sooner.
 
-`uninstall` restores the command that was wrapped in `--exec`, or removes the
-`statusLine` key entirely if there was nothing to restore, and deletes the
-cache file. A `statusLine.command` that isn't ours is left untouched.
+You need Claude Code 2.1.80 or newer, which is the version that started including usage in the statusline data.
 
-### The `statusline` subcommand
+It also only works on Pro and Max subscriptions logged in the normal way. API-key billing doesn't include usage numbers, so there's nothing to show.
 
-You can also wire it up by hand — this is all `hook install` does:
+### License
 
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/abs/path/claude-usage-tray statusline --exec '~/.claude/statusline-command.sh'"
-  }
-}
-```
-
-Drop the `--exec '...'` part if you have no statusline command of your own.
-
-The subcommand is deliberately boring: it reads stdin to EOF, and then, with
-`--exec`, runs your command via `sh -c` with the same bytes on stdin and lets
-its stdout through unmodified. **It always exits 0 and never prints anything
-of its own**, even if the cache write fails or your command is missing or
-fails — a usage tray must not be able to break your statusline.
-
-Repaints carrying usage data are written to the cache verbatim. One
-exception: a freshly started session paints its statusline once before its
-first turn, with `rate_limits` absent, and that repaint is skipped rather
-than clobbering a cache that already has real usage data — otherwise the
-tray would flash "no data" at the start of every session. If there is no
-cache yet, or the existing cache is equally empty, it writes anyway, so the
-first-run experience is unaffected.
-
-### Upgrading from the old shell hook
-
-Nothing to do: run `claude-usage-tray hook install`. It strips the old
-`# --- claude-usage-tray hook … # --- end claude-usage-tray hook ---` block
-out of your statusline script (backing the script up as
-`<script>.bak-usage-tray` first) and deletes the obsolete
-`usage-tray-cache.json`.
-
-## Icon legend
-
-- **Outer arc**: sweeps clockwise with 5-hour session usage percentage.
-- **Inner dot**: 7-day weekly usage percentage, same color bands.
-- **Color bands**: green below 50%, yellow below 75%, orange below 90%, red
-  at 90% and above. The edges are the same numbers as the
-  [notification thresholds](#notifications), so the icon changes color at
-  exactly the moments the tray also speaks up.
-- **Question mark in the center**: the cache file is older than 10 minutes
-  (stale) — usage may have changed since the last time Claude Code ran. The
-  ring and the session arc stay at full strength and keep showing the last
-  known numbers; only the weekly dot is swapped for the `?`, which says "this
-  might not be current" without hiding the reading. The menu's third row
-  spells the gap out — `⚠ Last updated 45 min ago`, `⚠ Last updated 12 h
-  ago`, `⚠ Last updated 2 d ago`.
-- **Stale does not mean wrong.** Reset times are absolute timestamps, so the
-  tray keeps counting down to them from its own clock without any new data —
-  and once a 5-hour window's `resets_at` has passed, the session percentage
-  **drops itself back to 0%** even while the cache is stale. A stale icon
-  showing `Session: 0%` after a long break is telling you the truth, not
-  showing you a frozen number.
-- **Gray icon**: no cache file found, or it couldn't be parsed. The menu then
-  reads `⚠ Hook not installed — no data` and offers a clickable **Install
-  hook** item that does the same thing as `claude-usage-tray hook install`,
-  followed by a `Hook installed — data appears next time Claude Code
-  refreshes` toast — or `Hook already installed — entry refreshed` if it was
-  wired up all along and the entry was merely re-pointed at the current
-  binary. That item is only there while there is no data.
-
-## Icon style
-
-`Settings ▸ Icon style` chooses between the colored gauge and a flat
-monochrome one, for panels and themes where four severity colors are more
-noise than signal. The setting is saved as `icon_style` in `config.toml` and
-applies the moment you pick it.
-
-| Menu option | `config.toml` | What you get |
-| --- | --- | --- |
-| `Color` (default) | `"color"` | The banded gauge described above. |
-| `Monochrome (auto)` | `"mono-auto"` | One flat color, following your desktop's light/dark preference. |
-| `Monochrome dark` | `"mono-dark"` | One flat color, pinned to "my desktop is dark". |
-| `Monochrome light` | `"mono-light"` | One flat color, pinned to "my desktop is light". |
-
-In monochrome mode the ring, the session arc and the weekly dot are all drawn
-in the same color, and the **length of the arc sweep alone** carries the usage
-signal — there is no green/yellow/orange/red to read. Everything else behaves
-exactly as in color mode: a stale cache still swaps the center dot for a
-question mark (drawn in the same foreground color as the rest of the icon,
-since a second gray would vanish against the ring), and a missing cache still
-renders the gray "no data" ring and dot.
-
-**The names describe your UI, not the icon.** `Monochrome dark` means "my
-desktop is dark", so it paints a **near-white** icon; `Monochrome light` means
-"my desktop is light" and paints a **near-black** one. Pick the one that
-matches your panel; if the icon comes out invisible, you have picked the other
-one.
-
-`Monochrome (auto)` reads your preference from the XDG Desktop Portal
-(`org.freedesktop.portal.Settings`, namespace `org.freedesktop.appearance`,
-key `color-scheme`), which is the same setting KDE, GNOME and friends
-publish for every other app: `1` means "prefer dark" (light icon), `0` and
-`2` mean no preference or "prefer light" (dark icon). The tray also
-subscribes to the portal's change signal, so flipping your desktop between
-light and dark repaints the icon live, without a restart. If no portal is
-running — or the lookup fails for any other reason — auto assumes a **dark
-desktop** and draws the light icon; pin `Monochrome light` if that is wrong
-for your setup.
-
-## Notifications
-
-Desktop notifications fire as your 5-hour session usage climbs past
-**50%, 75%, 90%, 99% and 100%**. All five are on by default and each one can
-be switched off individually under `Settings ▸ Notifications`.
-
-- **Urgency**: 50% and 75% are normal priority; 90%, 99% and 100% are
-  critical, so they stay on screen on desktops that treat critical
-  notifications that way.
-- **Once per crossing**: a threshold re-arms only when the 5-hour window
-  resets or usage drops back below it, so you are not alerted on every poll
-  tick.
-- **Only the highest**: if usage jumps from 10% to 99% between two reads,
-  you get one notification (99%), not four.
-- **Toggling is not retroactive**: switching a threshold back on while usage
-  is already past it stays quiet until the next genuine crossing.
-- **Restarting is not a crossing**: the first reading after the tray starts
-  is a baseline, not an alert. Starting the tray at 82% tells you nothing;
-  climbing from 82% to 91% afterwards notifies at 90%. This is why no
-  notification state needs to survive a restart.
-
-**When quota resets** (also on by default, same submenu) is a separate
-notification — `Session quota reset — fresh 5-hour window`, normal priority
-— fired when the session window's reset time arrives. It comes from the
-tray's own clock, not from the cache, so it is on time even when no Claude
-Code session is running and nothing has refreshed the cache for hours. It
-fires at most once per reset time, and never if the cache has no reset time
-to work from.
-
-These notifications persist in your notification history; the "Check for new
-data" toast described above is transient.
-
-## Environment variables
-
-- `CLAUDE_TRAY_POLL_SECS` — how often (in seconds) the tray re-reads the
-  cache file. **Takes precedence over the configured refresh interval** when
-  it is set to a positive integer; anything else (unset, `0`, garbage) is
-  ignored and the config file wins. While the override is in effect the
-  radio group still saves your choice to the config file — it just doesn't
-  change the running interval, and the submenu says so. Removing the
-  variable and restarting makes the saved choice take effect.
-- `CLAUDE_CONFIG_DIR` — Claude Code's own config-directory override, honoured
-  here too: it decides where `hook install` edits `settings.json` and where
-  the cache file (`$CLAUDE_CONFIG_DIR/usage-tray-statusline.json`) is written
-  and read. Defaults to `~/.claude`.
-
-Effective refresh interval, highest priority first:
-`CLAUDE_TRAY_POLL_SECS` → `refresh_secs` in `config.toml` → `5`.
-
-## Limitations
-
-- Usage data only refreshes while Claude Code is actively running a session
-  (the statusline only runs then). When no session is running, the icon goes
-  stale and grows a `?` in the middle, but it keeps showing the last known
-  numbers, reset-time countdowns remain accurate regardless, and a session
-  window that rolls over in the meantime still drops the session percentage
-  back to 0%.
-- Requires Claude Code >= 2.1.80 (the version that added `rate_limits` to
-  the statusline JSON).
-- Only works for Pro/Max subscription accounts authenticated via Claude
-  Code's normal OAuth login. `rate_limits` is absent from the statusline
-  JSON for API-key billing, so there is nothing for this tool to show in
-  that case.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
