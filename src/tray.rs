@@ -13,17 +13,13 @@
 //!
 //! See `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md`.
 
-use crate::config::{self, Config, REFRESH_CHOICES};
+use crate::config::{self, Config, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
 use jiff::{Timestamp, tz::TimeZone};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-
-/// Session-usage percentage at which a normal-urgency alert fires.
-const WARN_THRESHOLD: f64 = 80.0;
-/// Session-usage percentage at which a critical-urgency alert fires.
-const CRITICAL_THRESHOLD: f64 = 95.0;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Messages the tray sends to the poll loop in `main.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +32,11 @@ pub enum Wake {
     /// instead of finishing the current (possibly 60 s) wait. Not a refresh —
     /// it neither re-reads the cache nor notifies.
     IntervalChanged,
+    /// A notification setting changed: cut the current wait short so the poll
+    /// loop picks the new preferences up from the shared state immediately
+    /// rather than up to a minute later. Like `IntervalChanged`, it neither
+    /// re-reads the cache nor notifies.
+    NotifyChanged,
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
@@ -176,7 +177,7 @@ pub fn snapshot_changed(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
 /// A threshold crossing the poll loop should turn into a desktop notification.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageAlert {
-    /// The threshold that was crossed (80 or 95).
+    /// The threshold that was crossed — one of [`NOTIFY_THRESHOLDS`].
     pub threshold: u8,
     /// The session percentage that triggered it.
     pub percent: f64,
@@ -192,7 +193,10 @@ impl UsageAlert {
 
     /// Notification body.
     pub fn body(&self) -> String {
-        if self.critical {
+        if self.threshold >= 100 {
+            "The 5-hour window is fully used. Further requests will wait for the reset."
+                .to_string()
+        } else if self.critical {
             format!(
                 "The 5-hour window is above {}%. You are close to the limit.",
                 self.threshold
@@ -210,17 +214,41 @@ impl UsageAlert {
 /// 5-hour window began). Readings without a percentage are ignored entirely:
 /// they neither fire nor re-arm, so a temporarily unreadable cache cannot
 /// cause a duplicate alert.
-#[derive(Debug, Default)]
+///
+/// Fired state is tracked for *every* threshold in [`NOTIFY_THRESHOLDS`],
+/// including the ones currently switched off. That is what makes toggling
+/// safe: a threshold the user re-enables while usage is already past it is
+/// recorded as delivered, so it stays quiet until the next real crossing,
+/// exactly as if it had been on the whole time. It is also what makes a jump
+/// past several thresholds fire only the highest one.
+#[derive(Debug)]
 pub struct Notifier {
-    fired_warn: bool,
-    fired_critical: bool,
+    /// The enabled subset of [`NOTIFY_THRESHOLDS`].
+    enabled: Vec<u8>,
+    /// Thresholds already delivered (or passed) for the current window.
+    fired: Vec<u8>,
     window: Option<Timestamp>,
     seen_window: bool,
 }
 
 impl Notifier {
-    pub fn new() -> Self {
-        Self::default()
+    /// Builds a notifier for the given enabled thresholds.
+    pub fn new(enabled: &[u8]) -> Self {
+        Notifier {
+            enabled: enabled.to_vec(),
+            fired: Vec::new(),
+            window: None,
+            seen_window: false,
+        }
+    }
+
+    /// Replaces the enabled set (a menu toggle). No fired state is discarded,
+    /// so re-enabling a threshold that current usage is already past does not
+    /// produce a spurious alert.
+    pub fn set_enabled(&mut self, enabled: &[u8]) {
+        if self.enabled != enabled {
+            self.enabled = enabled.to_vec();
+        }
     }
 
     /// Feeds the latest session metric in and returns an alert to emit, if any.
@@ -231,48 +259,198 @@ impl Notifier {
         if !self.seen_window || self.window != metric.resets_at {
             self.seen_window = true;
             self.window = metric.resets_at;
-            self.fired_warn = false;
-            self.fired_critical = false;
+            self.fired.clear();
         }
 
-        if percent < WARN_THRESHOLD {
-            self.fired_warn = false;
-        }
-        if percent < CRITICAL_THRESHOLD {
-            self.fired_critical = false;
+        // Anything usage has fallen back below is armed again.
+        self.fired
+            .retain(|&threshold| percent >= f64::from(threshold));
+
+        let alert = self
+            .enabled
+            .iter()
+            .copied()
+            .filter(|&threshold| percent >= f64::from(threshold) && !self.fired.contains(&threshold))
+            .max()
+            .map(|threshold| UsageAlert {
+                threshold,
+                percent,
+                critical: config::is_critical(threshold),
+            });
+
+        // Every threshold usage has passed counts as delivered — the lower
+        // ones because the highest alert already covers them, the disabled
+        // ones so that switching them on later stays quiet.
+        for threshold in NOTIFY_THRESHOLDS {
+            if percent >= f64::from(threshold) && !self.fired.contains(&threshold) {
+                self.fired.push(threshold);
+            }
         }
 
-        if percent >= CRITICAL_THRESHOLD && !self.fired_critical {
-            self.fired_critical = true;
-            // Crossing straight past both thresholds must not produce two
-            // notifications, so the warn level counts as already delivered.
-            self.fired_warn = true;
-            return Some(UsageAlert {
-                threshold: 95,
-                percent,
-                critical: true,
-            });
+        alert
+    }
+}
+
+/// The "your 5-hour window rolled over" notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResetAlert {
+    /// The `resets_at` that came due.
+    pub at: Timestamp,
+}
+
+impl ResetAlert {
+    pub fn summary(&self) -> String {
+        "Claude usage".to_string()
+    }
+
+    pub fn body(&self) -> String {
+        "Session quota reset — fresh 5-hour window".to_string()
+    }
+}
+
+/// Pure state machine for the quota-reset notification.
+///
+/// It runs off the tray's own wall clock rather than off cache contents, so it
+/// fires on time even when Claude Code is idle and nothing is refreshing the
+/// cache — `resets_at` is an absolute timestamp, so no new data is needed to
+/// know the window rolled over.
+///
+/// A reset only fires if the tray saw that `resets_at` while it was still in
+/// the future. A window that had already expired when the tray first read the
+/// cache (a stale cache from yesterday, say) is recorded as handled without
+/// notifying: announcing "fresh window" for something that expired hours ago
+/// would be noise at every startup.
+#[derive(Debug, Default)]
+pub struct ResetNotifier {
+    /// A future reset we are waiting for.
+    pending: Option<Timestamp>,
+    /// The last `resets_at` already dealt with, fired or suppressed. Fires
+    /// happen at most once per distinct value.
+    handled: Option<Timestamp>,
+}
+
+impl ResetNotifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds in the session window's `resets_at` and the current time.
+    /// `enabled` is the user's `notify_on_reset` setting: when off, the
+    /// crossing is still consumed (so switching it back on later cannot
+    /// resurrect an old one), it just produces no alert.
+    pub fn evaluate(
+        &mut self,
+        resets_at: Option<Timestamp>,
+        now: Timestamp,
+        enabled: bool,
+    ) -> Option<ResetAlert> {
+        // A watched window comes due on the tray's own clock, whether or not
+        // the cache still reports it. Consuming it here and not under
+        // `resets_at` is what keeps a cache that went missing mid-window from
+        // leaving a permanently-due deadline behind — which the poll loop
+        // would busy-wait on.
+        let fired = match self.pending {
+            Some(at) if at <= now => {
+                self.pending = None;
+                self.handled = Some(at);
+                enabled.then_some(ResetAlert { at })
+            }
+            _ => None,
+        };
+        // Arm the next window. A `resets_at` already in the past that we never
+        // watched (a stale cache at startup) arms nothing and fires nothing.
+        if let Some(at) = resets_at
+            && at > now
+            && self.handled != Some(at)
+        {
+            self.pending = Some(at);
         }
-        if percent >= WARN_THRESHOLD && !self.fired_warn {
-            self.fired_warn = true;
-            return Some(UsageAlert {
-                threshold: 80,
-                percent,
-                critical: false,
-            });
+        fired
+    }
+
+    /// The moment the poll loop must be awake by, if any, so the reset alert
+    /// is not delayed by a long refresh interval.
+    pub fn deadline(&self) -> Option<Timestamp> {
+        self.pending
+    }
+}
+
+/// How long the poll loop should wait: the configured interval, cut short so
+/// that a pending quota reset is handled the moment it comes due rather than
+/// up to a full interval later.
+///
+/// A deadline that has already passed yields a zero wait; the loop then
+/// immediately runs its next cycle, which consumes the crossing — so this
+/// cannot spin, because the deadline is gone by the following iteration.
+pub fn poll_wait(interval_secs: u64, deadline: Option<Timestamp>, now: Timestamp) -> Duration {
+    let interval = Duration::from_secs(interval_secs);
+    match deadline {
+        Some(at) => {
+            let secs = at.as_second() - now.as_second();
+            let until = Duration::from_secs(u64::try_from(secs).unwrap_or(0));
+            interval.min(until)
         }
-        None
+        None => interval,
+    }
+}
+
+/// The notification preferences the poll loop needs, shared with the menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotifyPrefs {
+    /// Enabled session-usage thresholds.
+    pub thresholds: Vec<u8>,
+    /// Whether the quota-reset alert fires.
+    pub on_reset: bool,
+}
+
+impl NotifyPrefs {
+    fn from_config(config: &Config) -> Self {
+        NotifyPrefs {
+            thresholds: config.notify_thresholds.clone(),
+            on_reset: config.notify_on_reset,
+        }
+    }
+}
+
+/// Shared handle to [`NotifyPrefs`]. A mutex rather than atomics because the
+/// value is a list; it is held only for a clone or a store, never across I/O.
+#[derive(Clone)]
+pub struct NotifyHandle(Arc<Mutex<NotifyPrefs>>);
+
+impl NotifyHandle {
+    fn new(prefs: NotifyPrefs) -> Self {
+        NotifyHandle(Arc::new(Mutex::new(prefs)))
+    }
+
+    /// Current preferences. A poisoned mutex (a panic while holding it) still
+    /// yields usable data here — recovering beats taking the tray down over a
+    /// notification setting.
+    pub fn get(&self) -> NotifyPrefs {
+        match self.0.lock() {
+            Ok(prefs) => prefs.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set(&self, prefs: NotifyPrefs) {
+        match self.0.lock() {
+            Ok(mut slot) => *slot = prefs,
+            Err(poisoned) => *poisoned.into_inner() = prefs,
+        }
     }
 }
 
 /// Settings shared between the menu (which changes them) and the poll loop
-/// (which reads the interval every cycle, so changes apply live).
+/// (which reads the interval and the notification preferences every cycle, so
+/// changes apply live).
 pub struct Settings {
     /// Last-loaded/last-saved config file contents.
     config: Config,
     /// The interval the poll loop actually waits, in seconds. Shared so a
     /// radio-group change takes effect without restarting anything.
     interval: Arc<AtomicU64>,
+    /// Notification preferences, shared the same way.
+    notify: NotifyHandle,
     /// True when `CLAUDE_TRAY_POLL_SECS` is set to a usable value. The radio
     /// group then still persists the user's choice, but the effective interval
     /// stays the environment's.
@@ -284,9 +462,11 @@ impl Settings {
     /// override, returning the handle the poll loop reads.
     pub fn new(config: Config, env_secs: Option<u64>) -> Self {
         let effective = env_secs.unwrap_or(config.refresh_secs);
+        let notify = NotifyHandle::new(NotifyPrefs::from_config(&config));
         Settings {
             config,
             interval: Arc::new(AtomicU64::new(effective)),
+            notify,
             env_locked: env_secs.is_some(),
         }
     }
@@ -294,6 +474,11 @@ impl Settings {
     /// Handle for the poll loop; `load` it once per cycle.
     pub fn interval_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.interval)
+    }
+
+    /// Handle for the poll loop; `get` it once per cycle.
+    pub fn notify_handle(&self) -> NotifyHandle {
+        self.notify.clone()
     }
 }
 
@@ -353,11 +538,76 @@ impl UsageTray {
         config::save(&self.settings.config);
     }
 
+    /// Persists a changed config and republishes the notification preferences
+    /// to the poll loop, waking it so the change is live immediately.
+    fn apply_notify_change(&mut self) {
+        config::save(&self.settings.config);
+        self.settings
+            .notify
+            .set(NotifyPrefs::from_config(&self.settings.config));
+        self.send(Wake::NotifyChanged);
+    }
+
+    /// Checkbox handler for one usage threshold.
+    fn toggle_threshold(&mut self, threshold: u8) {
+        let enabled = !self.settings.config.notifies_at(threshold);
+        self.settings.config.set_notifies_at(threshold, enabled);
+        self.apply_notify_change();
+    }
+
+    /// Checkbox handler for the quota-reset alert.
+    fn toggle_notify_on_reset(&mut self) {
+        self.settings.config.notify_on_reset = !self.settings.config.notify_on_reset;
+        self.apply_notify_change();
+    }
+
+    /// The `Notifications` sub-submenu. `enabled` is the capability probe
+    /// result: with an unwritable config directory every toggle here would
+    /// silently fail to persist, so they render grayed instead.
+    fn notifications_menu(&self, enabled: bool) -> ksni::MenuItem<Self> {
+        let mut submenu: Vec<ksni::MenuItem<Self>> = NOTIFY_THRESHOLDS
+            .iter()
+            .map(|&threshold| {
+                ksni::menu::CheckmarkItem {
+                    label: format!("At {threshold}%"),
+                    enabled,
+                    checked: self.settings.config.notifies_at(threshold),
+                    activate: Box::new(move |tray: &mut Self| tray.toggle_threshold(threshold)),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect();
+        submenu.push(ksni::MenuItem::Separator);
+        submenu.push(
+            ksni::menu::CheckmarkItem {
+                label: "When quota resets".into(),
+                enabled,
+                checked: self.settings.config.notify_on_reset,
+                activate: Box::new(|tray: &mut Self| tray.toggle_notify_on_reset()),
+                ..Default::default()
+            }
+            .into(),
+        );
+        ksni::menu::SubMenu {
+            label: "Notifications".into(),
+            submenu,
+            ..Default::default()
+        }
+        .into()
+    }
+
     /// The `Settings` submenu.
     fn settings_menu(&self) -> ksni::MenuItem<Self> {
+        // Probed on every menu build (cheap: a create_dir_all plus one tiny
+        // file), so fixing a permissions problem un-grays the entries without
+        // restarting the tray.
+        let can_persist = config::is_writable();
+        let can_autostart = crate::autostart::is_available();
         let mut submenu: Vec<ksni::MenuItem<Self>> = vec![
             ksni::menu::CheckmarkItem {
                 label: "Launch at login".into(),
+                enabled: can_autostart,
                 // Read from disk, not from the config mirror: the file is the
                 // thing the session manager actually acts on, and the user may
                 // have removed it behind our back.
@@ -366,6 +616,8 @@ impl UsageTray {
                 ..Default::default()
             }
             .into(),
+            ksni::MenuItem::Separator,
+            self.notifications_menu(can_persist),
             ksni::MenuItem::Separator,
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: "Refresh interval".into(),
@@ -379,6 +631,7 @@ impl UsageTray {
                     .iter()
                     .map(|secs| ksni::menu::RadioItem {
                         label: format!("{secs} s"),
+                        enabled: can_persist,
                         ..Default::default()
                     })
                     .collect(),
@@ -734,7 +987,7 @@ mod tests {
         let settings = Settings::new(
             Config {
                 refresh_secs: 30,
-                launch_at_login: false,
+                ..Config::default()
             },
             None,
         );
@@ -747,7 +1000,7 @@ mod tests {
         let settings = Settings::new(
             Config {
                 refresh_secs: 30,
-                launch_at_login: false,
+                ..Config::default()
             },
             Some(2),
         );
@@ -778,99 +1031,372 @@ mod tests {
         assert!(snapshot_changed(&a, &e));
     }
 
+    /// All thresholds on, the shipped default.
+    fn all_on() -> Notifier {
+        Notifier::new(&NOTIFY_THRESHOLDS)
+    }
+
     #[test]
-    fn notifier_fires_once_at_eighty() {
-        let mut n = Notifier::new();
-        assert_eq!(n.evaluate(Some(&metric(Some(50.0), Some(BASE)))), None);
+    fn notifier_fires_once_per_enabled_threshold() {
+        let mut n = all_on();
+        assert_eq!(n.evaluate(Some(&metric(Some(10.0), Some(BASE)))), None);
+
         let alert = n
-            .evaluate(Some(&metric(Some(81.0), Some(BASE))))
-            .expect("crossing 80 fires");
-        assert_eq!(alert.threshold, 80);
+            .evaluate(Some(&metric(Some(51.0), Some(BASE))))
+            .expect("crossing 50 fires");
+        assert_eq!(alert.threshold, 50);
         assert!(!alert.critical);
-        // Still above 80 but not 95: no repeat.
-        assert_eq!(n.evaluate(Some(&metric(Some(85.0), Some(BASE)))), None);
-    }
+        // Still above 50, below 75: no repeat.
+        assert_eq!(n.evaluate(Some(&metric(Some(60.0), Some(BASE)))), None);
 
-    #[test]
-    fn notifier_fires_critical_at_ninety_five() {
-        let mut n = Notifier::new();
-        n.evaluate(Some(&metric(Some(81.0), Some(BASE))));
         let alert = n
-            .evaluate(Some(&metric(Some(96.0), Some(BASE))))
-            .expect("crossing 95 fires");
-        assert_eq!(alert.threshold, 95);
-        assert!(alert.critical);
-        assert_eq!(n.evaluate(Some(&metric(Some(99.0), Some(BASE)))), None);
+            .evaluate(Some(&metric(Some(76.0), Some(BASE))))
+            .expect("crossing 75 fires");
+        assert_eq!(alert.threshold, 75);
+        assert!(!alert.critical);
     }
 
     #[test]
-    fn notifier_jumping_past_both_thresholds_fires_only_critical() {
-        let mut n = Notifier::new();
+    fn notifier_upper_thresholds_are_critical() {
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
+        for (percent, threshold) in [(91.0, 90), (99.0, 99), (100.0, 100)] {
+            let alert = n
+                .evaluate(Some(&metric(Some(percent), Some(BASE))))
+                .unwrap_or_else(|| panic!("crossing {threshold} fires"));
+            assert_eq!(alert.threshold, threshold);
+            assert!(alert.critical, "{threshold} must be critical");
+        }
+    }
+
+    #[test]
+    fn notifier_fires_at_exactly_the_threshold() {
+        let mut n = all_on();
+        let alert = n
+            .evaluate(Some(&metric(Some(50.0), Some(BASE))))
+            .expect("50.0 counts as reaching 50");
+        assert_eq!(alert.threshold, 50);
+    }
+
+    #[test]
+    fn notifier_jumping_past_several_thresholds_fires_only_the_highest() {
+        let mut n = all_on();
         n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
         let alert = n
-            .evaluate(Some(&metric(Some(97.0), Some(BASE))))
+            .evaluate(Some(&metric(Some(99.5), Some(BASE))))
             .expect("fires");
-        assert_eq!(alert.threshold, 95);
-        // 80 must not fire afterwards while still high.
-        assert_eq!(n.evaluate(Some(&metric(Some(90.0), Some(BASE)))), None);
+        assert_eq!(alert.threshold, 99);
+        // The ones it flew past must stay quiet while usage stays up there.
+        assert_eq!(n.evaluate(Some(&metric(Some(99.6), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(91.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(80.0), Some(BASE)))), None);
     }
 
     #[test]
     fn notifier_rearms_when_percent_drops_below_threshold() {
-        let mut n = Notifier::new();
+        let mut n = all_on();
         n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
-        assert!(n.evaluate(Some(&metric(Some(81.0), Some(BASE)))).is_some());
-        assert_eq!(n.evaluate(Some(&metric(Some(70.0), Some(BASE)))), None);
-        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
+        assert!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))).is_some());
+        assert_eq!(n.evaluate(Some(&metric(Some(60.0), Some(BASE)))), None);
+        let alert = n
+            .evaluate(Some(&metric(Some(77.0), Some(BASE))))
+            .expect("re-armed by the drop");
+        assert_eq!(alert.threshold, 75);
     }
 
     #[test]
     fn notifier_rearms_when_window_resets_at_changes() {
-        let mut n = Notifier::new();
+        let mut n = all_on();
         n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
-        assert!(n.evaluate(Some(&metric(Some(81.0), Some(BASE)))).is_some());
+        assert!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))).is_some());
         // New window, still high -> fires again.
         let alert = n
-            .evaluate(Some(&metric(Some(81.0), Some(BASE + 18_000))))
+            .evaluate(Some(&metric(Some(76.0), Some(BASE + 18_000))))
             .expect("new window re-arms");
-        assert_eq!(alert.threshold, 80);
+        assert_eq!(alert.threshold, 75);
     }
 
     #[test]
     fn notifier_first_ever_reading_above_threshold_fires() {
-        let mut n = Notifier::new();
+        let mut n = all_on();
         let alert = n
             .evaluate(Some(&metric(Some(85.0), Some(BASE))))
-            .expect("first reading above 80 fires");
-        assert_eq!(alert.threshold, 80);
+            .expect("first reading above 75 fires");
+        assert_eq!(alert.threshold, 75);
     }
 
     #[test]
     fn notifier_ignores_missing_data_without_rearming() {
-        let mut n = Notifier::new();
-        assert!(n.evaluate(Some(&metric(Some(81.0), Some(BASE)))).is_some());
+        let mut n = all_on();
+        assert!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))).is_some());
         assert_eq!(n.evaluate(None), None);
         assert_eq!(n.evaluate(Some(&metric(None, Some(BASE)))), None);
         // Data comes back unchanged: must not re-fire.
-        assert_eq!(n.evaluate(Some(&metric(Some(81.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))), None);
+    }
+
+    #[test]
+    fn notifier_with_no_thresholds_never_fires() {
+        let mut n = Notifier::new(&[]);
+        assert_eq!(n.evaluate(Some(&metric(Some(100.0), Some(BASE)))), None);
+    }
+
+    #[test]
+    fn notifier_skips_disabled_thresholds_and_fires_the_next_enabled_one() {
+        // Only 50 and 100 on: passing 76 must stay silent, 100 must not.
+        let mut n = Notifier::new(&[50, 100]);
+        let alert = n
+            .evaluate(Some(&metric(Some(51.0), Some(BASE))))
+            .expect("50 is on");
+        assert_eq!(alert.threshold, 50);
+        assert_eq!(n.evaluate(Some(&metric(Some(91.0), Some(BASE)))), None);
+        let alert = n
+            .evaluate(Some(&metric(Some(100.0), Some(BASE))))
+            .expect("100 is on");
+        assert_eq!(alert.threshold, 100);
+    }
+
+    #[test]
+    fn notifier_reenabling_a_threshold_already_passed_does_not_fire() {
+        // The reconfigure edge: 90 is off while usage climbs past it, then the
+        // user switches it back on. Nothing happened at 90 that the user asked
+        // to hear about, so it must stay silent until a real crossing.
+        let mut n = Notifier::new(&[50, 75]);
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
+        assert!(n.evaluate(Some(&metric(Some(95.0), Some(BASE)))).is_some());
+
+        n.set_enabled(&NOTIFY_THRESHOLDS);
+        assert_eq!(n.evaluate(Some(&metric(Some(95.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(96.0), Some(BASE)))), None);
+
+        // A genuine later crossing of 99 still fires.
+        let alert = n
+            .evaluate(Some(&metric(Some(99.0), Some(BASE))))
+            .expect("99 is a fresh crossing");
+        assert_eq!(alert.threshold, 99);
+    }
+
+    #[test]
+    fn notifier_reenabling_after_a_drop_fires_on_the_next_crossing() {
+        let mut n = Notifier::new(&[50, 75]);
+        n.evaluate(Some(&metric(Some(95.0), Some(BASE))));
+        n.set_enabled(&NOTIFY_THRESHOLDS);
+        // Usage falls back below 90, then climbs again: now it is a crossing
+        // the user has asked to hear about.
+        assert_eq!(n.evaluate(Some(&metric(Some(80.0), Some(BASE)))), None);
+        let alert = n
+            .evaluate(Some(&metric(Some(92.0), Some(BASE))))
+            .expect("re-armed by the drop");
+        assert_eq!(alert.threshold, 90);
+    }
+
+    #[test]
+    fn notifier_disabling_a_threshold_silences_it_immediately() {
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
+        n.set_enabled(&[100]);
+        assert_eq!(n.evaluate(Some(&metric(Some(99.0), Some(BASE)))), None);
     }
 
     #[test]
     fn alert_text_differs_by_urgency() {
         let warn = UsageAlert {
-            threshold: 80,
-            percent: 81.0,
+            threshold: 50,
+            percent: 51.0,
             critical: false,
         };
-        assert_eq!(warn.summary(), "Claude session usage 81%");
-        assert!(warn.body().contains("80%"));
+        assert_eq!(warn.summary(), "Claude session usage 51%");
+        assert!(warn.body().contains("50%"));
 
         let crit = UsageAlert {
-            threshold: 95,
-            percent: 96.0,
+            threshold: 90,
+            percent: 91.0,
             critical: true,
         };
-        assert_eq!(crit.summary(), "Claude session usage 96%");
-        assert!(crit.body().contains("95%"));
+        assert_eq!(crit.summary(), "Claude session usage 91%");
+        assert!(crit.body().contains("90%"));
+
+        // 100% is not "close to the limit" — it is the limit.
+        let full = UsageAlert {
+            threshold: 100,
+            percent: 100.0,
+            critical: true,
+        };
+        assert_eq!(full.summary(), "Claude session usage 100%");
+        assert!(full.body().contains("fully used"));
+    }
+
+    #[test]
+    fn reset_notifier_fires_once_when_the_window_it_watched_comes_due() {
+        let mut r = ResetNotifier::new();
+        let at = ts(BASE + 600);
+        assert_eq!(r.evaluate(Some(at), ts(BASE), true), None);
+        assert_eq!(r.deadline(), Some(at));
+
+        let alert = r
+            .evaluate(Some(at), ts(BASE + 600), true)
+            .expect("due at exactly resets_at");
+        assert_eq!(alert.at, at);
+        assert_eq!(alert.body(), "Session quota reset — fresh 5-hour window");
+        assert_eq!(r.deadline(), None);
+
+        // The cache still reports the same (now past) resets_at for as long as
+        // Claude Code stays idle: never fire twice for it.
+        assert_eq!(r.evaluate(Some(at), ts(BASE + 900), true), None);
+        assert_eq!(r.evaluate(Some(at), ts(BASE + 20_000), true), None);
+    }
+
+    #[test]
+    fn reset_notifier_fires_again_for_the_next_window() {
+        let mut r = ResetNotifier::new();
+        let first = ts(BASE + 600);
+        r.evaluate(Some(first), ts(BASE), true);
+        assert!(r.evaluate(Some(first), ts(BASE + 600), true).is_some());
+
+        let second = ts(BASE + 18_600);
+        assert_eq!(r.evaluate(Some(second), ts(BASE + 700), true), None);
+        let alert = r
+            .evaluate(Some(second), ts(BASE + 18_600), true)
+            .expect("the next window fires too");
+        assert_eq!(alert.at, second);
+    }
+
+    #[test]
+    fn reset_notifier_stays_silent_without_a_resets_at() {
+        let mut r = ResetNotifier::new();
+        assert_eq!(r.evaluate(None, ts(BASE), true), None);
+        assert_eq!(r.evaluate(None, ts(BASE + 100_000), true), None);
+        assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn reset_notifier_ignores_a_window_that_expired_before_the_tray_saw_it() {
+        // Startup against a stale cache: announcing a reset that happened
+        // hours ago would be noise.
+        let mut r = ResetNotifier::new();
+        assert_eq!(r.evaluate(Some(ts(BASE - 3600)), ts(BASE), true), None);
+        assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn reset_notifier_consumes_the_crossing_while_disabled() {
+        let mut r = ResetNotifier::new();
+        let at = ts(BASE + 600);
+        r.evaluate(Some(at), ts(BASE), false);
+        assert_eq!(r.evaluate(Some(at), ts(BASE + 600), false), None);
+        // Switching the setting back on must not resurrect the old crossing.
+        assert_eq!(r.evaluate(Some(at), ts(BASE + 601), true), None);
+    }
+
+    #[test]
+    fn reset_notifier_still_fires_if_the_cache_disappears_mid_window() {
+        // Claude Code idle plus a deleted cache file: the reset is still a
+        // fact about the clock, and the pending deadline must be consumed
+        // either way — a deadline that stayed due would spin the poll loop.
+        let mut r = ResetNotifier::new();
+        let at = ts(BASE + 600);
+        r.evaluate(Some(at), ts(BASE), true);
+        let alert = r
+            .evaluate(None, ts(BASE + 600), true)
+            .expect("fires from the clock alone");
+        assert_eq!(alert.at, at);
+        assert_eq!(r.deadline(), None);
+        assert_eq!(r.evaluate(None, ts(BASE + 601), true), None);
+        assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn reset_notifier_consumes_the_deadline_even_when_disabled() {
+        let mut r = ResetNotifier::new();
+        let at = ts(BASE + 600);
+        r.evaluate(Some(at), ts(BASE), false);
+        assert_eq!(r.evaluate(None, ts(BASE + 600), false), None);
+        assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn poll_wait_is_the_interval_when_nothing_is_pending() {
+        assert_eq!(poll_wait(60, None, ts(BASE)), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn poll_wait_is_clamped_to_a_nearer_reset() {
+        assert_eq!(
+            poll_wait(60, Some(ts(BASE + 10)), ts(BASE)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn poll_wait_keeps_the_interval_when_the_reset_is_further_out() {
+        assert_eq!(
+            poll_wait(5, Some(ts(BASE + 4000)), ts(BASE)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn poll_wait_for_a_due_or_past_reset_is_zero() {
+        assert_eq!(poll_wait(60, Some(ts(BASE)), ts(BASE)), Duration::ZERO);
+        assert_eq!(poll_wait(60, Some(ts(BASE - 90)), ts(BASE)), Duration::ZERO);
+    }
+
+    /// Walks the poll loop's own sequence — evaluate, then wait for
+    /// `poll_wait` — over a simulated hour with a 60 s interval, checking that
+    /// the reset lands on time and that the loop never sits in a zero-wait
+    /// spin.
+    #[test]
+    fn simulated_poll_loop_fires_the_reset_on_time_without_spinning() {
+        let mut r = ResetNotifier::new();
+        let reset_at = BASE + 1_000;
+        let mut now = BASE;
+        let mut fired_at: Option<i64> = None;
+        let mut zero_waits = 0;
+
+        for _ in 0..200 {
+            if now > BASE + 3_600 {
+                break;
+            }
+            if let Some(alert) = r.evaluate(Some(ts(reset_at)), ts(now), true) {
+                assert_eq!(alert.at, ts(reset_at));
+                assert!(fired_at.is_none(), "fired twice");
+                fired_at = Some(now);
+            }
+            let wait = poll_wait(60, r.deadline(), ts(now));
+            if wait.is_zero() {
+                zero_waits += 1;
+            }
+            // A zero wait is only legitimate as the single cycle that
+            // consumes a due deadline.
+            assert!(zero_waits <= 1, "poll loop spun at {now}");
+            now += i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
+            if wait.is_zero() {
+                // The real loop still does a cache read on this pass; time
+                // moves on regardless.
+                now += 1;
+            }
+        }
+
+        assert_eq!(fired_at, Some(reset_at), "reset fired late or not at all");
+    }
+
+    #[test]
+    fn notify_prefs_are_shared_live_between_the_menu_and_the_poll_loop() {
+        let settings = Settings::new(Config::default(), None);
+        let handle = settings.notify_handle();
+        assert_eq!(
+            handle.get(),
+            NotifyPrefs {
+                thresholds: NOTIFY_THRESHOLDS.to_vec(),
+                on_reset: true,
+            }
+        );
+
+        let changed = NotifyPrefs {
+            thresholds: vec![100],
+            on_reset: false,
+        };
+        settings.notify.set(changed.clone());
+        assert_eq!(handle.get(), changed);
     }
 }

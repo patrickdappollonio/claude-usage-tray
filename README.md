@@ -101,19 +101,38 @@ The tray menu has a `Settings` submenu with everything that is configurable:
   printed and the checkbox stays as it was. Note the entry records the path
   of the binary you enabled it from — if you move the binary, re-toggle the
   checkbox.
+- **Notifications** — a submenu with one checkbox per usage threshold
+  (`At 50%` … `At 100%`) plus `When quota resets`. See
+  [Notifications](#notifications) below for what each one does. Changes take
+  effect immediately; no restart.
 - **Refresh interval** — 5 s / 15 s / 30 s / 60 s. Changes take effect
   immediately; no restart.
 
-Both settings are saved to `~/.config/claude-usage-tray/config.toml`
+**Grayed-out entries**: the tray checks, each time you open the menu,
+whether it can actually act on these settings. If
+`~/.config/claude-usage-tray/` cannot be created or written to (read-only
+home, full disk, wrong ownership), the refresh-interval options and the
+notification checkboxes are shown disabled rather than accepting a click
+that could not be saved. If `~/.config/autostart/` is unavailable, `Launch
+at login` is disabled the same way. Because the check runs on every menu
+open, fixing the permissions un-grays the entries without restarting the
+tray.
+
+Settings are saved to `~/.config/claude-usage-tray/config.toml`
 (`$XDG_CONFIG_HOME` is respected if set), written atomically:
 
 ```toml
 refresh_secs = 5
 launch_at_login = false
+notify_thresholds = [50, 75, 90, 99, 100]
+notify_on_reset = true
 ```
 
 A missing or corrupt config file is not an error: the tray falls back to the
-defaults above.
+defaults above. `notify_thresholds` is the list of thresholds that are
+switched **on**; unknown or out-of-range entries are dropped on load, a value
+that is not a list at all falls back to the default set, and an empty list is
+respected as "no threshold alerts".
 
 ## Installing the statusline hook
 
@@ -180,11 +199,31 @@ a malformed cache file, and never breaks your statusline output.
 
 ## Notifications
 
-A desktop notification fires once when session usage crosses 80% (normal
-priority) and again at 95% (critical priority). Each threshold re-arms only
-when the 5-hour window resets or usage drops back below it, so you won't be
-spammed on every poll tick. These are the only notifications that persist;
-the "Check for new data" toast described above is transient.
+Desktop notifications fire as your 5-hour session usage climbs past
+**50%, 75%, 90%, 99% and 100%**. All five are on by default and each one can
+be switched off individually under `Settings ▸ Notifications`.
+
+- **Urgency**: 50% and 75% are normal priority; 90%, 99% and 100% are
+  critical, so they stay on screen on desktops that treat critical
+  notifications that way.
+- **Once per crossing**: a threshold re-arms only when the 5-hour window
+  resets or usage drops back below it, so you are not alerted on every poll
+  tick.
+- **Only the highest**: if usage jumps from 10% to 99% between two reads,
+  you get one notification (99%), not four.
+- **Toggling is not retroactive**: switching a threshold back on while usage
+  is already past it stays quiet until the next genuine crossing.
+
+**When quota resets** (also on by default, same submenu) is a separate
+notification — `Session quota reset — fresh 5-hour window`, normal priority
+— fired when the session window's reset time arrives. It comes from the
+tray's own clock, not from the cache, so it is on time even when no Claude
+Code session is running and nothing has refreshed the cache for hours. It
+fires at most once per reset time, and never if the cache has no reset time
+to work from.
+
+These notifications persist in your notification history; the "Check for new
+data" toast described above is transient.
 
 ## Environment variables
 

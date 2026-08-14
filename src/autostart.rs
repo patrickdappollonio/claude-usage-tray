@@ -78,6 +78,20 @@ pub fn disable_in(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Whether the autostart entry in `dir` could actually be created or removed
+/// right now. Shares the config module's create-then-write probe, since the
+/// question ("can we put a file here?") is the same one.
+pub fn is_available_in(dir: &Path) -> bool {
+    crate::config::dir_is_writable(dir)
+}
+
+/// Whether the real autostart directory is usable. Probed each time the menu
+/// is built so that fixing the permissions un-grays the checkbox without a
+/// restart.
+pub fn is_available() -> bool {
+    is_available_in(&default_autostart_dir())
+}
+
 /// True when the entry exists in the real autostart directory.
 pub fn is_enabled() -> bool {
     is_enabled_in(&default_autostart_dir())
@@ -175,6 +189,31 @@ mod tests {
         let temp = TempDir::new("autostart-disable-absent");
         disable_in(temp.path()).expect("disabling an absent entry is fine");
         disable_in(&temp.path().join("never-created")).expect("missing dir is fine too");
+    }
+
+    #[test]
+    fn is_available_in_is_true_for_a_writable_directory() {
+        let temp = TempDir::new("autostart-available");
+        // Also true for one that does not exist yet: it can be created.
+        assert!(is_available_in(&temp.path().join("autostart")));
+        assert!(is_available_in(temp.path()));
+    }
+
+    #[test]
+    fn is_available_in_is_false_for_a_read_only_directory() {
+        let temp = TempDir::new("autostart-unavailable");
+        let dir = temp.path().join("locked");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        crate::testutil::set_mode(&dir, 0o555);
+
+        let root_can_write_anyway = std::fs::write(dir.join("root-check"), b"").is_ok();
+        if root_can_write_anyway {
+            let _ = std::fs::remove_file(dir.join("root-check"));
+        } else {
+            assert!(!is_available_in(&dir));
+        }
+
+        crate::testutil::set_mode(&dir, 0o755);
     }
 
     #[test]

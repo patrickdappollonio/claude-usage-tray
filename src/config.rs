@@ -2,11 +2,13 @@
 //! launch-at-login flag.
 //!
 //! The file lives at `~/.config/claude-usage-tray/config.toml` (respecting
-//! `$XDG_CONFIG_HOME`) and holds exactly two keys:
+//! `$XDG_CONFIG_HOME`) and holds four keys:
 //!
 //! ```toml
 //! refresh_secs = 5
 //! launch_at_login = false
+//! notify_thresholds = [50, 75, 90, 99, 100]
+//! notify_on_reset = true
 //! ```
 //!
 //! Like every other read path in this crate, nothing here panics on bad input:
@@ -26,13 +28,33 @@ pub const DEFAULT_REFRESH_SECS: u64 = 5;
 /// The intervals offered by the `Refresh interval` radio group, in seconds.
 pub const REFRESH_CHOICES: [u64; 4] = [5, 15, 30, 60];
 
+/// Every session-usage threshold the tray knows how to alert on, ascending.
+/// Values outside this set are meaningless to the notifier, so they are
+/// dropped on load rather than kept as dead weight in the config.
+pub const NOTIFY_THRESHOLDS: [u8; 5] = [50, 75, 90, 99, 100];
+
+/// Thresholds at and above this value notify at critical urgency; the lower
+/// ones are informational.
+pub const CRITICAL_FROM: u8 = 90;
+
+/// True when a threshold should be delivered at critical urgency.
+pub fn is_critical(threshold: u8) -> bool {
+    threshold >= CRITICAL_FROM
+}
+
 /// User settings as stored in `config.toml`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Seconds between cache re-reads.
     pub refresh_secs: u64,
     /// Whether an XDG autostart entry should exist for the tray.
     pub launch_at_login: bool,
+    /// The enabled subset of [`NOTIFY_THRESHOLDS`], sorted and deduplicated.
+    /// An empty list is a legitimate state: it means the user switched every
+    /// threshold off.
+    pub notify_thresholds: Vec<u8>,
+    /// Whether the "session quota reset" notification fires.
+    pub notify_on_reset: bool,
 }
 
 impl Default for Config {
@@ -40,6 +62,8 @@ impl Default for Config {
         Config {
             refresh_secs: DEFAULT_REFRESH_SECS,
             launch_at_login: false,
+            notify_thresholds: NOTIFY_THRESHOLDS.to_vec(),
+            notify_on_reset: true,
         }
     }
 }
@@ -60,6 +84,37 @@ impl Config {
             })
             .unwrap_or(0)
     }
+
+    /// Whether alerts for `threshold` are switched on.
+    pub fn notifies_at(&self, threshold: u8) -> bool {
+        self.notify_thresholds.contains(&threshold)
+    }
+
+    /// Switches `threshold` on or off, keeping the list sorted and unique.
+    /// Thresholds outside [`NOTIFY_THRESHOLDS`] are ignored.
+    pub fn set_notifies_at(&mut self, threshold: u8, enabled: bool) {
+        if !NOTIFY_THRESHOLDS.contains(&threshold) {
+            return;
+        }
+        self.notify_thresholds.retain(|&t| t != threshold);
+        if enabled {
+            self.notify_thresholds.push(threshold);
+            self.notify_thresholds.sort_unstable();
+        }
+    }
+}
+
+/// Keeps only known thresholds, deduplicated and sorted. Used both when
+/// loading a hand-edited file and when accepting a list from anywhere else.
+pub fn sanitize_thresholds(values: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    let mut kept: Vec<u8> = values
+        .into_iter()
+        .filter_map(|value| u8::try_from(value).ok())
+        .filter(|threshold| NOTIFY_THRESHOLDS.contains(threshold))
+        .collect();
+    kept.sort_unstable();
+    kept.dedup();
+    kept
 }
 
 /// Default config file location: `$XDG_CONFIG_HOME/claude-usage-tray/config.toml`,
@@ -93,19 +148,42 @@ pub fn parse_config(body: &str) -> Config {
         .get("launch_at_login")
         .and_then(|value| value.as_bool())
         .unwrap_or(defaults.launch_at_login);
+    // A present-but-not-a-list value (or a missing key) means "we have no idea
+    // what the user wanted" — defaults. A real list, on the other hand, is
+    // taken at face value after filtering, including the empty one: that is
+    // how "every threshold switched off" is stored.
+    let notify_thresholds = match table
+        .get("notify_thresholds")
+        .and_then(|value| value.as_array())
+    {
+        Some(items) => sanitize_thresholds(items.iter().filter_map(|item| item.as_integer())),
+        None => defaults.notify_thresholds.clone(),
+    };
+    let notify_on_reset = table
+        .get("notify_on_reset")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(defaults.notify_on_reset);
     Config {
         refresh_secs,
         launch_at_login,
+        notify_thresholds,
+        notify_on_reset,
     }
 }
 
 /// Renders a config back to TOML. Written by hand rather than through a
-/// serializer: the schema is two scalars, and this keeps the `toml` dependency
-/// to its parser half.
+/// serializer: the schema is three scalars and a small integer list, and this
+/// keeps the `toml` dependency to its parser half.
 pub fn render_config(config: &Config) -> String {
+    let thresholds = config
+        .notify_thresholds
+        .iter()
+        .map(|threshold| threshold.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "refresh_secs = {}\nlaunch_at_login = {}\n",
-        config.refresh_secs, config.launch_at_login
+        "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\nnotify_on_reset = {}\n",
+        config.refresh_secs, config.launch_at_login, thresholds, config.notify_on_reset
     )
 }
 
@@ -137,6 +215,35 @@ pub fn save_to(path: &Path, config: &Config) -> io::Result<()> {
             Err(err)
         }
     }
+}
+
+/// Cheap capability probe: can we create `dir` (if absent) and write a file
+/// inside it? Used to gray out the menu entries whose only effect would be a
+/// failed save.
+///
+/// Deliberately a real create + write rather than a permission-bit reading:
+/// read-only mounts, full disks, immutable attributes and SELinux denials all
+/// show up here and none of them show up in the mode bits. The probe file is
+/// removed again; if even the removal fails, the directory is still writable,
+/// which is the question being asked.
+pub fn dir_is_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".write-probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether the real config directory can be written to right now. Called on
+/// every menu open, hence the "cheap" requirement above.
+pub fn is_writable() -> bool {
+    dir_is_writable(&config_dir())
 }
 
 /// Interprets the `CLAUDE_TRAY_POLL_SECS` value. `None` (unset, unparseable,
@@ -174,24 +281,31 @@ mod tests {
     use crate::testutil::TempDir;
 
     #[test]
-    fn default_is_five_seconds_and_no_autostart() {
+    fn default_is_five_seconds_no_autostart_and_all_notifications_on() {
         assert_eq!(
             Config::default(),
             Config {
                 refresh_secs: 5,
-                launch_at_login: false
+                launch_at_login: false,
+                notify_thresholds: vec![50, 75, 90, 99, 100],
+                notify_on_reset: true,
             }
         );
     }
 
     #[test]
     fn parses_a_full_config() {
-        let config = parse_config("refresh_secs = 30\nlaunch_at_login = true\n");
+        let config = parse_config(
+            "refresh_secs = 30\nlaunch_at_login = true\n\
+             notify_thresholds = [75, 100]\nnotify_on_reset = false\n",
+        );
         assert_eq!(
             config,
             Config {
                 refresh_secs: 30,
-                launch_at_login: true
+                launch_at_login: true,
+                notify_thresholds: vec![75, 100],
+                notify_on_reset: false,
             }
         );
     }
@@ -201,15 +315,15 @@ mod tests {
         assert_eq!(
             parse_config("launch_at_login = true\n"),
             Config {
-                refresh_secs: 5,
-                launch_at_login: true
+                launch_at_login: true,
+                ..Config::default()
             }
         );
         assert_eq!(
             parse_config("refresh_secs = 60\n"),
             Config {
                 refresh_secs: 60,
-                launch_at_login: false
+                ..Config::default()
             }
         );
     }
@@ -220,9 +334,93 @@ mod tests {
             parse_config("colour = \"blue\"\nrefresh_secs = 15\n"),
             Config {
                 refresh_secs: 15,
-                launch_at_login: false
+                ..Config::default()
             }
         );
+    }
+
+    #[test]
+    fn parses_an_empty_threshold_list_as_everything_off() {
+        // Not a fallback case: this is how "no threshold alerts" is stored.
+        assert_eq!(
+            parse_config("notify_thresholds = []\n").notify_thresholds,
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn threshold_list_drops_unknown_and_out_of_range_values() {
+        assert_eq!(
+            parse_config("notify_thresholds = [50, 80, 101, -3, 999999, 100]\n")
+                .notify_thresholds,
+            vec![50, 100]
+        );
+    }
+
+    #[test]
+    fn threshold_list_is_deduplicated_and_sorted() {
+        assert_eq!(
+            parse_config("notify_thresholds = [100, 50, 100, 75, 50]\n").notify_thresholds,
+            vec![50, 75, 100]
+        );
+    }
+
+    #[test]
+    fn a_non_list_threshold_value_falls_back_to_the_default_set() {
+        for body in [
+            "notify_thresholds = 90\n",
+            "notify_thresholds = \"all\"\n",
+            "notify_thresholds = true\n",
+            "notify_thresholds = { at = 90 }\n",
+        ] {
+            assert_eq!(
+                parse_config(body).notify_thresholds,
+                NOTIFY_THRESHOLDS.to_vec(),
+                "body: {body}"
+            );
+        }
+        // A list of the wrong element type keeps list semantics: nothing
+        // survives the filter, so nothing is enabled.
+        assert_eq!(
+            parse_config("notify_thresholds = [\"90\", true]\n").notify_thresholds,
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn notify_on_reset_falls_back_when_wrong_typed() {
+        assert!(!parse_config("notify_on_reset = false\n").notify_on_reset);
+        assert!(parse_config("notify_on_reset = 1\n").notify_on_reset);
+    }
+
+    #[test]
+    fn set_notifies_at_toggles_and_keeps_the_list_sorted_and_unique() {
+        let mut config = Config {
+            notify_thresholds: vec![],
+            ..Config::default()
+        };
+        config.set_notifies_at(100, true);
+        config.set_notifies_at(50, true);
+        config.set_notifies_at(50, true);
+        assert_eq!(config.notify_thresholds, vec![50, 100]);
+        assert!(config.notifies_at(50));
+
+        config.set_notifies_at(50, false);
+        assert_eq!(config.notify_thresholds, vec![100]);
+        assert!(!config.notifies_at(50));
+
+        // Unknown thresholds are not storable.
+        config.set_notifies_at(80, true);
+        assert_eq!(config.notify_thresholds, vec![100]);
+    }
+
+    #[test]
+    fn critical_urgency_starts_at_ninety() {
+        assert!(!is_critical(50));
+        assert!(!is_critical(75));
+        assert!(is_critical(90));
+        assert!(is_critical(99));
+        assert!(is_critical(100));
     }
 
     #[test]
@@ -242,8 +440,18 @@ mod tests {
         let config = Config {
             refresh_secs: 60,
             launch_at_login: true,
+            notify_thresholds: vec![75, 99],
+            notify_on_reset: false,
         };
         assert_eq!(parse_config(&render_config(&config)), config);
+
+        // The all-off list must survive the round trip as itself, not as the
+        // default set.
+        let none = Config {
+            notify_thresholds: vec![],
+            ..Config::default()
+        };
+        assert_eq!(parse_config(&render_config(&none)), none);
     }
 
     #[test]
@@ -262,6 +470,8 @@ mod tests {
         let config = Config {
             refresh_secs: 15,
             launch_at_login: true,
+            notify_thresholds: vec![50, 100],
+            notify_on_reset: false,
         };
         save_to(&path, &config).expect("save succeeds");
         assert!(path.exists());
@@ -276,6 +486,7 @@ mod tests {
         let updated = Config {
             refresh_secs: 30,
             launch_at_login: true,
+            ..Config::default()
         };
         save_to(&path, &updated).expect("second save");
         assert_eq!(load_from(&path), updated);
@@ -307,7 +518,7 @@ mod tests {
     fn env_override_wins_over_the_configured_interval() {
         let config = Config {
             refresh_secs: 60,
-            launch_at_login: false,
+            ..Config::default()
         };
         assert_eq!(env_override(Some("2")).unwrap_or(config.refresh_secs), 2);
         assert_eq!(env_override(None).unwrap_or(config.refresh_secs), 60);
@@ -318,17 +529,60 @@ mod tests {
         for (index, &secs) in REFRESH_CHOICES.iter().enumerate() {
             let config = Config {
                 refresh_secs: secs,
-                launch_at_login: false,
+                ..Config::default()
             };
             assert_eq!(config.refresh_choice(), index);
         }
     }
 
     #[test]
+    fn dir_is_writable_creates_a_missing_directory_and_leaves_nothing_behind() {
+        let dir = TempDir::new("writable-probe");
+        let target = dir.path().join("claude-usage-tray");
+        assert!(dir_is_writable(&target));
+        assert!(target.is_dir());
+        let leftovers: Vec<_> = std::fs::read_dir(&target)
+            .expect("read probed dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "probe left files: {leftovers:?}");
+    }
+
+    #[test]
+    fn dir_is_writable_is_false_for_a_read_only_directory() {
+        let dir = TempDir::new("writable-readonly");
+        let target = dir.path().join("locked");
+        std::fs::create_dir_all(&target).expect("create dir");
+        crate::testutil::set_mode(&target, 0o555);
+
+        // Root ignores the mode bits, so the assertion below would be a lie
+        // there. Find out by trying it directly rather than guessing at the
+        // uid, then skip.
+        let root_can_write_anyway = std::fs::write(target.join("root-check"), b"").is_ok();
+        if root_can_write_anyway {
+            let _ = std::fs::remove_file(target.join("root-check"));
+        } else {
+            assert!(!dir_is_writable(&target));
+        }
+
+        // Restore so the TempDir can clean itself up.
+        crate::testutil::set_mode(&target, 0o755);
+    }
+
+    #[test]
+    fn dir_is_writable_is_false_when_the_path_is_a_file() {
+        let dir = TempDir::new("writable-file");
+        let path = dir.path().join("not-a-dir");
+        std::fs::write(&path, b"x").expect("write file");
+        assert!(!dir_is_writable(&path));
+    }
+
+    #[test]
     fn refresh_choice_for_an_unlisted_interval_selects_the_default() {
         let config = Config {
             refresh_secs: 7,
-            launch_at_login: false,
+            ..Config::default()
         };
         assert_eq!(
             REFRESH_CHOICES[config.refresh_choice()],

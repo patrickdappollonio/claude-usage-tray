@@ -25,6 +25,13 @@ impl TempDir {
     }
 }
 
+/// Sets the permission bits of `path`. Used by the capability-probe tests to
+/// build a directory that cannot be written to.
+pub fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

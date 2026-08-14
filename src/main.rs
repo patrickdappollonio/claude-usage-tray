@@ -20,8 +20,7 @@ use jiff::{Timestamp, tz::TimeZone};
 use ksni::blocking::TrayMethods;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
-use tray::{UsageAlert, Wake};
+use tray::{ResetAlert, UsageAlert, Wake};
 
 /// Emits a threshold notification. Failures (no notification daemon, D-Bus
 /// down) are ignored: a missing notification must never take the tray with it.
@@ -36,6 +35,18 @@ fn notify(alert: &UsageAlert) {
         } else {
             notify_rust::Urgency::Normal
         });
+    let _ = notification.show();
+}
+
+/// Emits the "your 5-hour window rolled over" notification. Normal urgency:
+/// it is good news, not a warning.
+fn notify_reset(alert: &ResetAlert) {
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .appname("Claude usage")
+        .summary(&alert.summary())
+        .body(&alert.body())
+        .urgency(notify_rust::Urgency::Normal);
     let _ = notification.show();
 }
 
@@ -59,6 +70,7 @@ fn main() {
     let env_secs = config::env_override(std::env::var("CLAUDE_TRAY_POLL_SECS").ok().as_deref());
     let settings = tray::Settings::new(stored, env_secs);
     let interval = settings.interval_handle();
+    let notify_prefs = settings.notify_handle();
     let tz = TimeZone::system();
 
     let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
@@ -76,15 +88,49 @@ fn main() {
         }
     };
 
-    let mut notifier = tray::Notifier::new();
+    let mut notifier = tray::Notifier::new(&notify_prefs.get().thresholds);
+    let mut reset_notifier = tray::ResetNotifier::new();
 
     loop {
+        // Re-read the preferences every cycle so a menu toggle applies live.
+        let prefs = notify_prefs.get();
+        notifier.set_enabled(&prefs.thresholds);
         if let Some(alert) = notifier.evaluate(snapshot.session.as_ref()) {
             notify(&alert);
         }
 
-        // Re-read the interval every cycle so a settings change applies live.
-        let wait = Duration::from_secs(interval.load(Ordering::Relaxed));
+        let now = Timestamp::now();
+        // Whether the window we were waiting on has now come due — recorded
+        // before `evaluate` consumes it.
+        let window_rolled_over = reset_notifier.deadline().is_some_and(|at| at <= now);
+        let session_reset = snapshot
+            .session
+            .as_ref()
+            .and_then(|session| session.resets_at);
+        if let Some(alert) = reset_notifier.evaluate(session_reset, now, prefs.on_reset) {
+            notify_reset(&alert);
+        }
+        if window_rolled_over {
+            // The cached percentages describe the window that just ended; a
+            // re-read reports the fresh one (the reader zeroes a percentage
+            // whose `resets_at` has passed), so the icon follows the
+            // notification instead of lagging a whole interval behind it.
+            let next = source::read_snapshot(&cache_path, Timestamp::now());
+            if tray::snapshot_changed(&snapshot, &next) {
+                let pushed = next.clone();
+                handle.update(move |tray| tray.snapshot = pushed);
+            }
+            snapshot = next;
+            continue;
+        }
+
+        // Re-read the interval every cycle so a settings change applies live,
+        // and never sleep past a pending quota reset.
+        let wait = tray::poll_wait(
+            interval.load(Ordering::Relaxed),
+            reset_notifier.deadline(),
+            Timestamp::now(),
+        );
         let user_initiated = match wake_rx.recv_timeout(wait) {
             // "Check for new data" or a left-click: re-read *and* tell the
             // user what came of it.
@@ -93,6 +139,8 @@ fn main() {
             Err(RecvTimeoutError::Timeout) => false,
             // The interval changed mid-wait: start a fresh wait with it.
             Ok(Wake::IntervalChanged) => continue,
+            // A notification toggle changed: pick it up at the top of the loop.
+            Ok(Wake::NotifyChanged) => continue,
             Ok(Wake::Quit) => break,
             // Every sender is gone, which can only mean the tray service died.
             Err(RecvTimeoutError::Disconnected) => break,
