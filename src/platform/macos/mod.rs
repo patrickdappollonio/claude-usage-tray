@@ -210,10 +210,32 @@ where
 /// (see the doc comment above), and that work is where this gets revisited
 /// alongside a real app identity.
 pub fn notify(toast: &Toast, _channel: Channel) {
-    let _ = notify_rust::Notification::new()
-        .summary(&toast.summary)
-        .body(&toast.body)
-        .show();
+    // Deliberately NOT notify-rust here: its macOS backend
+    // (mac-notification-sys) masquerades under another app's bundle identity
+    // via `get_bundle_identifier_or_default("use_default")`, and on current
+    // macOS that lookup can fail into an "choose an application" picker for a
+    // literal app called `use_default` (observed on a real Mac). osascript's
+    // `display notification` is the unbundled-binary-safe path: no identity
+    // games, no dialogs. Loses urgency/transient nuance, which is acceptable
+    // until the bundled-app work gives us UNUserNotificationCenter.
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        applescript_escape(&toast.body),
+        applescript_escape(&toast.summary),
+    );
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Escapes a string for inclusion inside a double-quoted AppleScript literal.
+/// AppleScript's only escapes in double-quoted strings are `\"` and `\\`;
+/// newlines are legal inside the quotes as-is.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Does nothing, on purpose.

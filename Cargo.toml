@@ -48,12 +48,12 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io", "
 # Default features are left on deliberately: the GTK/libxdo ones only pull
 # dependencies in under `cfg(linux)`, so they cost nothing here.
 #
-# `notify-rust` is the same crate the Linux backend uses; its macOS path pulls
-# in `mac-notification-sys`, whose build script compiles Objective-C, so this
-# section cannot be type-checked from a Linux host (`cargo check --target
-# aarch64-apple-darwin` fails on it) and is proven by the macOS CI job instead.
+# Notifications on macOS go through `osascript` (see `platform/macos/mod.rs`
+# for why notify-rust's mac backend is avoided), so no notification crate
+# here. This section is proven by the macOS CI job; `cargo check --target
+# aarch64-apple-darwin` from a Linux host fails on tray-icon's ObjC build
+# scripts, not on our code.
 [target.'cfg(target_os = "macos")'.dependencies]
-notify-rust = "4.18.0"
 # Only for `CFRunLoop::wake_up` after the status item is created; see
 # `platform/macos/mod.rs`.
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"] }

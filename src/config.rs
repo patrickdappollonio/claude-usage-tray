@@ -50,10 +50,9 @@ pub fn is_critical(threshold: u8) -> bool {
 /// the icon: `MonoDark` means "my desktop is dark", which needs a light icon.
 /// `MonoAuto` asks the XDG desktop portal which one it is (see
 /// the XDG portal watcher in `platform/linux/portal.rs`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconStyle {
     /// The severity-banded color gauge (green/amber/orange/red).
-    #[default]
     Color,
     /// Monochrome, following the desktop's light/dark preference.
     MonoAuto,
@@ -61,6 +60,22 @@ pub enum IconStyle {
     MonoDark,
     /// Monochrome pinned to "my UI is light" — a dark icon.
     MonoLight,
+}
+
+impl Default for IconStyle {
+    /// Per-platform: color on Linux (where the tray convention allows colored
+    /// icons and dim strokes read fine), monochrome-auto on macOS, where menu
+    /// bar icons are conventionally template images — the OS tints the
+    /// silhouette to full contrast for either bar color, whereas the colored
+    /// gauge's dim gray ring disappears against a dark menu bar (observed on a
+    /// real Mac). Color remains selectable in Settings on both.
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            IconStyle::MonoAuto
+        } else {
+            IconStyle::Color
+        }
+    }
 }
 
 impl IconStyle {
