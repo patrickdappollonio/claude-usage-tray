@@ -1,0 +1,257 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare-release:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release_version.outputs.value }}
+      npm_tag: ${{ steps.npm_dist_tag.outputs.value }}
+    steps:
+      - name: Determine release version
+        id: release_version
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            echo "Failed to extract version from ${{ github.event.release.tag_name }}"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Determine npm dist tag
+        id: npm_dist_tag
+        env:
+          VERSION: ${{ steps.release_version.outputs.value }}
+        run: |
+          if [[ "$VERSION" == *-* ]]; then
+            echo "value=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build linux/${{ matrix.goarch }}
+    needs: prepare-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            goarch: amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            goarch: arm64
+
+    env:
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Native runners per architecture, so there is no cross-compilation and
+      # no Docker: the crate is pure Rust with zero C dependencies, and the
+      # musl targets link fully static.
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # cargo-edit's `set-version` updates Cargo.toml *and* Cargo.lock in one
+      # step, which a bare `sed` on Cargo.toml would not do (it would leave the
+      # lockfile stale and make `--locked` builds fail).
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+
+      - name: Set version from tag
+        run: cargo set-version "$VERSION"
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # The release profile sets `strip = true`; this is belt and braces for
+      # any debug sections the linker leaves behind.
+      - name: Strip binary
+        run: strip target/${{ matrix.target }}/release/claude-usage-tray
+
+      - name: Verify the binary is statically linked
+        run: |
+          set -euo pipefail
+          BIN=target/${{ matrix.target }}/release/claude-usage-tray
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qv 'statically linked\|not a dynamic executable'; then
+            echo "Binary is not statically linked:"
+            ldd "$BIN"
+            exit 1
+          fi
+
+      - name: Build tarball
+        run: |
+          set -euo pipefail
+          STAGE="claude-usage-tray_${VERSION}_linux_${{ matrix.goarch }}"
+          mkdir -p "dist/$STAGE"
+          cp target/${{ matrix.target }}/release/claude-usage-tray "dist/$STAGE/"
+          cp LICENSE README.md "dist/$STAGE/"
+          tar czf "dist/${STAGE}.tar.gz" -C "dist/$STAGE" .
+          rm -rf "dist/$STAGE"
+
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          NFPM_VERSION=2.47.0
+          case "${{ matrix.goarch }}" in
+            amd64) NFPM_ARCH=x86_64 ;;
+            arm64) NFPM_ARCH=arm64 ;;
+          esac
+          curl -sSfL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"
+          tar xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          sudo install -m 0755 /tmp/nfpm /usr/local/bin/nfpm
+          nfpm --version
+
+      - name: Build packages
+        env:
+          ARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          # nfpm does not expand env vars inside contents[].src, so stage the
+          # binary at the fixed path nfpm.yaml refers to.
+          mkdir -p dist/pkgroot
+          cp target/${{ matrix.target }}/release/claude-usage-tray dist/pkgroot/
+          BASE="dist/claude-usage-tray_${VERSION}_linux_${{ matrix.goarch }}"
+          nfpm package -f nfpm.yaml -p deb       -t "${BASE}.deb"
+          nfpm package -f nfpm.yaml -p rpm       -t "${BASE}.rpm"
+          nfpm package -f nfpm.yaml -p apk       -t "${BASE}.apk"
+          nfpm package -f nfpm.yaml -p archlinux -t "${BASE}.pkg.tar.zst"
+          ls -la dist
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/claude-usage-tray_*
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.goarch }}
+          path: dist/claude-usage-tray_${{ needs.prepare-release.outputs.version }}_linux_${{ matrix.goarch }}.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  build-npm-package:
+    name: Build npm package
+    needs: [prepare-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Download release archive artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/artifacts
+          merge-multiple: true
+
+      - name: Build npm package
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARTIFACTS_DIR: dist/artifacts
+        run: node npm/scripts/build_npm_package.mjs
+
+      - name: Upload npm tarball to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/npm/claude-usage-tray-npm-*.tgz
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: dist/npm/claude-usage-tray-npm-*.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm package
+    needs: [prepare-release, build-npm-package]
+    if: ${{ needs.build-npm-package.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: "@patrickdappollonio"
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Download npm package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: dist/npm
+
+      - name: Publish to npm
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          NPM_TAG: ${{ needs.prepare-release.outputs.npm_tag }}
+        run: |
+          set -euo pipefail
+          tarball="dist/npm/claude-usage-tray-npm-${VERSION}.tgz"
+          if [[ ! -f "$tarball" ]]; then
+            echo "npm tarball $tarball not found"
+            exit 1
+          fi
+
+          publish_cmd=(npm publish "$tarball" --access public)
+          if [[ -n "$NPM_TAG" ]]; then
+            publish_cmd+=(--tag "$NPM_TAG")
+          fi
+
+          echo "+ ${publish_cmd[*]}"
+          "${publish_cmd[@]}"
+
+  checksums:
+    name: Publish checksums
+    needs: [prepare-release, build, build-npm-package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every release asset and checksum it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist && cd dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'claude-usage-tray_*' --pattern 'claude-usage-tray-npm-*'
+          rm -f checksums.txt
+          sha256sum claude-usage-tray* | sort -k2 > checksums.txt
+          cat checksums.txt
+          gh release upload "$TAG" checksums.txt --repo "$GITHUB_REPOSITORY" --clobber

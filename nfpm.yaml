@@ -1,0 +1,49 @@
+name: claude-usage-tray
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Patrick D'appollonio <patrickdappollonio@gmail.com>
+description: |
+  Linux tray icon showing Claude Code 5-hour and weekly usage.
+  A StatusNotifierItem tray icon that renders your Claude Code
+  subscription usage — the 5-hour session percentage and the 7-day
+  weekly percentage — with reset times, read from a local cache file.
+  Makes no network calls and never reads your credentials.
+vendor: Patrick D'appollonio
+homepage: https://github.com/patrickdappollonio/claude-usage-tray
+license: MIT
+
+contents:
+  # nfpm expands environment variables in the metadata fields above, but NOT in
+  # `contents[].src`, so the binary is staged at a fixed path before packaging
+  # (the release workflow copies it here from the per-target build directory).
+  - src: ./dist/pkgroot/claude-usage-tray
+    dst: /usr/bin/claude-usage-tray
+    file_info:
+      mode: 0755
+
+  - src: ./LICENSE
+    dst: /usr/share/doc/claude-usage-tray/LICENSE
+    file_info:
+      mode: 0644
+    packager: deb
+
+  - src: ./LICENSE
+    dst: /usr/share/licenses/claude-usage-tray/LICENSE
+    file_info:
+      mode: 0644
+    packager: rpm
+
+  - src: ./LICENSE
+    dst: /usr/share/licenses/claude-usage-tray/LICENSE
+    file_info:
+      mode: 0644
+    packager: archlinux
+
+  - src: ./LICENSE
+    dst: /usr/share/licenses/claude-usage-tray/LICENSE
+    file_info:
+      mode: 0644
+    packager: apk

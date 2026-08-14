@@ -49,19 +49,78 @@ usage over the network have gotten accounts auto-banned. This tool never
 does that class of thing, by construction: there is no HTTP client in the
 dependency tree at all.
 
-## Build
+## Installation
+
+Every release ships statically linked binaries for **x86\_64** and **arm64** —
+no runtime dependencies, no glibc version to match. Pick whichever of these
+suits your system; replace `<version>` with the release you want (for example
+`0.1.0`) and `<arch>` with `amd64` or `arm64`.
+
+### Debian, Ubuntu and derivatives
 
 ```sh
-cargo build --release
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.deb
+sudo dpkg -i claude-usage-tray_<version>_linux_<arch>.deb
 ```
 
-The binary is at `target/release/claude-usage-tray`.
+### Fedora, RHEL, openSUSE
+
+```sh
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.rpm
+sudo rpm -i claude-usage-tray_<version>_linux_<arch>.rpm
+# or, to let your package manager resolve it:
+sudo dnf install ./claude-usage-tray_<version>_linux_<arch>.rpm
+```
+
+### Arch Linux
+
+```sh
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.pkg.tar.zst
+sudo pacman -U claude-usage-tray_<version>_linux_<arch>.pkg.tar.zst
+```
+
+### Alpine
+
+```sh
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.apk
+sudo apk add --allow-untrusted claude-usage-tray_<version>_linux_<arch>.apk
+```
+
+### npm
+
+```sh
+npm install -g @patrickdappollonio/claude-usage-tray
+```
+
+Or run it without installing, with `npx @patrickdappollonio/claude-usage-tray`.
+The npm package bundles the same prebuilt binaries and is Linux-only.
+
+### Homebrew / Linuxbrew
+
+Once releases are published, the tap provides it:
+
+```sh
+brew install patrickdappollonio/tap/claude-usage-tray
+```
+
+### Plain tarball
+
+If none of the above fit, grab the archive and drop the binary somewhere on
+your `PATH`:
+
+```sh
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_linux_<arch>.tar.gz
+tar xzf claude-usage-tray_<version>_linux_<arch>.tar.gz
+sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
+```
+
+Each release also carries a `checksums.txt` with SHA-256 sums for every asset.
 
 ## Run
 
 ```sh
-./target/release/claude-usage-tray            # run the tray
-./target/release/claude-usage-tray hook install
+claude-usage-tray               # run the tray
+claude-usage-tray hook install  # wire up the Claude Code statusline
 ```
 
 The binary has three modes, dispatched from its first argument:
@@ -352,4 +411,4 @@ Effective refresh interval, highest priority first:
 
 ## License
 
-No license has been chosen yet for this project.
+MIT — see [LICENSE](LICENSE).

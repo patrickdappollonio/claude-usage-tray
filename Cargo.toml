@@ -2,6 +2,17 @@
 name = "claude-usage-tray"
 version = "0.1.0"
 edition = "2024"
+description = "Linux tray icon showing Claude Code 5-hour and weekly usage"
+authors = ["Patrick D'appollonio"]
+license = "MIT"
+repository = "https://github.com/patrickdappollonio/claude-usage-tray"
+homepage = "https://github.com/patrickdappollonio/claude-usage-tray"
+readme = "README.md"
+keywords = ["tray", "statusnotifieritem", "claude", "usage", "linux"]
+categories = ["command-line-utilities", "gui", "visualization"]
+
+[profile.release]
+strip = true
 
 [dependencies]
 dirs = "6.0.0"
