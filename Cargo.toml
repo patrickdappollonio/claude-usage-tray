@@ -2,23 +2,28 @@
 name = "claude-usage-tray"
 version = "0.1.0"
 edition = "2024"
-description = "Linux tray icon showing Claude Code 5-hour and weekly usage"
+description = "Tray icon showing Claude Code 5-hour and weekly usage, for Linux and macOS"
 authors = ["Patrick D'appollonio"]
 license = "MIT"
 repository = "https://github.com/patrickdappollonio/claude-usage-tray"
 homepage = "https://github.com/patrickdappollonio/claude-usage-tray"
 readme = "README.md"
-keywords = ["tray", "statusnotifieritem", "claude", "usage", "linux"]
+keywords = ["tray", "statusnotifieritem", "claude", "usage", "menubar"]
 categories = ["command-line-utilities", "gui", "visualization"]
 
 [profile.release]
 strip = true
 
+# Portable dependencies: everything the platform-independent core needs (see
+# `src/platform/mod.rs` for where the boundary runs).
 [dependencies]
 dirs = "6.0.0"
 jiff = "0.2.35"
-ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
-notify-rust = "4.18.0"
+# Only for `flock` and `kill` in `src/instance.rs` (the single-instance lock and
+# `restart`); std has neither. Both supported platforms are Unix, and libc is
+# already in the dependency tree several times over, so this adds nothing to the
+# build.
+libc = "0.2.189"
 serde_json = "1.0.151"
 tiny-skia = "0.12.0"
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
@@ -27,6 +32,42 @@ toml = { version = "1.1.4", default-features = false, features = ["parse", "serd
 # binaries stay statically linked; no default features, so no cookies, no
 # proxy stack, no JSON layer.
 ureq = { version = "3.4.0", default-features = false, features = ["rustls", "gzip"] }
+
+# The Linux backend (`src/platform/linux/`): StatusNotifierItem tray, XDG
+# portal, freedesktop notifications.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+notify-rust = "4.18.0"
 # Same zbus ksni already brings in (its `async-io` feature enables that
 # backend); used only for the desktop portal's color-scheme setting.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+# The macOS backend (`src/platform/macos/`): an `NSStatusItem` in the menu
+# bar, its `NSMenu`, and Notification Center toasts.
+#
+# `tray-icon` owns the status item and re-exports `muda` (as
+# `tray_icon::menu`) for the menu; both insist on the main thread with a
+# running event loop, which is what `tao` is here for — it is the event loop
+# the crate's own examples use, and it is also how the poll-loop thread
+# marshals work back onto the main thread (`EventLoopProxy::send_event`).
+# Default features are left on deliberately: the GTK/libxdo ones only pull
+# dependencies in under `cfg(linux)`, so they cost nothing here.
+#
+# This section is proven by the macOS CI job; `cargo check --target
+# aarch64-apple-darwin` from a Linux host fails on tray-icon's ObjC build
+# scripts, not on our code.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Notifications, but only the `preview-macos-un` backend: that feature swaps
+# notify-rust's default macOS path (mac-notification-sys, which borrows another
+# app's bundle identity and shows nothing useful for an unbundled binary) for
+# `mac-usernotifications`, a real UNUserNotificationCenter client. It brings
+# `check_bundle`, which is how `platform/macos/mod.rs` decides whether this
+# process has an app identity at all before touching the framework. Default
+# features are off because notify-rust's default (`z`) is the zbus/XDG stack,
+# which is Linux-only anyway.
+notify-rust = { version = "4.18.0", default-features = false, features = ["preview-macos-un"] }
+# Only for `CFRunLoop::wake_up` after the status item is created; see
+# `platform/macos/mod.rs`.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"] }
+tao = "0.36.0"
+tray-icon = "0.24.2"

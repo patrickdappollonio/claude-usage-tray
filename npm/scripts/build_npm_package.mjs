@@ -29,10 +29,12 @@ const tarballPath = path.join(npmDistDir, tarballName);
 const binaryName = "claude-usage-tray";
 
 // Archive names must match the tarballs produced by the release build matrix:
-// claude-usage-tray_<version>_linux_<amd64|arm64>.tar.gz
+// claude-usage-tray_<version>_<linux|darwin>_<amd64|arm64>.tar.gz
 const TARGETS = [
-  { key: "linux-x64", archive: `claude-usage-tray_${releaseVersion}_linux_amd64.tar.gz` },
-  { key: "linux-arm64", archive: `claude-usage-tray_${releaseVersion}_linux_arm64.tar.gz` }
+  { key: "darwin-arm64", archive: `claude-usage-tray_${releaseVersion}_darwin_arm64.tar.gz` },
+  { key: "darwin-x64", archive: `claude-usage-tray_${releaseVersion}_darwin_amd64.tar.gz` },
+  { key: "linux-arm64", archive: `claude-usage-tray_${releaseVersion}_linux_arm64.tar.gz` },
+  { key: "linux-x64", archive: `claude-usage-tray_${releaseVersion}_linux_amd64.tar.gz` }
 ];
 
 async function main() {

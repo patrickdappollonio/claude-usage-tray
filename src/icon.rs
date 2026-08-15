@@ -1,5 +1,5 @@
-//! Renders a `UsageSnapshot` into the ARGB32 pixmaps `ksni` expects for the
-//! tray icon: a dim background ring, a session-percent arc gauge swept
+//! Renders a `UsageSnapshot` into ARGB32 pixmaps for the tray icon: a dim
+//! background ring, a session-percent arc gauge swept
 //! clockwise from the top in a color that bands with severity, and a small
 //! inner dot showing the weekly percent in the same banding. See
 //! `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md` for the
@@ -20,8 +20,41 @@
 use crate::source::{SnapshotState, UsageSnapshot};
 use tiny_skia::{LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-/// Icon sizes `ksni` is given; StatusNotifierItem hosts pick whichever fits.
+/// Icon sizes rendered; the tray host picks whichever fits.
 const SIZES: [u32; 3] = [22, 24, 48];
+
+/// One rendered icon, in the layout every tray backend can start from: ARGB32
+/// in network byte order (the StatusNotifierItem pixmap format, which `ksni`
+/// takes as-is).
+///
+/// Platform-neutral on purpose — this is what keeps the renderer, and its
+/// pixel-level tests, out of the platform layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IconImage {
+    pub width: i32,
+    pub height: i32,
+    pub data: Vec<u8>,
+}
+
+impl IconImage {
+    /// The same pixels as straight (non-premultiplied) RGBA, which is the
+    /// layout every non-freedesktop tray API asks for —
+    /// `tray_icon::Icon::from_rgba` on macOS, in particular.
+    ///
+    /// Only the byte order changes: [`data`](IconImage::data) is already
+    /// un-premultiplied (see `premultiplied_rgba_to_argb_be`), so this rotates
+    /// `A R G B` into `R G B A` and nothing else. Kept here rather than in the
+    /// backend so the pixel layout — the one thing both trays have to agree on
+    /// — stays testable without a desktop.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.data.len());
+        for px in self.data.chunks_exact(4) {
+            out.extend_from_slice(&[px[1], px[2], px[3], px[0]]);
+        }
+        out
+    }
+}
 
 /// Dim neutral gray used for the background ring and the `Missing` state.
 const GRAY: (u8, u8, u8) = (128, 128, 128);
@@ -40,7 +73,7 @@ const MONO_ON_LIGHT: (u8, u8, u8) = (51, 51, 51);
 
 /// How the icon is painted. Resolved from the user's `icon_style` setting
 /// (plus, for `mono-auto`, the desktop portal's color-scheme value) before
-/// every render — see `crate::tray::resolve_appearance`.
+/// every render — see `crate::ui::resolve_appearance`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IconAppearance {
     /// Severity-banded colors (green/yellow/orange/red).
@@ -105,14 +138,14 @@ pub fn band_color(percent: f64) -> (u8, u8, u8) {
 
 /// Renders the 22/24/48 px ARGB32 (network byte order) icons for `snapshot`
 /// in the given appearance.
-pub fn render_icons(snapshot: &UsageSnapshot, appearance: IconAppearance) -> Vec<ksni::Icon> {
+pub fn render_icons(snapshot: &UsageSnapshot, appearance: IconAppearance) -> Vec<IconImage> {
     SIZES
         .iter()
         .map(|&size| render_one(size, snapshot, appearance))
         .collect()
 }
 
-fn render_one(size: u32, snapshot: &UsageSnapshot, appearance: IconAppearance) -> ksni::Icon {
+fn render_one(size: u32, snapshot: &UsageSnapshot, appearance: IconAppearance) -> IconImage {
     // Fixed, known-valid dimensions (22/24/48, always > 0) — Pixmap::new only
     // returns None for zero-sized or overflowing dimensions, neither of which
     // can happen here.
@@ -146,7 +179,7 @@ fn render_one(size: u32, snapshot: &UsageSnapshot, appearance: IconAppearance) -
         }
     }
 
-    ksni::Icon {
+    IconImage {
         width: size as i32,
         height: size as i32,
         data: premultiplied_rgba_to_argb_be(pixmap.data()),
@@ -387,7 +420,7 @@ fn arc_path(cx: f32, cy: f32, radius: f32, start_deg: f32, sweep_deg: f32) -> Op
 }
 
 /// Converts tiny-skia's premultiplied RGBA8 buffer into the straight-alpha
-/// ARGB32-big-endian byte layout `ksni::Icon` requires (network byte order,
+/// ARGB32-big-endian byte layout `IconImage` requires (network byte order,
 /// i.e. alpha byte first).
 fn premultiplied_rgba_to_argb_be(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
@@ -571,7 +604,7 @@ mod tests {
 
     /// Visible (alpha != 0) pixels of an icon as `(r, g, b)` triples, with the
     /// premultiplication already undone by the ARGB conversion.
-    fn visible_pixels(icon: &ksni::Icon) -> Vec<(u8, u8, u8)> {
+    fn visible_pixels(icon: &IconImage) -> Vec<(u8, u8, u8)> {
         icon.data
             .chunks_exact(4)
             .filter(|px| px[0] != 0)
@@ -689,7 +722,7 @@ mod tests {
     /// Pixels of `icon` at `distance >= min_r` from the center, i.e. the ring
     /// and arc annulus, with the small central area the weekly dot / question
     /// mark occupies excluded.
-    fn outside_center(icon: &ksni::Icon, min_r: f64) -> Vec<[u8; 4]> {
+    fn outside_center(icon: &IconImage, min_r: f64) -> Vec<[u8; 4]> {
         let size = icon.width as usize;
         let c = size as f64 / 2.0;
         let mut out = Vec::new();
@@ -714,7 +747,7 @@ mod tests {
 
     /// Visible pixels strictly inside `max_r` of the center — the region the
     /// center mark has to itself.
-    fn center_pixels(icon: &ksni::Icon, max_r: f64) -> Vec<(u8, u8, u8)> {
+    fn center_pixels(icon: &IconImage, max_r: f64) -> Vec<(u8, u8, u8)> {
         let size = icon.width as usize;
         let c = size as f64 / 2.0;
         let mut out = Vec::new();
@@ -780,7 +813,7 @@ mod tests {
             let fresh = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
             let stale = snapshot(SnapshotState::Stale, Some(70.0), Some(30.0));
             let max_alpha =
-                |icon: &ksni::Icon| icon.data.chunks_exact(4).map(|px| px[0]).max().unwrap_or(0);
+                |icon: &IconImage| icon.data.chunks_exact(4).map(|px| px[0]).max().unwrap_or(0);
             for (f, s) in render_icons(&fresh, appearance)
                 .iter()
                 .zip(render_icons(&stale, appearance).iter())
@@ -930,5 +963,52 @@ mod tests {
             );
         }
     }
-}
 
+    // ---- the RGBA view --------------------------------------------------
+    //
+    // The macOS backend feeds `to_rgba` straight into
+    // `tray_icon::Icon::from_rgba`, which rejects anything whose byte count
+    // does not match the dimensions — and would silently draw the wrong
+    // colors if the channels were rotated the wrong way.
+
+    #[test]
+    fn to_rgba_rotates_argb_into_rgba() {
+        let icon = IconImage {
+            width: 1,
+            height: 2,
+            data: vec![0xAA, 0x11, 0x22, 0x33, 0x00, 0x44, 0x55, 0x66],
+        };
+        assert_eq!(
+            icon.to_rgba(),
+            vec![0x11, 0x22, 0x33, 0xAA, 0x44, 0x55, 0x66, 0x00]
+        );
+    }
+
+    #[test]
+    fn to_rgba_keeps_one_pixel_per_four_bytes() {
+        for icon in render_icons(
+            &snapshot(SnapshotState::Fresh, Some(42.0), Some(17.0)),
+            IconAppearance::Color,
+        ) {
+            let rgba = icon.to_rgba();
+            assert_eq!(rgba.len(), (icon.width * icon.height * 4) as usize);
+            assert_eq!(rgba.len(), icon.data.len());
+        }
+    }
+
+    /// The alpha channel is what macOS tints a template image through, so a
+    /// monochrome render must still be transparent everywhere it does not
+    /// draw, and opaque where it does.
+    #[test]
+    fn to_rgba_preserves_transparency_for_template_icons() {
+        let icons = render_icons(
+            &snapshot(SnapshotState::Fresh, Some(50.0), Some(50.0)),
+            IconAppearance::Mono { dark_ui: false },
+        );
+        let icon = &icons[2];
+        let rgba = icon.to_rgba();
+        let alphas: Vec<u8> = rgba.chunks_exact(4).map(|px| px[3]).collect();
+        assert!(alphas.contains(&0), "nothing is transparent");
+        assert!(alphas.iter().any(|&a| a > 200), "nothing is drawn");
+    }
+}

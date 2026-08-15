@@ -725,6 +725,60 @@ mod tests {
         );
     }
 
+    /// The macOS app bundle puts the binary at
+    /// `/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray`,
+    /// which has a space in it. `settings.json` stores one command *string*
+    /// that Claude Code hands to a shell, so an unquoted path there would run
+    /// `/Applications/Claude` with `Usage` and `Tray.app/...` as arguments —
+    /// the hook would look installed and silently never write the cache.
+    #[test]
+    fn build_command_quotes_a_bundled_macos_exe_path() {
+        let exe = "/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray";
+        let command = build_command(exe, Some("~/.claude/line.sh"));
+        assert_eq!(
+            command,
+            concat!(
+                "'/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray'",
+                " statusline --exec '~/.claude/line.sh'"
+            )
+        );
+        // And it is recognized as ours again, with the path intact, so a
+        // re-install refreshes rather than wrapping itself.
+        let parsed = parse_our_command(&command).expect("ours");
+        assert_eq!(parsed.exe, exe);
+        assert_eq!(parsed.original.as_deref(), Some("~/.claude/line.sh"));
+    }
+
+    #[test]
+    fn install_round_trips_a_bundled_macos_exe_path() {
+        let temp = TempDir::new("hook-install-bundled-exe");
+        let exe =
+            PathBuf::from("/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray");
+        write_settings_file(
+            temp.path(),
+            r#"{"statusLine":{"type":"command","command":"~/.claude/line.sh"}}"#,
+        );
+
+        let first = install_in(temp.path(), &exe).expect("install");
+        assert!(!first.refreshed);
+        let second = install_in(temp.path(), &exe).expect("re-install");
+        assert!(second.refreshed, "the spacey path must be recognized as ours");
+        assert_eq!(first.command, second.command);
+        assert_eq!(second.wrapped.as_deref(), Some("~/.claude/line.sh"));
+
+        let status = status_in(temp.path(), jiff::Timestamp::now());
+        assert_eq!(status.recorded_exe.as_deref(), exe.to_str());
+        // Same binary, so no "the recorded binary differs" nag.
+        assert!(
+            !status
+                .render(Some(&exe), jiff::Timestamp::now())
+                .contains("differs from the running")
+        );
+
+        uninstall_in(temp.path()).expect("uninstall");
+        assert_eq!(settings_json(temp.path())["statusLine"]["command"], "~/.claude/line.sh");
+    }
+
     #[test]
     fn build_command_escapes_single_quotes_in_the_original() {
         let command = build_command("/opt/tray", Some("echo 'hi there'"));

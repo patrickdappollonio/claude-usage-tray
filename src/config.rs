@@ -49,11 +49,10 @@ pub fn is_critical(threshold: u8) -> bool {
 /// The two pinned monochrome options are named for *the user's UI*, not for
 /// the icon: `MonoDark` means "my desktop is dark", which needs a light icon.
 /// `MonoAuto` asks the XDG desktop portal which one it is (see
-/// [`crate::portal`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// the XDG portal watcher in `platform/linux/portal.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconStyle {
     /// The severity-banded color gauge (green/amber/orange/red).
-    #[default]
     Color,
     /// Monochrome, following the desktop's light/dark preference.
     MonoAuto,
@@ -61,6 +60,22 @@ pub enum IconStyle {
     MonoDark,
     /// Monochrome pinned to "my UI is light" — a dark icon.
     MonoLight,
+}
+
+impl Default for IconStyle {
+    /// Per-platform: color on Linux (where the tray convention allows colored
+    /// icons and dim strokes read fine), monochrome-auto on macOS, where menu
+    /// bar icons are conventionally template images — the OS tints the
+    /// silhouette to full contrast for either bar color, whereas the colored
+    /// gauge's dim gray ring disappears against a dark menu bar (observed on a
+    /// real Mac). Color remains selectable in Settings on both.
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            IconStyle::MonoAuto
+        } else {
+            IconStyle::Color
+        }
+    }
 }
 
 impl IconStyle {
@@ -387,7 +402,7 @@ mod tests {
                 launch_at_login: false,
                 notify_thresholds: vec![50, 75, 90, 99, 100],
                 notify_on_reset: true,
-                icon_style: IconStyle::Color,
+                icon_style: IconStyle::default(),
                 check_updates: true,
             }
         );
@@ -398,7 +413,7 @@ mod tests {
         let config = parse_config(
             "refresh_secs = 30\nlaunch_at_login = true\n\
              notify_thresholds = [75, 100]\nnotify_on_reset = false\n\
-             check_updates = false\n",
+             icon_style = \"color\"\ncheck_updates = false\n",
         );
         assert_eq!(
             config,
@@ -537,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_missing_or_wrong_typed_icon_style_is_color() {
+    fn unknown_missing_or_wrong_typed_icon_style_is_the_platform_default() {
         for body in [
             "",
             "icon_style = \"chartreuse\"\n",
@@ -548,7 +563,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_config(body).icon_style,
-                IconStyle::Color,
+                IconStyle::default(),
                 "body: {body}"
             );
         }
