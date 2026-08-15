@@ -6,6 +6,8 @@
 
 `claude-usage-tray` is a tiny application that lives in your menu bar on macOS or your system tray on Linux, and it reports the status of your Claude quotas and sessions. The numbers come straight from the Claude CLI itself, so there are no cookies to copy and no awkward browser hacks to keep alive. It installs a small hook on the Claude CLI, and from then on, whenever you use Claude normally, fresh numbers flow to the tray and keep it current. Other tools resort to tricks like impersonating the Claude CLI, which can get an account banned, since [Anthropic disallows the practice](https://www.theregister.com/2026/02/20/anthropic_clarifies_ban_third_party_claude_access/).
 
+**[Jump to installation &rarr;](#install)**
+
 The app can also notify you at the moments that matter: when you cross usage thresholds you choose, and when your quotas reset, both the 5-hour window and the weekly one. All of it is configurable from the tray menu itself.
 
 There is no window and no dashboard to keep open. Just a small gauge that changes color as you get closer to the limit, and a menu when you want the details. Green means you have room, red means wrap it up.
