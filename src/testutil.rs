@@ -32,6 +32,29 @@ pub fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
 }
 
+/// Sets the modification time of `path` to `secs` since the epoch. Used by the
+/// binary-swap tests to move an mtime deliberately instead of hoping the clock
+/// ticks between two writes.
+pub fn set_mtime(path: &Path, secs: i64) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path without NUL");
+    let times = [
+        libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        },
+        libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        },
+    ];
+    // SAFETY: a NUL-terminated path and a two-element `timeval` array, which is
+    // exactly what `utimes` reads.
+    let rc = unsafe { libc::utimes(raw.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "utimes failed: {}", std::io::Error::last_os_error());
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

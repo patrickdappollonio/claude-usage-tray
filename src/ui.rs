@@ -22,6 +22,7 @@ use crate::menu::{MenuAction, MenuRow, RadioGroup, RadioOption};
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
 use crate::update::Update;
 use jiff::{Timestamp, tz::TimeZone};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -66,6 +67,13 @@ pub enum Wake {
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
+
+/// Label of the menu row offered once the binary on disk has been replaced.
+pub const RESTART_TO_UPDATE_LABEL: &str = "⟳ Restart to update";
+
+/// Body of the toast shown the moment that replacement is noticed. Said once,
+/// because the menu row keeps the offer standing afterwards.
+pub const RESTART_TO_UPDATE_TOAST: &str = "Update installed — restart to apply";
 
 /// Furthest a reset time may be from `now` before `humanize_reset` stops
 /// using the weekday form: past this many days the `%a` abbreviation reads
@@ -664,6 +672,40 @@ impl UpdateHandle {
     }
 }
 
+/// Shared slot holding the path of the *new* binary once the one this process
+/// was started from has been replaced on disk: written by the poll loop (see
+/// [`crate::binary`]), read by the menu on every build and by the click
+/// handler that acts on it.
+///
+/// Same shape and the same reasoning as [`UpdateHandle`], one step further
+/// along: that one means "there is a newer release to go and get", this one
+/// means "the newer release is already installed and only a restart is
+/// missing".
+#[derive(Clone, Default)]
+pub struct RestartHandle(Arc<Mutex<Option<PathBuf>>>);
+
+impl RestartHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The binary to restart into, if one has been installed under us.
+    pub fn get(&self) -> Option<PathBuf> {
+        match self.0.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Records the swapped-in binary's path.
+    pub fn set(&self, path: Option<PathBuf>) {
+        match self.0.lock() {
+            Ok(mut slot) => *slot = path,
+            Err(poisoned) => *poisoned.into_inner() = path,
+        }
+    }
+}
+
 /// Resolves the configured style plus the desktop's reported scheme into the
 /// appearance the renderer takes.
 ///
@@ -760,6 +802,8 @@ pub struct Settings {
     check_updates: Arc<AtomicBool>,
     /// The release the update checker found, if any.
     update: UpdateHandle,
+    /// The replacement binary, once one has been installed under this process.
+    restart: RestartHandle,
     /// True when `CLAUDE_TRAY_POLL_SECS` is set to a usable value. The radio
     /// group then still persists the user's choice, but the effective interval
     /// stays the environment's.
@@ -781,6 +825,7 @@ impl Settings {
             appearance,
             check_updates,
             update: UpdateHandle::new(),
+            restart: RestartHandle::new(),
             env_locked: env_secs.is_some(),
         }
     }
@@ -811,6 +856,13 @@ impl Settings {
     /// the same slot through the tray's own copy.
     pub fn update_handle(&self) -> UpdateHandle {
         self.update.clone()
+    }
+
+    /// Handle for the poll loop, which watches the binary on disk and writes
+    /// the replacement's path here — the menu reads the same slot through the
+    /// tray's own copy.
+    pub fn restart_handle(&self) -> RestartHandle {
+        self.restart.clone()
     }
 }
 
@@ -1010,6 +1062,31 @@ impl TrayCore {
             MenuAction::ToggleThreshold(threshold) => self.toggle_threshold(*threshold),
             MenuAction::ToggleNotifyOnReset => self.toggle_notify_on_reset(),
             MenuAction::ToggleCheckUpdates => self.toggle_check_updates(),
+            MenuAction::RestartToUpdate => self.restart_to_update(),
+        }
+    }
+
+    /// The `Restart to update` row: start the *new* binary with the `restart`
+    /// subcommand and carry on.
+    ///
+    /// There is deliberately no in-process shutdown path here. The child runs
+    /// exactly what a user typing `claude-usage-tray restart` would run: it
+    /// finds this process through the lock file's PID, signals it, waits for
+    /// the lock to come free, and starts the replacement. Doing it that way
+    /// means the menu row and the command line cannot drift apart, and the
+    /// old process needs no special handling of its own — it just gets a
+    /// `SIGTERM` like any other.
+    fn restart_to_update(&self) {
+        let Some(exe) = self.settings.restart.get() else {
+            // The row is only drawn when the slot is full; a click that races
+            // it losing its value has nothing to do.
+            return;
+        };
+        if let Err(err) = crate::instance::spawn_detached(&exe, crate::RESTART_COMMAND) {
+            // Nothing louder is possible or wanted: this may well be running
+            // with stderr on /dev/null, and a failed restart leaves a
+            // perfectly working tray behind.
+            eprintln!("claude-usage-tray: could not restart into the new binary: {err}");
         }
     }
 
@@ -1040,7 +1117,16 @@ impl TrayCore {
             rows.push(MenuRow::action("Install hook", MenuAction::InstallHook));
         }
         rows.push(MenuRow::Separator);
-        if let Some(update) = self.settings.update.get() {
+        if self.settings.restart.get().is_some() {
+            // Deliberately *instead of* the update row and not alongside it: a
+            // new version already sitting on disk outranks a link to go and
+            // download one, and two update rows in a five-row menu would be a
+            // puzzle rather than an offer.
+            rows.push(MenuRow::action(
+                RESTART_TO_UPDATE_LABEL,
+                MenuAction::RestartToUpdate,
+            ));
+        } else if let Some(update) = self.settings.update.get() {
             // Enabled, unlike the three info rows above it: this one does
             // something.
             rows.push(MenuRow::action(
@@ -2345,6 +2431,65 @@ mod tests {
             rows[4],
             MenuRow::action(update.label(), MenuAction::OpenUrl(update.url.clone()))
         );
+    }
+
+    #[test]
+    fn the_restart_row_appears_once_the_binary_on_disk_is_replaced() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        assert!(
+            !labels(&core.menu_with(ts(BASE), all_available()))
+                .contains(&RESTART_TO_UPDATE_LABEL.to_string()),
+            "nothing to restart into before an upgrade lands"
+        );
+
+        core.settings
+            .restart
+            .set(Some(PathBuf::from("/usr/local/bin/claude-usage-tray")));
+        let rows = core.menu_with(ts(BASE), all_available());
+        // The same slot the update row occupies: after the separator, above
+        // `Settings`, and clickable.
+        assert_eq!(
+            rows[4],
+            MenuRow::action(RESTART_TO_UPDATE_LABEL, MenuAction::RestartToUpdate)
+        );
+    }
+
+    /// A binary already sitting on disk outranks a link to go and download
+    /// one. Showing both would ask the user to choose between "update" and
+    /// "update", where only one of them finishes the job.
+    #[test]
+    fn the_restart_row_replaces_the_update_row_when_both_apply() {
+        let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        let update = Update {
+            version: "0.2.0".into(),
+            url: "https://example.test/releases/tag/v0.2.0".into(),
+        };
+        core.settings.update.set(Some(update.clone()));
+        core.settings
+            .restart
+            .set(Some(PathBuf::from("/usr/local/bin/claude-usage-tray")));
+
+        let rows = core.menu_with(ts(BASE), all_available());
+        let labels = labels(&rows);
+        assert!(labels.contains(&RESTART_TO_UPDATE_LABEL.to_string()));
+        assert!(
+            !labels.iter().any(|label| label.contains("Update available")),
+            "both rows at once: {labels:?}"
+        );
+        assert_eq!(
+            rows[4],
+            MenuRow::action(RESTART_TO_UPDATE_LABEL, MenuAction::RestartToUpdate)
+        );
+    }
+
+    /// Clicking with an empty slot must be a no-op rather than a panic or a
+    /// spawn of something unnamed. (The successful path spawns a process, so
+    /// it is verified live rather than here.)
+    #[test]
+    fn restarting_with_nothing_recorded_does_nothing() {
+        let (mut core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        core.activate(&MenuAction::RestartToUpdate);
+        assert!(core.settings.restart.get().is_none());
     }
 
     #[test]

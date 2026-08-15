@@ -26,6 +26,7 @@
 //! summary), "Quit", "Install hook", and interval changes take effect
 //! immediately instead of on the next tick.
 
+mod binary;
 mod config;
 mod hook;
 mod icon;
@@ -98,6 +99,23 @@ fn refresh_toast(body: &str) -> (Toast, Channel) {
     )
 }
 
+/// Builds the toast for "the binary underneath you was upgraded". Normal
+/// urgency and not transient: it is worth finding again in notification
+/// history, since the thing it asks for (a restart) is not something anyone
+/// does mid-sentence. Ephemeral, so it neither replaces nor is replaced by a
+/// threshold alert.
+fn binary_swapped_toast() -> (Toast, Channel) {
+    (
+        Toast {
+            summary: "Claude usage tray".to_string(),
+            body: ui::RESTART_TO_UPDATE_TOAST.to_string(),
+            urgency: Urgency::Normal,
+            transient: false,
+        },
+        Channel::Ephemeral,
+    )
+}
+
 /// Emits a threshold notification. Failures (no notification daemon, D-Bus
 /// down) are ignored by the backend: a missing notification must never take
 /// the tray with it.
@@ -118,6 +136,12 @@ fn notify_refresh(body: &str) {
     platform::notify(&toast, channel);
 }
 
+/// Emits the "a new binary was installed under you" notification.
+fn notify_binary_swapped() {
+    let (toast, channel) = binary_swapped_toast();
+    platform::notify(&toast, channel);
+}
+
 
 const USAGE: &str = "\
 claude-usage-tray — Claude Code usage in the system tray
@@ -133,6 +157,11 @@ claude-usage-tray — Claude Code usage in the system tray
   claude-usage-tray hook uninstall       undo that
   claude-usage-tray hook status          report what is currently wired up
 ";
+
+/// The subcommand that replaces a running instance. Named here because the
+/// `Restart to update` menu row spawns the new binary with exactly this word,
+/// rather than reimplementing what it does.
+pub(crate) const RESTART_COMMAND: &str = "restart";
 
 /// The documented flag that keeps the tray attached to the terminal.
 const FOREGROUND_FLAG: &str = "--foreground";
@@ -178,7 +207,7 @@ fn parse_mode(args: &[String]) -> Mode {
         None => Mode::Detach,
         Some(flag) if flag == FOREGROUND_FLAG && args.len() == 1 => Mode::Foreground,
         Some(flag) if flag == RUN_FOREGROUND_FLAG && args.len() == 1 => Mode::Foreground,
-        Some("restart") if args.len() == 1 => Mode::Restart,
+        Some(command) if command == RESTART_COMMAND && args.len() == 1 => Mode::Restart,
         Some("statusline") => Mode::Statusline,
         Some("hook") => Mode::Hook,
         _ => Mode::Usage,
@@ -236,8 +265,6 @@ fn detach() -> i32 {
 /// Spawns the detached child and reports it. Split from [`detach`] so
 /// `restart` can reuse it after clearing the way.
 fn spawn_background() -> i32 {
-    use std::os::unix::process::CommandExt;
-
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
@@ -245,16 +272,9 @@ fn spawn_background() -> i32 {
             return 1;
         }
     };
-    let spawned = std::process::Command::new(exe)
-        .arg(RUN_FOREGROUND_FLAG)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        // Its own process group, so closing the terminal (or a Ctrl-C meant
-        // for whatever the user runs next) does not take the tray with it.
-        .process_group(0)
-        .spawn();
-    match spawned {
+    // Detached in its own process group, so closing the terminal (or a Ctrl-C
+    // meant for whatever the user runs next) does not take the tray with it.
+    match instance::spawn_detached(&exe, RUN_FOREGROUND_FLAG) {
         Ok(_) => {
             println!("{BACKGROUNDED}");
             0
@@ -504,7 +524,15 @@ fn run_tray() {
     let appearance = settings.appearance_handle();
     let check_updates = settings.check_updates_handle();
     let updates = settings.update_handle();
+    let restart = settings.restart_handle();
     let tz = TimeZone::system();
+
+    // The path of the binary this process was started from, watched for the
+    // moment a package upgrade replaces it. Recorded here, before anything
+    // else can chdir or otherwise disturb the answer. If the path cannot be
+    // determined at all there is nothing to watch and nothing to restart into,
+    // so the feature simply stays quiet.
+    let mut binary_watch = std::env::current_exe().ok().map(binary::BinaryWatch::new);
 
     let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
 
@@ -543,6 +571,8 @@ fn run_tray() {
             &interval,
             &notify_prefs,
             &tz,
+            binary_watch.as_mut(),
+            &restart,
         );
     });
     if let Err(err) = started {
@@ -567,6 +597,8 @@ fn poll_loop(
     interval: &std::sync::atomic::AtomicU64,
     notify_prefs: &ui::NotifyHandle,
     tz: &TimeZone,
+    mut binary_watch: Option<&mut binary::BinaryWatch>,
+    restart: &ui::RestartHandle,
 ) {
     // The first cycle's reading becomes the notifier's baseline rather than a
     // volley of alerts for crossings that happened before this process
@@ -580,6 +612,19 @@ fn poll_loop(
         notifier.set_enabled(&prefs.thresholds);
         if let Some(alert) = notifier.evaluate(snapshot.session.as_ref()) {
             notify(&alert);
+        }
+
+        // Has the program on disk been replaced since this process started? One
+        // `stat` per cycle, and it fires exactly once: the toast says it, and
+        // the menu row keeps offering it from then on.
+        if let Some(watch) = binary_watch.as_deref_mut()
+            && watch.check()
+        {
+            restart.set(Some(watch.path().to_path_buf()));
+            notify_binary_swapped();
+            // The row lives in shared state that `menu` reads, so a repaint is
+            // all it takes to make it appear without waiting for a click.
+            handle.refresh();
         }
 
         let now = Timestamp::now();
@@ -800,6 +845,21 @@ mod notify_channel_routing {
         };
         let (_, channel) = reset_toast(&alert);
         assert_eq!(channel, Channel::Ephemeral);
+    }
+
+    /// The upgrade notice must not land on the threshold lane: it would
+    /// replace (or be replaced by) a live usage warning, which is the one
+    /// thing the user cannot afford to lose.
+    #[test]
+    fn the_binary_swap_toast_routes_to_the_ephemeral_channel_and_persists() {
+        let (toast, channel) = binary_swapped_toast();
+        assert_eq!(channel, Channel::Ephemeral);
+        assert_eq!(toast.urgency, Urgency::Normal);
+        assert!(
+            !toast.transient,
+            "a restart prompt is worth finding again in history"
+        );
+        assert_eq!(toast.body, "Update installed — restart to apply");
     }
 
     #[test]

@@ -60,6 +60,25 @@ fn write_pid(mut file: &File, pid: u32) -> io::Result<()> {
     file.flush()
 }
 
+/// Starts `exe arg` as a detached child: standard streams on `/dev/null` and a
+/// process group of its own, so it outlives the terminal (or the tray) that
+/// started it.
+///
+/// The single place that spelling lives, because two callers need exactly the
+/// same one: the parent that backgrounds the tray, and the `Restart to update`
+/// menu row that starts the newly installed binary's `restart`.
+pub fn spawn_detached(exe: &Path, arg: &str) -> io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+
+    std::process::Command::new(exe)
+        .arg(arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+}
+
 /// Parses the contents of a lock file into a PID.
 ///
 /// Anything that is not a plain positive integer is rejected rather than

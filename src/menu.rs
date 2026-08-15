@@ -25,6 +25,9 @@ pub enum MenuAction {
     InstallHook,
     /// Open the release page of the update the checker found.
     OpenUrl(String),
+    /// Restart into the new binary that has appeared on disk (offered instead
+    /// of [`MenuAction::OpenUrl`] when the upgrade is already installed).
+    RestartToUpdate,
     /// "Check for new data".
     Refresh,
     /// Quit the tray.
