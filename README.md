@@ -44,11 +44,21 @@ Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the co
 
 Every release ships binaries for x86_64 and arm64, on both Linux and macOS. The Linux ones are statically linked: no runtime dependencies, no glibc version to match. macOS additionally gets a real `.app`, which is the one to pick if you want notifications; it is a few blocks down.
 
-**Homebrew (macOS and Linuxbrew):**
+**Homebrew (macOS, recommended):**
+
+```bash
+brew install --cask patrickdappollonio/tap/claude-usage-tray
+```
+
+The cask installs the full application into `/Applications`, which is the version with proper notifications, and it puts the `claude-usage-tray` command on your `PATH` too.
+
+**Homebrew (Linuxbrew):**
 
 ```bash
 brew install patrickdappollonio/tap/claude-usage-tray
 ```
+
+The formula is Linux only and installs just the binary, which on Linux is the whole app. On macOS, use the cask above.
 
 **npm:**
 
@@ -181,7 +191,7 @@ macOS only delivers notifications on behalf of something it can name, and a bare
 
 Install the `.app` and notifications go through Notification Center properly. The first time the tray has something to tell you, macOS asks whether Claude Usage Tray may send notifications; say yes once and that is the end of it. From then on the banners carry the app's name, they land in Notification Center where you can scroll back through them, and you can tune or silence them in System Settings under Notifications like any other app.
 
-Install the bare binary instead (Homebrew, npm, the tarball) and everything else works exactly the same, but notifications are best effort. The tray still tries, using the only route available to an unbundled program, and on recent macOS versions that route often delivers nothing at all. Nothing breaks and nothing is logged in your face; you simply may not see the banners. If threshold alerts matter to you, use the bundle.
+Install the bare binary instead (npm or the tarball) and everything else works exactly the same, but notifications are best effort. The tray still tries, using the only route available to an unbundled program, and on recent macOS versions that route often delivers nothing at all. Nothing breaks and nothing is logged in your face; you simply may not see the banners. If threshold alerts matter to you, use the bundle.
 
 Launch at login is unchanged either way. The checkbox writes a LaunchAgent, which macOS lists under Login Items as "Allow in the Background" rather than "Open at Login". The bundle does not register itself for the "Open at Login" list, so do not go looking for it there.
 
