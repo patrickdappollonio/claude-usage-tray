@@ -12,7 +12,7 @@ The app can also notify you at the moments that matter: when you cross usage thr
 
 There is no window and no dashboard to keep open. Just a small gauge that changes color as you get closer to the limit, and a menu when you want the details. Green means you have room, red means wrap it up.
 
-### It never talks to the Claude Website or Anthropic APIs
+### 🔒 It never talks to the Claude Website or Anthropic APIs
 
 This is the part worth reading slowly.
 
@@ -24,7 +24,7 @@ Your own statusline keeps working exactly as before. If the tray ever fails to w
 
 The only network request the program can make is an optional update check, once a day, against the GitHub releases API. It is anonymous, it sends nothing but the program name and version, and it only reads the latest release tag. Turn it off in `Settings > Check for updates` and the program makes zero network requests, ever.
 
-### Reading the icon
+### 🧭 Reading the icon
 
 The icon is a small gauge, and it tells you two things at once.
 
@@ -38,7 +38,9 @@ On Linux, left-click the icon for a plain summary, something like "You've used 3
 
 Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the countdowns stay accurate on their own. When a 5-hour window rolls over, the session percentage drops back to 0% even if nothing has reported in hours.
 
-### Install
+<a id="install"></a>
+
+### 📦 Install
 
 Every release ships binaries for x86_64 and arm64, on both Linux and macOS. The Linux ones are statically linked: no runtime dependencies, no glibc version to match.
 
@@ -105,7 +107,7 @@ The `xattr` line is needed because the binaries are not signed with an Apple cer
 
 Replace `<version>` with the release you want (for example `0.1.0`) and `<arch>` with `amd64` or `arm64`. Every release also carries a `checksums.txt` with SHA-256 sums for each file. Grab any of these from the [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest).
 
-### Getting started
+### 🚀 Getting started
 
 Two commands and you're done:
 
@@ -136,7 +138,7 @@ If you skip the install step, the tray notices. It shows a gray icon and offers 
 
 One small note: the hook records the full path of the binary you ran it from. If you move the binary, run `hook install` again. `hook status` will tell you when the paths no longer match.
 
-### Settings
+### ⚙️ Settings
 
 Everything configurable lives in the `Settings` submenu. Changes apply immediately, no restart.
 
@@ -148,7 +150,7 @@ Everything configurable lives in the `Settings` submenu. Changes apply immediate
 
 Settings are saved to `~/.config/claude-usage-tray/config.toml` on Linux and `~/Library/Application Support/claude-usage-tray/config.toml` on macOS. If the tray can't write there, the affected menu entries appear grayed out instead of pretending to accept your click.
 
-### Desktop compatibility
+### 🖥️ Desktop compatibility
 
 On Linux the icon uses StatusNotifierItem, the freedesktop tray standard. On macOS it lives in the menu bar through the native APIs.
 
@@ -157,7 +159,7 @@ On Linux the icon uses StatusNotifierItem, the freedesktop tray standard. On mac
 - **GNOME:** needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension. Without it GNOME has no tray to draw into, and no icon will appear. The tray tells you and exits rather than running invisibly.
 - **Notifications** use the standard desktop notification service, which every desktop above ships by default, GNOME included, no extension needed.
 
-### What it can't do
+### 🚧 What it can't do
 
 Worth knowing before you install.
 
@@ -167,6 +169,6 @@ You need Claude Code 2.1.80 or newer, which is the version that started includin
 
 It also only works on Pro and Max subscriptions logged in the normal way. API-key billing doesn't include usage numbers, so there's nothing to show.
 
-### License
+### 📄 License
 
 MIT. See [LICENSE](LICENSE).
