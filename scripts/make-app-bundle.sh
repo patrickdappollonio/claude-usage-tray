@@ -19,11 +19,10 @@
 # Runs on macOS only: `codesign` and (for the zip step in CI) `ditto` are macOS
 # tools. POSIX sh otherwise, so `sh -n` on Linux can check it in CI.
 #
-# TODO: embed Contents/Resources/AppIcon.icns once the gauge renders are turned
-# into an iconset (`iconutil -c icns`). Without it macOS falls back to the
-# generic application icon, which shows up in Notification Center banners and
-# in Login Items. The menu bar icon itself is drawn at runtime and is
-# unaffected.
+# The app icon (Contents/Resources/AppIcon.icns) is built from
+# assets/appicon-1024.png (the gauge at 30%, white on a dark rounded square,
+# rendered by the app's own icon code) via `sips` + `iconutil`. If the master
+# PNG is missing the bundle still assembles, just with the generic icon.
 
 set -eu
 
@@ -92,9 +91,27 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 </dict>
 </plist>
 PLIST
+
+# App icon: resize the committed master into an iconset and compile it. Both
+# tools ship with macOS. Skipped quietly when the master is not present.
+ICON_MASTER="$(dirname "$0")/../assets/appicon-1024.png"
+if [ -f "$ICON_MASTER" ]; then
+	ICONSET="$OUT_DIR/AppIcon.iconset"
+	rm -rf "$ICONSET"
+	mkdir -p "$ICONSET"
+	for size in 16 32 128 256 512; do
+		sips -z "$size" "$size" "$ICON_MASTER" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+		double=$((size * 2))
+		sips -z "$double" "$double" "$ICON_MASTER" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+	done
+	iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+	rm -rf "$ICONSET"
+fi
 
 cp "$BINARY" "$APP/Contents/MacOS/$EXECUTABLE"
 chmod 0755 "$APP/Contents/MacOS/$EXECUTABLE"
