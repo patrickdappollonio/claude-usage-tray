@@ -44,19 +44,13 @@ Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the co
 
 Every release ships binaries for x86_64 and arm64, on both Linux and macOS. The Linux ones are statically linked: no runtime dependencies, no glibc version to match. macOS additionally gets a real `.app`, which is the one to pick if you want notifications; it is a few blocks down.
 
-**Homebrew on macOS (recommended):**
+**Homebrew (macOS, recommended):**
 
 ```bash
 brew install --cask patrickdappollonio/tap/claude-usage-tray
 ```
 
-The cask installs the full application into `/Applications`, which is the version with proper notifications, and it puts the `claude-usage-tray` command on your `PATH` too. The plain formula also works on macOS if you prefer a bare binary, but notifications stay basic without the app bundle.
-
-**Homebrew on Linux (Linuxbrew):**
-
-```bash
-brew install patrickdappollonio/tap/claude-usage-tray
-```
+The cask installs the full application into `/Applications`, which is the version with proper notifications, and it puts the `claude-usage-tray` command on your `PATH` too. On Linux, use any of the packages below instead.
 
 **npm:**
 
