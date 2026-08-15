@@ -2,29 +2,39 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/patrickdappollonio/claude-usage-tray)](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest) [![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/patrickdappollonio/claude-usage-tray/total)](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest) [![NPM Version](https://img.shields.io/npm/v/%40patrickdappollonio%2Fclaude-usage-tray)](https://www.npmjs.com/package/@patrickdappollonio/claude-usage-tray) [![CI](https://img.shields.io/github/actions/workflow/status/patrickdappollonio/claude-usage-tray/ci.yml?branch=main&label=ci)](https://github.com/patrickdappollonio/claude-usage-tray/actions/workflows/ci.yml) [![GitHub License](https://img.shields.io/github/license/patrickdappollonio/claude-usage-tray)](LICENSE)
 
-Know how much Claude Code you have left, without asking. **claude-usage-tray** puts a tiny gauge in your Linux system tray or your macOS menu bar showing your 5-hour session usage and your weekly usage, with the times they reset.
+<img align="right" src="assets/states.gif" width="190" alt="The tray gauge cycling through its states">
 
-No window. No dashboard. Just an icon that changes color as you get closer to the limit, and a menu when you want the details.
+`claude-usage-tray` is a tiny application that lives in your menu bar on macOS or your system tray on Linux, and it reports the status of your Claude quotas and sessions. The numbers come straight from the Claude CLI itself, so there are no cookies to copy and no awkward browser hacks to keep alive. It installs a small hook on the Claude CLI, and from then on, whenever you use Claude normally, fresh numbers flow to the tray and keep it current. Other tools resort to tricks like impersonating the Claude CLI, which can get an account banned, since [Anthropic disallows the practice](https://www.theregister.com/2026/02/20/anthropic_clarifies_ban_third_party_claude_access/).
 
-<!-- screenshot -->
+The app can also notify you at the moments that matter: when you cross usage thresholds you choose, and when your quotas reset, both the 5-hour window and the weekly one. All of it is configurable from the tray menu itself.
 
-### Why you might want this
+There is no window and no dashboard to keep open. Just a small gauge that changes color as you get closer to the limit, and a menu when you want the details. Green means you have room, red means wrap it up.
 
-Claude Code already knows your usage. It just doesn't tell you until you go looking, and by then you are usually mid-thought on something important.
-
-This puts the number where you can glance at it. Green means you have room. Red means wrap it up. If you would rather be told than reminded, it can also notify you as you cross 50%, 75%, 90%, 99% and 100%.
-
-### It never talks to Anthropic
+### It never talks to the Claude Website or Anthropic APIs
 
 This is the part worth reading slowly.
 
-The tray never reads your Claude credentials, never touches your OAuth tokens, and never contacts Anthropic at all. There is no account to create and nothing to log into.
+The tray never reads your Claude credentials, never touches your OAuth tokens, and never contacts Anthropic or the Claude website at all. There is no account to create and nothing to log into.
 
 Here is the whole data flow. Claude Code already computes your usage numbers and hands them to whatever you have configured as your statusline. One command wires this tool into that statusline, where it quietly copies those numbers to a small file on your machine. The tray reads that file. That's it.
 
 Your own statusline keeps working exactly as before. If the tray ever fails to write its file, your statusline still prints what it always printed, because the piece that runs inside Claude Code is built to stay out of the way and never fail loudly.
 
 The only network request the program can make is an optional update check, once a day, against the GitHub releases API. It is anonymous, it sends nothing but the program name and version, and it only reads the latest release tag. Turn it off in `Settings > Check for updates` and the program makes zero network requests, ever.
+
+### Reading the icon
+
+The icon is a small gauge, and it tells you two things at once.
+
+- **The outer arc** is your 5-hour session, sweeping clockwise as you use it up.
+- **The dot in the middle** is your weekly usage.
+- **The color** is the warning: green under 50%, yellow under 75%, orange under 90%, red at 90% and above. Both parts use the same bands.
+- **A question mark in the middle** means the numbers haven't been updated recently. You still see the last known reading, it just might not be current.
+- **A gray icon** means there's no data yet, usually because the hook isn't installed.
+
+On Linux, left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets at 03:50) and 33% of your weekly limit (resets Tue 09:00)." It appears briefly and disappears on its own. On macOS any click simply opens the menu, as menu bar items do, and the same numbers lead it.
+
+Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the countdowns stay accurate on their own. When a 5-hour window rolls over, the session percentage drops back to 0% even if nothing has reported in hours.
 
 ### Install
 
@@ -89,7 +99,7 @@ xattr -d com.apple.quarantine claude-usage-tray
 sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
 ```
 
-The `xattr` line is needed because the binaries are not signed with an Apple certificate, so macOS quarantines direct downloads. Homebrew and npm installs skip the quarantine, no extra step there.
+The `xattr` line is needed because the binaries are not signed with an Apple certificate, so macOS quarantines direct downloads. Homebrew and npm installs skip the quarantine, so there is no extra step there.
 
 Replace `<version>` with the release you want (for example `0.1.0`) and `<arch>` with `amd64` or `arm64`. Every release also carries a `checksums.txt` with SHA-256 sums for each file. Grab any of these from the [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest).
 
@@ -123,20 +133,6 @@ claude-usage-tray restart          # swap the running tray for the one on disk
 If you skip the install step, the tray notices. It shows a gray icon and offers an **Install hook** button right in the menu, which does the same thing as the command above.
 
 One small note: the hook records the full path of the binary you ran it from. If you move the binary, run `hook install` again. `hook status` will tell you when the paths no longer match.
-
-### Reading the icon
-
-The icon is a small gauge, and it tells you two things at once.
-
-- **The outer arc** is your 5-hour session, sweeping clockwise as you use it up.
-- **The dot in the middle** is your weekly usage.
-- **The color** is the warning: green under 50%, yellow under 75%, orange under 90%, red at 90% and above. Both parts use the same bands.
-- **A question mark in the middle** means the numbers haven't been updated recently. You still see the last known reading, it just might not be current.
-- **A gray icon** means there's no data yet, usually because the hook isn't installed.
-
-On Linux, left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets at 03:50) and 33% of your weekly limit (resets Tue 09:00)." It appears briefly and disappears on its own. On macOS any click simply opens the menu, as menu bar items do, and the same numbers lead it.
-
-Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the countdowns stay accurate on their own. When a 5-hour window rolls over, the session percentage drops back to 0% even if nothing has reported in hours.
 
 ### Settings
 
