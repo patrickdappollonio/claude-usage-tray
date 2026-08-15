@@ -78,3 +78,32 @@ jobs:
           name: claude-usage-tray-darwin-arm64
           path: target/release/claude-usage-tray
           retention-days: 7
+
+      # The bundle is the interesting half to hand-test: only inside one does
+      # the tray get UNUserNotificationCenter notifications, so a branch build
+      # that assembles and signs cleanly here is what proves the script before
+      # a release ever runs it.
+      - name: Assemble the app bundle
+        run: sh scripts/make-app-bundle.sh target/release/claude-usage-tray 0.0.0-ci dist
+
+      # `make-app-bundle.sh` already verifies its own signature; this repeats
+      # it standalone so a broken bundle fails the job on its own line, and
+      # `--strict` is what catches a bundle whose contents drifted from what
+      # was signed.
+      - name: Verify the ad-hoc signature
+        run: codesign --verify --strict --verbose=2 "dist/Claude Usage Tray.app"
+
+      # `ditto`, not `zip`: it is the macOS-native archiver and the only one
+      # that preserves the bundle's resource forks and extended attributes,
+      # including the signature. `--keepParent` keeps the `.app` directory
+      # itself inside the archive rather than unpacking its contents loose.
+      - name: Zip the app bundle
+        run: ditto -c -k --keepParent "dist/Claude Usage Tray.app" dist/claude-usage-tray-darwin-arm64-app.zip
+
+      - name: Upload macOS app bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-usage-tray-darwin-arm64-app
+          path: dist/claude-usage-tray-darwin-arm64-app.zip
+          retention-days: 7
+          if-no-files-found: error

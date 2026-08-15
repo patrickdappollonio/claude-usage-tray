@@ -42,7 +42,7 @@ Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the co
 
 ### 📦 Install
 
-Every release ships binaries for x86_64 and arm64, on both Linux and macOS. The Linux ones are statically linked: no runtime dependencies, no glibc version to match.
+Every release ships binaries for x86_64 and arm64, on both Linux and macOS. The Linux ones are statically linked: no runtime dependencies, no glibc version to match. macOS additionally gets a real `.app`, which is the one to pick if you want notifications; it is a few blocks down.
 
 **Homebrew (macOS and Linuxbrew):**
 
@@ -94,6 +94,24 @@ tar xzf claude-usage-tray_<version>_linux_<arch>.tar.gz
 sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
 ```
 
+**App bundle (macOS, recommended):**
+
+```bash
+curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_darwin_<arch>_app.zip
+unzip claude-usage-tray_<version>_darwin_<arch>_app.zip
+mv "Claude Usage Tray.app" /Applications/
+xattr -dr com.apple.quarantine "/Applications/Claude Usage Tray.app"
+open "/Applications/Claude Usage Tray.app"
+```
+
+This is the same tray, wrapped in a real macOS application, and it is the version to pick if you want notifications that actually show up. The `xattr` line is recursive here (`-dr`, not `-d`) because unzipping a quarantined download marks every file inside the bundle, not just the folder, and one leftover mark is enough for macOS to refuse to open it. There is no Dock icon and no app window: it goes straight to the menu bar, exactly like the bare binary does.
+
+The command line still works from inside the bundle. The binary lives at `/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray`, so `hook install` and friends are available if you point at it, and it is worth adding to your `PATH` if you use them often:
+
+```bash
+"/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray" hook install
+```
+
 **Plain tarball (macOS):**
 
 ```bash
@@ -142,7 +160,7 @@ One small note: the hook records the full path of the binary you ran it from. If
 
 Everything configurable lives in the `Settings` submenu. Changes apply immediately, no restart.
 
-- **Launch at login.** A checkbox. On Linux it writes a standard autostart entry, which KDE, GNOME, XFCE, LXQt, Cinnamon and MATE all honor. On macOS it writes a LaunchAgent; note that macOS lists those under Login Items as "Allow in the Background" rather than "Open at Login" (that other list is reserved for bundled apps), but it starts at login all the same.
+- **Launch at login.** A checkbox. On Linux it writes a standard autostart entry, which KDE, GNOME, XFCE, LXQt, Cinnamon and MATE all honor. On macOS it writes a LaunchAgent pointing at whichever copy you ran it from, the one inside the app bundle included; note that macOS lists LaunchAgents under Login Items as "Allow in the Background" rather than "Open at Login", but it starts at login all the same.
 - **Notifications.** One checkbox per threshold (50%, 75%, 90%, 99%, 100%), plus one for when your quota resets. All on by default, all optional. You get one notification per crossing, the highest one only, and restarting the tray never counts as a crossing.
 - **Refresh interval.** How often the tray re-reads the numbers: 5, 15, 30 or 60 seconds.
 - **Icon style.** Color, or monochrome for panels where four colors are more noise than signal. Monochrome auto follows your desktop's light or dark preference and repaints live when you switch. There's also a manual dark and light option, named after your desktop rather than the icon, so pick the one matching your panel. In monochrome the arc length carries the signal instead of the color. Linux defaults to color; macOS defaults to monochrome, drawn as a template image the system tints to match either menu bar, since the colored gauge's dim ring gets lost against a dark menu bar.
@@ -155,9 +173,19 @@ Settings are saved to `~/.config/claude-usage-tray/config.toml` on Linux and `~/
 On Linux the icon uses StatusNotifierItem, the freedesktop tray standard. On macOS it lives in the menu bar through the native APIs.
 
 - **Works out of the box:** KDE Plasma, XFCE 4.16+, LXQt, Cinnamon, MATE, and macOS.
-- **macOS notes:** the icon adapts to light and dark menu bars automatically. Notifications work, though they stay basic until the app ships as a full application bundle.
+- **macOS notes:** the icon adapts to light and dark menu bars automatically. Notifications depend on how you installed it, which is what the next section is about.
 - **GNOME:** needs the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension. Without it GNOME has no tray to draw into, and no icon will appear. The tray tells you and exits rather than running invisibly.
 - **Notifications** use the standard desktop notification service, which every desktop above ships by default, GNOME included, no extension needed.
+
+### 🔔 Notifications on macOS
+
+macOS only delivers notifications on behalf of something it can name, and a bare command line binary has no name to give. That is the whole reason the app bundle exists.
+
+Install the `.app` and notifications go through Notification Center properly. The first time the tray has something to tell you, macOS asks whether Claude Usage Tray may send notifications; say yes once and that is the end of it. From then on the banners carry the app's name, they land in Notification Center where you can scroll back through them, and you can tune or silence them in System Settings under Notifications like any other app.
+
+Install the bare binary instead (Homebrew, npm, the tarball) and everything else works exactly the same, but notifications are best effort. The tray still tries, using the only route available to an unbundled program, and on recent macOS versions that route often delivers nothing at all. Nothing breaks and nothing is logged in your face; you simply may not see the banners. If threshold alerts matter to you, use the bundle.
+
+Launch at login is unchanged either way. The checkbox writes a LaunchAgent, which macOS lists under Login Items as "Allow in the Background" rather than "Open at Login". The bundle does not register itself for the "Open at Login" list, so do not go looking for it there.
 
 ### 🚧 What it can't do
 

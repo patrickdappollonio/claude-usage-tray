@@ -25,6 +25,16 @@
 //! the `CFRunLoop::wake_up` after creating the icon, which their example needs
 //! to make the icon appear at all.
 //!
+//! # Two kinds of process
+//!
+//! The same binary runs either as a bare executable or as the executable
+//! inside `Claude Usage Tray.app` (see `scripts/make-app-bundle.sh`), and
+//! [`notify`] is the one place that can tell the difference and has to. Only a
+//! bundle has a `CFBundleIdentifier`, and `UNUserNotificationCenter` refuses
+//! to work — crashes, in fact — without one. Everything else here behaves
+//! identically in both, including the LaunchAgent, which simply records
+//! whichever path this copy was launched from.
+//!
 //! # What is deliberately not here
 //!
 //! * **No `NSApplication` delegate of our own.** `tao` already owns one, and
@@ -32,11 +42,16 @@
 //! * **No appearance watcher.** See [`watch_appearance`]: monochrome icons are
 //!   AppKit template images, which the system re-tints for the menu bar by
 //!   itself.
+//! * **No `SMAppService` registration.** "Launch at login" stays a LaunchAgent
+//!   on both shapes of install, so there is one implementation and one
+//!   checkbox rather than a bundled path and an unbundled one that behave
+//!   differently. The cost is that macOS lists it under "Allow in the
+//!   Background" instead of "Open at Login".
 
 pub mod autostart;
 mod tray;
 
-use crate::platform::{BackendError, Channel, Toast};
+use crate::platform::{BackendError, Channel, Toast, Urgency};
 use crate::source::UsageSnapshot;
 use crate::ui::TrayCore;
 use std::sync::Arc;
@@ -188,32 +203,148 @@ where
     })
 }
 
+/// The `UNNotificationRequest` identifier every threshold alert reuses.
+///
+/// Re-posting a request under an identifier that is already delivered replaces
+/// it in place, which is exactly what [`Channel::ThresholdAlert`] asks for: the
+/// 90% banner reads where the 75% one was instead of stacking under it.
+/// Ephemeral toasts pass no identifier at all and get a fresh system-assigned
+/// one each time, so they stack.
+const THRESHOLD_ALERT_ID: &str = "com.patrickdappollonio.claude-usage-tray.threshold-alert";
+
+/// Whether this process has an app bundle identity, worked out once.
+///
+/// `notify_rust::check_bundle` is `NSBundle::mainBundle().bundleIdentifier()`
+/// and nothing else, which is the reliable form of the question:
+/// `mainBundle` itself is *not* a bundle test (Apple documents that it "may
+/// return a valid bundle object even for unbundled apps", rooted at whatever
+/// directory the executable sits in), but only a real `Info.plist` supplies a
+/// `CFBundleIdentifier`. Matching on `".app/Contents/MacOS/"` in the
+/// executable path would have guessed at the same thing from the outside.
+///
+/// This is also a hard gate, not a preference: `UNUserNotificationCenter`
+/// *crashes* a process with no bundle identifier, so the check has to come
+/// before anything touches the framework.
+fn is_bundled() -> bool {
+    static BUNDLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BUNDLED.get_or_init(|| notify_rust::check_bundle().is_ok())
+}
+
+/// Asks for notification permission once per process, returning whether it was
+/// granted.
+///
+/// `mac-usernotifications` never requests authorization on its own — every
+/// send path only calls `check_bundle` — so this is ours to do. The first call
+/// puts up the system's "Claude Usage Tray would like to send you
+/// notifications" prompt; every later one reads the answer cached here. It
+/// blocks, but on the notification framework's own dispatch queue rather than
+/// the main run loop, and it is called from the poll-loop thread.
+///
+/// A denial is honored rather than worked around: no fallback, no second
+/// route. The user said no.
+fn notifications_authorized() -> bool {
+    static AUTHORIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AUTHORIZED.get_or_init(|| notify_rust::request_auth_blocking().unwrap_or(false))
+}
+
 /// Posts a Notification Center notification.
 ///
-/// [`Toast::urgency`] and [`Toast::transient`] are dropped: they are
-/// freedesktop concepts with no Notification Center equivalent, and
-/// `notify-rust` only compiles those builders on Linux. Failures (an
-/// unbundled binary whose notifications the user has denied, most likely) are
-/// ignored on purpose: a missing notification must never take the tray with
-/// it.
+/// Which route it takes depends on what this process *is*:
 ///
-/// `channel` is accepted and ignored: every toast is fire-and-forget here, so
-/// a new threshold alert stacks instead of replacing the previous one, same
-/// as before this lane existed on Linux. `notify-rust`'s macOS backend hands
-/// back a handle too, so replace-in-place is possible in principle, but
-/// wiring it up is deferred to the bundled-app work — an unsigned,
-/// unbundled binary's Notification Center entitlements are already shaky
-/// (see the doc comment above), and that work is where this gets revisited
-/// alongside a real app identity.
-pub fn notify(toast: &Toast, _channel: Channel) {
-    // Deliberately NOT notify-rust here: its macOS backend
-    // (mac-notification-sys) masquerades under another app's bundle identity
-    // via `get_bundle_identifier_or_default("use_default")`, and on current
-    // macOS that lookup can fail into an "choose an application" picker for a
-    // literal app called `use_default` (observed on a real Mac). osascript's
-    // `display notification` is the unbundled-binary-safe path: no identity
-    // games, no dialogs. Loses urgency/transient nuance, which is acceptable
-    // until the bundled-app work gives us UNUserNotificationCenter.
+/// * **Inside the app bundle** (the `.app` that `scripts/make-app-bundle.sh`
+///   assembles) it goes through `UNUserNotificationCenter`, via notify-rust's
+///   `preview-macos-un` backend. That is the modern framework, and the one
+///   that gives the banner the app's own name, a permission prompt the user
+///   can answer once, an entry in System Settings > Notifications, and
+///   scroll-back in Notification Center.
+/// * **As a bare binary** (Homebrew, npm, the tarball) there is no app
+///   identity to post under, so it falls back to `osascript`'s `display
+///   notification`. That is best effort in the honest sense: it costs one
+///   short-lived process and on current macOS it frequently shows nothing at
+///   all (measured on a real Mac, from a terminal, silently). It stays because
+///   it is free and it still works on some setups; it is not something to
+///   promise anybody.
+///
+/// [`Toast::transient`] is dropped either way: Notification Center has no
+/// "don't keep this in history" concept. Failures are ignored on purpose — a
+/// missing notification must never take the tray with it.
+pub fn notify(toast: &Toast, channel: Channel) {
+    if is_bundled() {
+        notify_bundled(toast, channel);
+    } else {
+        notify_unbundled(toast);
+    }
+}
+
+/// How many times a bundled notification is attempted, and how long to wait
+/// between attempts. See [`notify_bundled`] for what is being waited for.
+const SEND_ATTEMPTS: u32 = 5;
+const SEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The `UNUserNotificationCenter` path. Only ever called once [`is_bundled`]
+/// has said yes.
+///
+/// # Why this retries
+///
+/// `mac-usernotifications` blocks on its send future through
+/// `block_on_current`, which refuses to block a non-main thread unless the
+/// main run loop is *waiting* (`CFRunLoop::main().is_waiting()`), and returns
+/// `MainThreadNotRunning` without sending anything if it is not. Every toast
+/// here comes off the poll-loop thread, and several of them are emitted
+/// immediately after that same thread pushed a snapshot through the event loop
+/// proxy — which is precisely what wakes the main thread up. So the one moment
+/// a toast is most likely to be sent is also the one moment the probe is most
+/// likely to say "busy".
+///
+/// The window is a few milliseconds of icon rendering, so a handful of spaced
+/// attempts covers it, and a genuinely refused notification (authorization
+/// revoked, say) simply fails five cheap times instead of one. Nothing is
+/// double-posted by retrying: `block_on_current` bails out before the send
+/// future is ever polled, and a threshold alert re-sent under the same
+/// identifier replaces itself in any case.
+fn notify_bundled(toast: &Toast, channel: Channel) {
+    if !notifications_authorized() {
+        return;
+    }
+    for attempt in 0..SEND_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(SEND_RETRY_DELAY);
+        }
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .summary(&toast.summary)
+            .body(&toast.body)
+            .interruption_level(interruption_level(toast.urgency));
+        if channel == Channel::ThresholdAlert {
+            notification.id(THRESHOLD_ALERT_ID);
+        }
+        if notification.show().is_ok() {
+            return;
+        }
+    }
+}
+
+/// Maps the portable urgency onto an interruption level.
+///
+/// `Critical` deliberately stops at `Active` rather than `TimeSensitive`, even
+/// though notify-rust's own `Urgency` conversion goes there: Apple gates the
+/// time-sensitive level behind the Time Sensitive Notifications capability
+/// (enabled in Xcode, backed by a provisioning profile), and this bundle is
+/// signed ad hoc with no entitlements at all. Asking for a level we are not
+/// entitled to risks the *most* important alert being the one that does not
+/// arrive, which is a bad trade for a banner that breaks through Focus.
+fn interruption_level(urgency: Urgency) -> notify_rust::InterruptionLevel {
+    match urgency {
+        Urgency::Low => notify_rust::InterruptionLevel::Passive,
+        Urgency::Normal | Urgency::Critical => notify_rust::InterruptionLevel::Active,
+    }
+}
+
+/// The unbundled fallback: `osascript`'s `display notification`.
+///
+/// Spawned and never waited on, with all three standard streams on
+/// `/dev/null`, so a missing or refusing `osascript` costs nothing.
+fn notify_unbundled(toast: &Toast) {
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
         applescript_escape(&toast.body),

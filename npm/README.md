@@ -32,8 +32,12 @@ re-run it after upgrading the package.
   or MATE work out of the box. GNOME needs the
   [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
   extension.
-- Or macOS 12 or newer, where the icon goes in the menu bar. Notifications work
-  but are basic, because the binary is not shipped inside an app bundle.
+- Or macOS 12 or newer, where the icon goes in the menu bar. Notifications are
+  best effort here: npm ships the bare binary, and macOS only delivers
+  notifications properly on behalf of an app bundle. For real Notification
+  Center banners, grab the `.app` from the
+  [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest)
+  instead. Everything else behaves the same.
 - Claude Code >= 2.1.80 (the version that added `rate_limits` to the statusline
   JSON), on a Pro/Max subscription account.
 

@@ -53,12 +53,19 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io", "
 # Default features are left on deliberately: the GTK/libxdo ones only pull
 # dependencies in under `cfg(linux)`, so they cost nothing here.
 #
-# Notifications on macOS go through `osascript` (see `platform/macos/mod.rs`
-# for why notify-rust's mac backend is avoided), so no notification crate
-# here. This section is proven by the macOS CI job; `cargo check --target
+# This section is proven by the macOS CI job; `cargo check --target
 # aarch64-apple-darwin` from a Linux host fails on tray-icon's ObjC build
 # scripts, not on our code.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Notifications, but only the `preview-macos-un` backend: that feature swaps
+# notify-rust's default macOS path (mac-notification-sys, which borrows another
+# app's bundle identity and shows nothing useful for an unbundled binary) for
+# `mac-usernotifications`, a real UNUserNotificationCenter client. It brings
+# `check_bundle`, which is how `platform/macos/mod.rs` decides whether this
+# process has an app identity at all before touching the framework. Default
+# features are off because notify-rust's default (`z`) is the zbus/XDG stack,
+# which is Linux-only anyway.
+notify-rust = { version = "4.18.0", default-features = false, features = ["preview-macos-un"] }
 # Only for `CFRunLoop::wake_up` after the status item is created; see
 # `platform/macos/mod.rs`.
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"] }

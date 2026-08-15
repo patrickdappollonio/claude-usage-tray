@@ -221,6 +221,28 @@ mod tests {
         assert!(plist.contains("<string>/Users/someone/bin/tray</string>"));
     }
 
+    /// Launched from the app bundle, `current_exe` is the path *inside* the
+    /// bundle, spaces and all. `ProgramArguments` is an array, so `launchd`
+    /// never splits it on whitespace the way a shell would; the only thing that
+    /// has to survive is the XML escaping. This pins that: one `<string>`
+    /// holding the whole path, and the `--foreground` flag still separate.
+    #[test]
+    fn the_plist_keeps_a_bundled_exe_path_with_spaces_in_one_argument() {
+        let exec = "/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray";
+        let plist = launch_agent_plist(Path::new(exec));
+        let arguments = plist
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</array>").next())
+            .expect("a ProgramArguments array");
+        let strings: Vec<&str> = arguments
+            .split("<string>")
+            .skip(1)
+            .filter_map(|piece| piece.split("</string>").next())
+            .collect();
+        assert_eq!(strings, vec![exec, "--foreground"]);
+    }
+
     /// A path is arbitrary user data as far as XML is concerned, and a raw `&`
     /// makes the whole plist unparseable — which would silently disable
     /// autostart for anyone with a `Rock & Roll` directory in their path.
@@ -305,6 +327,23 @@ mod tests {
         let temp = TempDir::new("launchagent-dir-collision");
         std::fs::create_dir_all(entry_path(temp.path())).expect("create colliding dir");
         assert!(!is_enabled_in(temp.path()));
+    }
+
+    /// The app bundle and the LaunchAgent name the same application, and both
+    /// spellings are written out by hand in two different languages (Rust here,
+    /// `sh` there). Reading the script back is the only thing that keeps them
+    /// from drifting apart into an app called one thing and a login item called
+    /// another.
+    #[test]
+    fn the_bundle_identifier_matches_the_launch_agent_label() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/make-app-bundle.sh"),
+        )
+        .expect("read the bundle script");
+        assert!(
+            script.contains(&format!("BUNDLE_ID=\"{LABEL}\"")),
+            "scripts/make-app-bundle.sh no longer uses {LABEL} as CFBundleIdentifier"
+        );
     }
 
     /// The entry lands under the user's own `Library`, never the system-wide

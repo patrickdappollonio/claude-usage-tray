@@ -210,8 +210,28 @@ jobs:
           tar czf "dist/${STAGE}.tar.gz" -C "dist/$STAGE" .
           rm -rf "dist/$STAGE"
 
+      # The recommended macOS download: a real `.app`, which is what gives the
+      # tray a bundle identity and therefore modern Notification Center
+      # notifications. The tarball above stays exactly as it was, and so does
+      # everything built from it (Homebrew, npm) — a bare binary is still fully
+      # supported, only its notifications are best-effort.
+      - name: Build the app bundle
+        run: |
+          set -euo pipefail
+          sh scripts/make-app-bundle.sh \
+            "target/${{ matrix.target }}/release/claude-usage-tray" "$VERSION" dist/app
+          # `ditto`, not `zip`: the macOS-native archiver, and the only one that
+          # round-trips a bundle's extended attributes and its code signature.
+          # `--keepParent` keeps the `.app` itself in the archive so unzipping
+          # produces an app, not its loose contents.
+          ditto -c -k --keepParent "dist/app/Claude Usage Tray.app" \
+            "dist/claude-usage-tray_${VERSION}_darwin_${{ matrix.goarch }}_app.zip"
+          rm -rf dist/app
+          ls -la dist
+
       # No .deb/.rpm/.apk/.pkg equivalents here: nfpm builds Linux packages
-      # only, and macOS is served by the tarball, Homebrew and npm.
+      # only, and macOS is served by the app bundle, the tarball, Homebrew and
+      # npm.
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
