@@ -112,7 +112,7 @@ Replace `<version>` with the release you want (for example `0.1.0`) and `<arch>`
 Two commands and you're done:
 
 ```bash
-claude-usage-tray hook install   # let Claude Code share its usage numbers
+claude-usage-tray hook install  # let Claude Code share its usage numbers
 claude-usage-tray               # run the tray
 ```
 
