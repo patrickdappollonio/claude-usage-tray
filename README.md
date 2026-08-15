@@ -134,7 +134,7 @@ The icon is a small gauge, and it tells you two things at once.
 - **A question mark in the middle** means the numbers haven't been updated recently. You still see the last known reading, it just might not be current.
 - **A gray icon** means there's no data yet, usually because the hook isn't installed.
 
-Left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets at 03:50) and 33% of your weekly limit (resets Tue 09:00)." It appears briefly and disappears on its own.
+On Linux, left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets at 03:50) and 33% of your weekly limit (resets Tue 09:00)." It appears briefly and disappears on its own. On macOS any click simply opens the menu, as menu bar items do, and the same numbers lead it.
 
 Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the countdowns stay accurate on their own. When a 5-hour window rolls over, the session percentage drops back to 0% even if nothing has reported in hours.
 
@@ -142,13 +142,13 @@ Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the co
 
 Everything configurable lives in the `Settings` submenu. Changes apply immediately, no restart.
 
-- **Launch at login.** A checkbox. It writes a standard autostart entry, which KDE, GNOME, XFCE, LXQt, Cinnamon and MATE all honor.
+- **Launch at login.** A checkbox. On Linux it writes a standard autostart entry, which KDE, GNOME, XFCE, LXQt, Cinnamon and MATE all honor. On macOS it writes a LaunchAgent; note that macOS lists those under Login Items as "Allow in the Background" rather than "Open at Login" (that other list is reserved for bundled apps), but it starts at login all the same.
 - **Notifications.** One checkbox per threshold (50%, 75%, 90%, 99%, 100%), plus one for when your quota resets. All on by default, all optional. You get one notification per crossing, the highest one only, and restarting the tray never counts as a crossing.
 - **Refresh interval.** How often the tray re-reads the numbers: 5, 15, 30 or 60 seconds.
-- **Icon style.** Color, or monochrome for panels where four colors are more noise than signal. Monochrome auto follows your desktop's light or dark preference and repaints live when you switch. There's also a manual dark and light option, named after your desktop rather than the icon, so pick the one matching your panel. In monochrome the arc length carries the signal instead of the color.
+- **Icon style.** Color, or monochrome for panels where four colors are more noise than signal. Monochrome auto follows your desktop's light or dark preference and repaints live when you switch. There's also a manual dark and light option, named after your desktop rather than the icon, so pick the one matching your panel. In monochrome the arc length carries the signal instead of the color. Linux defaults to color; macOS defaults to monochrome, drawn as a template image the system tints to match either menu bar, since the colored gauge's dim ring gets lost against a dark menu bar.
 - **Check for updates.** On by default, and the only setting that permits a network request. When a newer version exists, one row appears in the menu; clicking it opens the release page in your browser. Nothing is ever downloaded or installed for you. Once you have installed the new version through your package manager, run `claude-usage-tray restart` to switch over to it. The tray notices the swap on its own too, and offers a **Restart to update** row in the menu that does the same thing in one click. Uncheck it and the checks stop.
 
-Settings are saved to `~/.config/claude-usage-tray/config.toml`. If the tray can't write there, the affected menu entries appear grayed out instead of pretending to accept your click.
+Settings are saved to `~/.config/claude-usage-tray/config.toml` on Linux and `~/Library/Application Support/claude-usage-tray/config.toml` on macOS. If the tray can't write there, the affected menu entries appear grayed out instead of pretending to accept your click.
 
 ### Desktop compatibility
 
