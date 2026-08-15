@@ -12,7 +12,11 @@ keywords = ["tray", "statusnotifieritem", "claude", "usage", "menubar"]
 categories = ["command-line-utilities", "gui", "visualization"]
 
 [profile.release]
-strip = true
+opt-level = "z"   # Optimize for size; a tray app has no hot loops worth speed.
+lto = true        # Enable link time optimization.
+codegen-units = 1 # Reduce parallel code generation units for better optimization.
+debug = 0         # No debug information.
+strip = true      # Strip symbols from the binary.
 
 # Portable dependencies: everything the platform-independent core needs (see
 # `src/platform/mod.rs` for where the boundary runs).

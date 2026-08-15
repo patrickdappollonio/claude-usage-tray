@@ -78,8 +78,13 @@ jobs:
       # cargo-edit's `set-version` updates Cargo.toml *and* Cargo.lock in one
       # step, which a bare `sed` on Cargo.toml would not do (it would leave the
       # lockfile stale and make `--locked` builds fail).
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      # binstall fetches the prebuilt cargo-edit release instead of compiling
+      # it from source, which took several minutes per job.
       - name: Install cargo-edit
-        run: cargo install cargo-edit --locked
+        run: cargo binstall cargo-edit --no-confirm
 
       - name: Set version from tag
         run: cargo set-version "$VERSION"
@@ -186,8 +191,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      # binstall fetches the prebuilt cargo-edit release instead of compiling
+      # it from source, which took several minutes per job.
       - name: Install cargo-edit
-        run: cargo install cargo-edit --locked
+        run: cargo binstall cargo-edit --no-confirm
 
       - name: Set version from tag
         run: cargo set-version "$VERSION"
