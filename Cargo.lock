@@ -311,6 +311,7 @@ dependencies = [
  "dirs",
  "jiff",
  "ksni",
+ "libc",
  "notify-rust",
  "objc2-core-foundation",
  "serde_json",

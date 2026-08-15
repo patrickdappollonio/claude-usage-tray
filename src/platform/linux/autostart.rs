@@ -33,13 +33,19 @@ pub fn entry_path(dir: &Path) -> PathBuf {
 /// Builds the `.desktop` entry body for a given executable path.
 ///
 /// Pure, so the exact keys are unit-tested without writing anything.
+///
+/// `--foreground` is passed deliberately. A bare invocation re-executes itself
+/// in the background and exits, which the session manager would faithfully do
+/// nothing useful with: an extra process launch, and a session manager that
+/// thinks the app quit the moment it started. Running attached keeps the
+/// process the session actually started the one that lives.
 pub fn desktop_entry(exec: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Claude Usage Tray\n\
          Comment=Claude Code subscription usage in the system tray\n\
-         Exec={}\n\
+         Exec={} --foreground\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
         exec.display()
@@ -134,7 +140,7 @@ mod tests {
         for line in [
             "Type=Application",
             "Name=Claude Usage Tray",
-            "Exec=/usr/local/bin/claude-usage-tray",
+            "Exec=/usr/local/bin/claude-usage-tray --foreground",
             "X-GNOME-Autostart-enabled=true",
         ] {
             assert!(entry.lines().any(|l| l == line), "missing {line:?}");
@@ -144,7 +150,20 @@ mod tests {
     #[test]
     fn desktop_entry_uses_the_absolute_exec_path_given() {
         let entry = desktop_entry(Path::new("/home/someone/bin/tray"));
-        assert!(entry.contains("Exec=/home/someone/bin/tray\n"));
+        assert!(entry.contains("Exec=/home/someone/bin/tray --foreground\n"));
+    }
+
+    /// The session manager starts the tray directly rather than having it
+    /// re-execute itself into the background: a process that exits immediately
+    /// looks to the session like an app that failed to start.
+    #[test]
+    fn desktop_entry_runs_the_tray_in_the_foreground() {
+        let entry = desktop_entry(Path::new("/opt/tray"));
+        let exec = entry
+            .lines()
+            .find(|line| line.starts_with("Exec="))
+            .expect("an Exec line");
+        assert!(exec.ends_with(" --foreground"), "unexpected exec: {exec}");
     }
 
     #[test]

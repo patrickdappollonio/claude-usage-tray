@@ -9,6 +9,13 @@
 //! subcommand) and its own installer (`hook install|uninstall|status`), so
 //! there is no shell snippet anywhere in the design.
 //!
+//! Launching (tray mode): a bare `claude-usage-tray` re-executes itself with a
+//! private flag, in its own process group with its standard streams on
+//! `/dev/null`, and the parent returns the terminal — see [`detach`].
+//! `--foreground` skips that. Either way exactly one tray may run at a time,
+//! enforced by the `flock` in [`instance`]; `restart` is how an upgraded
+//! binary replaces the copy already running.
+//!
 //! Threading (tray mode): the platform backend decides which thread the poll
 //! loop gets ([`platform::run`] takes it as a closure precisely so that
 //! neither side has to assume). On Linux the tray service runs on its own
@@ -22,6 +29,7 @@
 mod config;
 mod hook;
 mod icon;
+mod instance;
 mod menu;
 mod platform;
 mod source;
@@ -114,7 +122,9 @@ fn notify_refresh(body: &str) {
 const USAGE: &str = "\
 claude-usage-tray — Claude Code usage in the system tray
 
-  claude-usage-tray                      run the tray
+  claude-usage-tray                      run the tray in the background
+  claude-usage-tray --foreground         run the tray in this terminal
+  claude-usage-tray restart              stop the running tray and start again
   claude-usage-tray statusline [--exec CMD]
                                          Claude Code statusline command: caches
                                          the stdin JSON, optionally running CMD
@@ -124,21 +134,195 @@ claude-usage-tray — Claude Code usage in the system tray
   claude-usage-tray hook status          report what is currently wired up
 ";
 
+/// The documented flag that keeps the tray attached to the terminal.
+const FOREGROUND_FLAG: &str = "--foreground";
+
+/// The private flag the detaching parent passes to the copy of itself it
+/// spawns. Behaves exactly like [`FOREGROUND_FLAG`] and is deliberately left
+/// out of [`USAGE`]: it exists so a process listing distinguishes the
+/// re-executed child from a user's own foreground run, not for anybody to
+/// type.
+const RUN_FOREGROUND_FLAG: &str = "__run-foreground";
+
+/// Printed by the parent before it exits, so "nothing happened" is never the
+/// visible outcome of launching the tray.
+const BACKGROUNDED: &str =
+    "claude-usage-tray: running in the background (use --foreground to keep it attached)";
+
+/// Printed when the single-instance lock is already held. It names the way
+/// out, because the common cause is a package upgrade: the old binary is still
+/// running and the user has just tried to start the new one.
+const ALREADY_RUNNING: &str =
+    "claude-usage-tray is already running (run 'claude-usage-tray restart' to replace it)";
+
+/// How long `restart` waits for the old instance to let go of the lock.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the command line asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// Bare invocation: re-exec into the background and return the terminal.
+    Detach,
+    /// Run the tray in this process (`--foreground`, or the private flag the
+    /// detaching parent uses).
+    Foreground,
+    /// Replace whichever instance is running.
+    Restart,
+    Statusline,
+    Hook,
+    Usage,
+}
+
+fn parse_mode(args: &[String]) -> Mode {
+    match args.first().map(String::as_str) {
+        None => Mode::Detach,
+        Some(flag) if flag == FOREGROUND_FLAG && args.len() == 1 => Mode::Foreground,
+        Some(flag) if flag == RUN_FOREGROUND_FLAG && args.len() == 1 => Mode::Foreground,
+        Some("restart") if args.len() == 1 => Mode::Restart,
+        Some("statusline") => Mode::Statusline,
+        Some("hook") => Mode::Hook,
+        _ => Mode::Usage,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match args.first().map(String::as_str) {
-        None => {
-            run_tray();
-            0
-        }
-        Some("statusline") => run_statusline(&args[1..]),
-        Some("hook") => run_hook(&args[1..]),
-        _ => {
+    let code = match parse_mode(&args) {
+        Mode::Detach => detach(),
+        Mode::Foreground => run_tray_locked(),
+        Mode::Restart => run_restart(),
+        // Never detached, and never single-instanced: both are synchronous
+        // commands the user (or Claude Code) is waiting on the exit of, and
+        // `statusline` in particular runs concurrently with a live tray by
+        // design.
+        Mode::Statusline => run_statusline(&args[1..]),
+        Mode::Hook => run_hook(&args[1..]),
+        Mode::Usage => {
             eprint!("{USAGE}");
             2
         }
     };
     std::process::exit(code);
+}
+
+/// Re-executes this binary in the background and returns the terminal.
+///
+/// A re-exec rather than a bare `fork`: the tray brings up AppKit on macOS,
+/// and a forked child that has not `exec`ed may not safely touch it. Spawning
+/// a fresh process sidesteps the whole question and costs one extra `exec`
+/// once per launch.
+///
+/// The single-instance check happens *here*, before the spawn, as well as in
+/// the child. The child's stderr is `/dev/null`, so a refusal printed there
+/// would be invisible; doing it in the parent is what makes "already running"
+/// something the user actually reads, with a nonzero exit to match.
+fn detach() -> i32 {
+    match instance::try_acquire(&instance::lock_path()) {
+        Ok(None) => {
+            eprintln!("{ALREADY_RUNNING}");
+            return 1;
+        }
+        // Free: release it again immediately so the child can take it. The
+        // gap is a race only against another launch in the same instant, and
+        // the child's own check is what closes it.
+        Ok(Some(lock)) => drop(lock),
+        // The lock file is unusable (read-only runtime directory, say). Not a
+        // reason to refuse to run the tray.
+        Err(_) => {}
+    }
+    spawn_background()
+}
+
+/// Spawns the detached child and reports it. Split from [`detach`] so
+/// `restart` can reuse it after clearing the way.
+fn spawn_background() -> i32 {
+    use std::os::unix::process::CommandExt;
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            eprintln!("claude-usage-tray: cannot determine my own path: {err}");
+            return 1;
+        }
+    };
+    let spawned = std::process::Command::new(exe)
+        .arg(RUN_FOREGROUND_FLAG)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Its own process group, so closing the terminal (or a Ctrl-C meant
+        // for whatever the user runs next) does not take the tray with it.
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(_) => {
+            println!("{BACKGROUNDED}");
+            0
+        }
+        Err(err) => {
+            eprintln!("claude-usage-tray: could not start in the background: {err}");
+            1
+        }
+    }
+}
+
+/// The `restart` subcommand: stop whatever instance is running, then start a
+/// fresh one in the background.
+///
+/// This is what makes an upgrade a one-liner. The newly installed binary
+/// cannot simply start — the old process still holds the lock — and asking
+/// people to hunt for a PID is a poor answer, so the tool does the hunting: the
+/// lock file carries the running instance's PID, and the lock itself is the
+/// proof that the PID is live.
+fn run_restart() -> i32 {
+    let path = instance::lock_path();
+    match instance::try_acquire(&path) {
+        // Nothing running: "restart" is just "start".
+        Ok(Some(lock)) => drop(lock),
+        Err(_) => {}
+        Ok(None) => {
+            let Some(pid) = instance::read_pid(&path) else {
+                eprintln!(
+                    "claude-usage-tray: another instance is running but did not record its \
+                     process id, so it cannot be stopped from here; quit it from its tray menu \
+                     and try again"
+                );
+                return 1;
+            };
+            if !instance::terminate(pid) {
+                eprintln!("claude-usage-tray: could not stop the running instance (pid {pid})");
+                return 1;
+            }
+            if !instance::wait_until_free(&path, RESTART_TIMEOUT) {
+                eprintln!(
+                    "claude-usage-tray: the running instance (pid {pid}) did not exit; nothing \
+                     was started"
+                );
+                return 1;
+            }
+            println!("claude-usage-tray: stopped the running instance (pid {pid})");
+        }
+    }
+    spawn_background()
+}
+
+/// Takes the single-instance lock, then runs the tray for the life of the
+/// process. The lock is held by leaking the open file: the kernel releases it
+/// when this process ends, however it ends.
+fn run_tray_locked() -> i32 {
+    match instance::try_acquire(&instance::lock_path()) {
+        Ok(Some(lock)) => {
+            lock.record_pid();
+            lock.hold_forever();
+        }
+        Ok(None) => {
+            eprintln!("{ALREADY_RUNNING}");
+            return 1;
+        }
+        Err(_) => {}
+    }
+    run_tray();
+    0
 }
 
 /// The `statusline` subcommand: pure transport. Reads Claude Code's statusline
@@ -504,6 +688,78 @@ fn poll_loop(
 /// `NotificationHandle`) lives in `platform::linux` and talks to a live
 /// notification daemon, so it is not unit-testable here — that verification
 /// is left to the orchestrator running this on a real desktop.
+#[cfg(test)]
+mod command_line {
+    use super::*;
+
+    fn mode(args: &[&str]) -> Mode {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        parse_mode(&owned)
+    }
+
+    #[test]
+    fn a_bare_invocation_detaches() {
+        assert_eq!(mode(&[]), Mode::Detach);
+    }
+
+    #[test]
+    fn the_foreground_flag_and_the_private_flag_both_run_here() {
+        assert_eq!(mode(&["--foreground"]), Mode::Foreground);
+        assert_eq!(mode(&["__run-foreground"]), Mode::Foreground);
+    }
+
+    #[test]
+    fn restart_is_its_own_mode() {
+        assert_eq!(mode(&["restart"]), Mode::Restart);
+    }
+
+    /// The two synchronous commands must never be detached: something is
+    /// waiting on their output and their exit code.
+    #[test]
+    fn the_synchronous_subcommands_are_untouched() {
+        assert_eq!(mode(&["statusline"]), Mode::Statusline);
+        assert_eq!(mode(&["statusline", "--exec", "prompt"]), Mode::Statusline);
+        assert_eq!(mode(&["hook", "install"]), Mode::Hook);
+        assert_eq!(mode(&["hook", "status"]), Mode::Hook);
+    }
+
+    #[test]
+    fn anything_else_is_a_usage_error() {
+        for args in [
+            vec!["--background"],
+            vec!["-f"],
+            vec!["--foreground", "extra"],
+            vec!["restart", "now"],
+            vec![""],
+        ] {
+            assert_eq!(mode(&args), Mode::Usage, "unexpected mode for {args:?}");
+        }
+    }
+
+    /// The private flag is a mechanism, not an interface: documenting it would
+    /// invite people to use it instead of `--foreground`.
+    #[test]
+    fn the_usage_text_documents_the_public_flags_only() {
+        assert!(USAGE.contains("--foreground"));
+        assert!(USAGE.contains("claude-usage-tray restart"));
+        assert!(!USAGE.contains(RUN_FOREGROUND_FLAG));
+    }
+
+    /// The refusal has to tell an upgrading user what to do next, or "already
+    /// running" is a dead end with the old binary still in the tray.
+    #[test]
+    fn the_already_running_message_points_at_restart() {
+        assert!(ALREADY_RUNNING.starts_with("claude-usage-tray is already running"));
+        assert!(ALREADY_RUNNING.contains("claude-usage-tray restart"));
+    }
+
+    #[test]
+    fn the_background_notice_mentions_how_to_stay_attached() {
+        assert!(BACKGROUNDED.contains("running in the background"));
+        assert!(BACKGROUNDED.contains(FOREGROUND_FLAG));
+    }
+}
+
 #[cfg(test)]
 mod notify_channel_routing {
     use super::*;

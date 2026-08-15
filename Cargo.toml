@@ -19,6 +19,11 @@ strip = true
 [dependencies]
 dirs = "6.0.0"
 jiff = "0.2.35"
+# Only for `flock` and `kill` in `src/instance.rs` (the single-instance lock and
+# `restart`); std has neither. Both supported platforms are Unix, and libc is
+# already in the dependency tree several times over, so this adds nothing to the
+# build.
+libc = "0.2.189"
 serde_json = "1.0.151"
 tiny-skia = "0.12.0"
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }

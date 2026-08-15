@@ -102,6 +102,10 @@ claude-usage-tray hook install   # let Claude Code share its usage numbers
 claude-usage-tray               # run the tray
 ```
 
+The second command hands your terminal straight back. The tray keeps running in the background, and it survives closing that terminal, so there is nothing to leave open and no `&` to remember. Only one tray runs at a time: start a second one and it tells you so instead of putting two icons in your panel.
+
+If you would rather watch it run, add `--foreground` and it stays attached until you stop it with Ctrl-C. That is the useful form for debugging, and it is what the launch-at-login entry uses so your session manager can supervise it properly.
+
 `hook install` edits your Claude Code `settings.json` and nothing else. If you already have a statusline, yours is wrapped rather than replaced, so it keeps running and printing exactly what it did before. If you had no statusline, you still don't get one, because the tray doesn't add anything of its own. Your original file is backed up the first time.
 
 Then start a Claude Code session and the numbers show up.
@@ -111,7 +115,10 @@ Two more commands, for when you need them:
 ```bash
 claude-usage-tray hook status      # what's wired up, and how fresh the data is
 claude-usage-tray hook uninstall   # put things back exactly as they were
+claude-usage-tray restart          # swap the running tray for the one on disk
 ```
+
+`restart` is the one to run after an upgrade. Installing a new version doesn't disturb the copy already running, so until you restart it you are still looking at the old one.
 
 If you skip the install step, the tray notices. It shows a gray icon and offers an **Install hook** button right in the menu, which does the same thing as the command above.
 
@@ -139,7 +146,7 @@ Everything configurable lives in the `Settings` submenu. Changes apply immediate
 - **Notifications.** One checkbox per threshold (50%, 75%, 90%, 99%, 100%), plus one for when your quota resets. All on by default, all optional. You get one notification per crossing, the highest one only, and restarting the tray never counts as a crossing.
 - **Refresh interval.** How often the tray re-reads the numbers: 5, 15, 30 or 60 seconds.
 - **Icon style.** Color, or monochrome for panels where four colors are more noise than signal. Monochrome auto follows your desktop's light or dark preference and repaints live when you switch. There's also a manual dark and light option, named after your desktop rather than the icon, so pick the one matching your panel. In monochrome the arc length carries the signal instead of the color.
-- **Check for updates.** On by default, and the only setting that permits a network request. When a newer version exists, one row appears in the menu; clicking it opens the release page in your browser. Nothing is ever downloaded or installed for you. Uncheck it and the checks stop.
+- **Check for updates.** On by default, and the only setting that permits a network request. When a newer version exists, one row appears in the menu; clicking it opens the release page in your browser. Nothing is ever downloaded or installed for you. Once you have installed the new version through your package manager, run `claude-usage-tray restart` to switch over to it. Uncheck it and the checks stop.
 
 Settings are saved to `~/.config/claude-usage-tray/config.toml`. If the tray can't write there, the affected menu entries appear grayed out instead of pretending to accept your click.
 

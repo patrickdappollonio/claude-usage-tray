@@ -44,6 +44,11 @@ pub fn entry_path(dir: &Path) -> PathBuf {
 /// executable path is XML-escaped: it comes from `std::env::current_exe`, so
 /// it is whatever the user named the directory they put the binary in, and an
 /// `&` in it must not produce a plist `launchd` refuses to parse.
+///
+/// `--foreground` is passed deliberately: a bare invocation re-executes itself
+/// in the background and exits, and `launchd` would then be supervising a
+/// process that is already gone while the real tray runs outside its
+/// knowledge. Attached, the job `launchd` started is the tray itself.
 pub fn launch_agent_plist(exec: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -56,6 +61,7 @@ pub fn launch_agent_plist(exec: &Path) -> String {
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
          \t\t<string>{exec}</string>\n\
+         \t\t<string>--foreground</string>\n\
          \t</array>\n\
          \t<key>RunAtLoad</key>\n\
          \t<true/>\n\
@@ -177,6 +183,28 @@ mod tests {
             assert!(plist.contains(fragment), "missing {fragment:?}");
         }
         assert!(plist.trim_end().ends_with("</plist>"));
+    }
+
+    /// `launchd` starts the tray directly rather than having it re-execute
+    /// itself into the background, so the job it supervises is the tray and not
+    /// a process that exits at once.
+    #[test]
+    fn the_plist_runs_the_tray_in_the_foreground() {
+        let plist = launch_agent_plist(Path::new("/usr/local/bin/claude-usage-tray"));
+        let arguments = plist
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</array>").next())
+            .expect("a ProgramArguments array");
+        let strings: Vec<&str> = arguments
+            .split("<string>")
+            .skip(1)
+            .filter_map(|piece| piece.split("</string>").next())
+            .collect();
+        assert_eq!(
+            strings,
+            vec!["/usr/local/bin/claude-usage-tray", "--foreground"]
+        );
     }
 
     /// The label is the file name without `.plist`; `launchctl` matches on it,
