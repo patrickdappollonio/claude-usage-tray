@@ -11,10 +11,14 @@
 # a real icon slot, a permission prompt on first use, and a proper entry in
 # System Settings > Notifications.
 #
-# The bundle is signed ad hoc (`codesign -s -`), not with an Apple certificate.
+# Signing is controlled by $SIGN_IDENTITY, which defaults to "-" (ad hoc).
 # Ad-hoc signing is enough to give the bundle the stable code identity the
-# notification framework wants; it is not enough for Gatekeeper, so a directly
-# downloaded copy still needs its quarantine attribute cleared (see the README).
+# notification framework wants; it is not enough for Gatekeeper, so an ad-hoc
+# bundle downloaded directly still needs its quarantine attribute cleared.
+# Release builds pass a real Developer ID Application identity instead (the
+# workflow passes the certificate's SHA-1 hash, which is unambiguous even when
+# several identities share a name), and then the bundle is notarized and
+# stapled by the release workflow so Gatekeeper accepts it untouched.
 #
 # Runs on macOS only: `codesign` and (for the zip step in CI) `ditto` are macOS
 # tools. POSIX sh otherwise, so `sh -n` on Linux can check it in CI.
@@ -36,6 +40,9 @@ EXECUTABLE="claude-usage-tray"
 # floor instead of finding out at runtime. The bare binary has no such limit,
 # because it never reaches that code (see `platform/macos/mod.rs::notify`).
 MIN_MACOS="12.0"
+# "-" is codesign's spelling of an ad-hoc signature, and stays the default so
+# CI branch builds and local runs need no certificate.
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 usage() {
 	echo "usage: $0 <binary> <version> [output-dir]" >&2
@@ -116,10 +123,25 @@ fi
 cp "$BINARY" "$APP/Contents/MacOS/$EXECUTABLE"
 chmod 0755 "$APP/Contents/MacOS/$EXECUTABLE"
 
-# Ad-hoc signature. `--deep` so the copied executable is signed along with the
-# bundle, `--force` so re-running over an existing bundle replaces the old
-# signature instead of failing.
-codesign --force --deep -s - "$APP"
-codesign --verify --verbose=2 "$APP"
+# Signature. No `--deep`: Apple recommends against it and instead wants nested
+# code signed from the inside out ("`--deep` Considered Harmful",
+# https://developer.apple.com/forums/thread/129980). This bundle has no nested
+# code at all — the single main executable is not "nested code", it is the
+# bundle's own code, and signing the bundle signs it. `--force` so re-running
+# over an existing bundle replaces the old signature instead of failing.
+if [ "$SIGN_IDENTITY" = "-" ]; then
+	codesign --force -s - "$APP"
+else
+	# Developer ID distribution, per Apple's signing recipe
+	# (https://developer.apple.com/forums/thread/701514): `--timestamp` for a
+	# secure timestamp and `--options runtime` for the Hardened Runtime, both
+	# of which the notary service requires. No entitlements: the tray needs
+	# none, so the Hardened Runtime's defaults apply as-is.
+	codesign --force --timestamp --options runtime -s "$SIGN_IDENTITY" "$APP"
+fi
+
+# `--strict` is what catches a bundle whose contents drifted from what was
+# signed, rather than merely confirming a signature exists.
+codesign --verify --strict --verbose=2 "$APP"
 
 echo "$APP"

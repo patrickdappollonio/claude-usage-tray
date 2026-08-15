@@ -100,11 +100,10 @@ sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_darwin_<arch>_app.zip
 unzip claude-usage-tray_<version>_darwin_<arch>_app.zip
 mv "Claude Usage Tray.app" /Applications/
-xattr -dr com.apple.quarantine "/Applications/Claude Usage Tray.app"
 open "/Applications/Claude Usage Tray.app"
 ```
 
-This is the same tray, wrapped in a real macOS application, and it is the version to pick if you want notifications that actually show up. The `xattr` line is recursive here (`-dr`, not `-d`) because unzipping a quarantined download marks every file inside the bundle, not just the folder, and one leftover mark is enough for macOS to refuse to open it. There is no Dock icon and no app window: it goes straight to the menu bar, exactly like the bare binary does.
+This is the same tray, wrapped in a real macOS application, and it is the version to pick if you want notifications that actually show up. It opens straight away, with no warning to click through and no `xattr` incantation, because the macOS builds are signed with a Developer ID certificate and notarized by Apple. There is no Dock icon and no app window: it goes straight to the menu bar, exactly like the bare binary does.
 
 The command line still works from inside the bundle. The binary lives at `/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray`, so `hook install` and friends are available if you point at it, and it is worth adding to your `PATH` if you use them often:
 
@@ -117,11 +116,10 @@ The command line still works from inside the bundle. The binary lives at `/Appli
 ```bash
 curl -LO https://github.com/patrickdappollonio/claude-usage-tray/releases/latest/download/claude-usage-tray_<version>_darwin_<arch>.tar.gz
 tar xzf claude-usage-tray_<version>_darwin_<arch>.tar.gz
-xattr -d com.apple.quarantine claude-usage-tray
 sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray
 ```
 
-The `xattr` line is needed because the binaries are not signed with an Apple certificate, so macOS quarantines direct downloads. Homebrew and npm installs skip the quarantine, so there is no extra step there.
+Nothing to unquarantine here either: the macOS binaries are signed with a Developer ID certificate and notarized by Apple, so a direct download runs as it is. Homebrew and npm work exactly as they always did.
 
 Replace `<version>` with the release you want (for example `0.1.0`) and `<arch>` with `amd64` or `arm64`. Every release also carries a `checksums.txt` with SHA-256 sums for each file. Grab any of these from the [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest).
 
