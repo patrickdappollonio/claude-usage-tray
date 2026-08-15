@@ -174,12 +174,12 @@ pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, _tz: &TimeZone) -> 
         },
         SnapshotState::Fresh => match snapshot.written_at {
             Some(at) => match age_secs(at, now) / 60 {
-                0 => "Updated just now".to_string(),
-                1 => "Updated 1 min ago".to_string(),
-                mins if mins < 60 => format!("Updated {mins} min ago"),
-                mins => format!("Updated {} hr ago", mins / 60),
+                0 => "Updated by Claude Code CLI just now".to_string(),
+                1 => "Updated by Claude Code CLI 1 min ago".to_string(),
+                mins if mins < 60 => format!("Updated by Claude Code CLI {mins} min ago"),
+                mins => format!("Updated by Claude Code CLI {} hr ago", mins / 60),
             },
-            None => "Updated recently".to_string(),
+            None => "Updated by Claude Code CLI recently".to_string(),
         },
     }
 }
@@ -1431,25 +1431,25 @@ mod tests {
     #[test]
     fn status_line_fresh_under_a_minute_is_just_now() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated just now");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI just now");
     }
 
     #[test]
     fn status_line_fresh_one_minute_is_singular() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 60));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated 1 min ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI 1 min ago");
     }
 
     #[test]
     fn status_line_fresh_minutes_ago() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 185));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated 3 min ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI 3 min ago");
     }
 
     #[test]
     fn status_line_fresh_with_clock_skew_is_just_now() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE + 30));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated just now");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI just now");
     }
 
     #[test]
@@ -1459,7 +1459,7 @@ mod tests {
         s.weekly = Some(metric(Some(61.0), Some(BASE + 1000)));
         assert_eq!(
             tooltip_text(&s, ts(BASE), &utc()),
-            "Session: 42% · resets 22:30\nWeekly: 61% · resets 22:30\nUpdated just now"
+            "Session: 42% · resets 22:30\nWeekly: 61% · resets 22:30\nUpdated by Claude Code CLI just now"
         );
     }
 
@@ -2368,7 +2368,7 @@ mod tests {
             vec![
                 "Session: 42%",
                 "Weekly: 61%",
-                "Updated 1 min ago",
+                "Updated by Claude Code CLI 1 min ago",
                 "---",
                 "Settings",
                 "Check for new data",
