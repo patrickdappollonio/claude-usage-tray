@@ -475,11 +475,6 @@ jobs:
           ARTIFACTS_DIR: dist/artifacts
         run: node npm/scripts/build_npm_package.mjs
 
-      - name: Upload npm tarball to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/npm/claude-usage-tray-npm-*.tgz
-
       - name: Upload npm package artifact
         uses: actions/upload-artifact@v4
         with:
@@ -545,7 +540,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist && cd dist
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'claude-usage-tray_*' --pattern 'claude-usage-tray-npm-*'
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'claude-usage-tray_*'
           rm -f checksums.txt
           sha256sum claude-usage-tray* | sort -k2 > checksums.txt
           cat checksums.txt
