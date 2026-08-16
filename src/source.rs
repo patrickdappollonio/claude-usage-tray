@@ -17,7 +17,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Freshness classification for a [`UsageSnapshot`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum SnapshotState {
     /// Cache file read and parsed; its mtime is within the staleness window.
     Fresh,
@@ -25,6 +25,7 @@ pub enum SnapshotState {
     /// threshold.
     Stale,
     /// Cache file missing, unreadable, or its JSON could not be parsed.
+    #[default]
     Missing,
 }
 
@@ -42,26 +43,39 @@ pub struct RateLimits {
     pub weekly: Option<Metric>,
 }
 
-/// A point-in-time read of the statusline cache.
-#[derive(Clone, Debug)]
+/// A point-in-time read of the tray's usage sources. Historically this was
+/// the statusline cache alone; it can now also be the merge of that cache
+/// with Claude Code's own `cachedUsageUtilization` blob (see
+/// [`merge_snapshot`] and `appcache.rs`).
+#[derive(Clone, Debug, Default)]
 pub struct UsageSnapshot {
     pub session: Option<Metric>,
     pub weekly: Option<Metric>,
-    /// When Claude Code last wrote the cache — under contract v2 this is the
-    /// cache file's mtime rather than a field inside the file. The name is
-    /// kept because that is still exactly what it means to every reader
-    /// ("Updated 3 min ago", "Last updated 12 h ago").
+    /// Per-model weekly buckets ("Fable at 71%"). Only the app cache carries
+    /// these — a hook-only snapshot always has an empty list.
+    pub scoped: Vec<crate::appcache::ScopedMetric>,
+    /// When Claude Code fetched the app-cache blob the `scoped` rows came
+    /// from. Carried separately from `written_at` because the scoped rows can
+    /// be older than the winning session/weekly source, and the menu says so.
+    pub scoped_fetched_at: Option<jiff::Timestamp>,
+    /// When the winning source last reported — the statusline cache file's
+    /// mtime, or the app cache's `fetchedAtMs`, whichever won the merge. The
+    /// name is kept because that is still exactly what it means to every
+    /// reader ("Updated 3 min ago", "Last updated 12 h ago").
     pub written_at: Option<jiff::Timestamp>,
     pub state: SnapshotState,
+    /// Whether the statusline hook's cache file was missing or unparseable.
+    /// Distinct from `state` now that app-cache data can make the snapshot
+    /// `Fresh` while the hook is still not installed — the "Install hook"
+    /// menu item keys off this, not off `state`.
+    pub hook_missing: bool,
 }
 
 impl UsageSnapshot {
     fn missing() -> Self {
         UsageSnapshot {
-            session: None,
-            weekly: None,
-            written_at: None,
-            state: SnapshotState::Missing,
+            hook_missing: true,
+            ..UsageSnapshot::default()
         }
     }
 }
@@ -189,28 +203,6 @@ pub fn default_kayfabe_path() -> PathBuf {
     crate::config::config_dir().join(KAYFABE_FILE_NAME)
 }
 
-/// Like [`read_snapshot`], but probes `kayfabe_path` first (a cheap stat +
-/// read on every poll tick, so no state to go stale across the process
-/// lifetime):
-///
-/// * kayfabe file absent → completely inert; falls through to the normal
-///   `read_snapshot(path, now)` path, unchanged from today.
-/// * kayfabe file present and readable → its contents go through
-///   [`fake_snapshot`] and *become* the snapshot, real cache ignored.
-/// * kayfabe file present but unreadable (permissions, race, etc.) →
-///   `Missing`, same as a missing real cache would be.
-pub fn read_snapshot_or_kayfabe(
-    path: &Path,
-    kayfabe_path: &Path,
-    now: jiff::Timestamp,
-) -> UsageSnapshot {
-    match std::fs::read_to_string(kayfabe_path) {
-        Ok(body) => fake_snapshot(&body, cache_mtime(kayfabe_path), now),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => read_snapshot(path, now),
-        Err(_) => UsageSnapshot::missing(),
-    }
-}
-
 /// Builds a snapshot from a `kayfabe.json` fixture body. Pure and
 /// unit-testable independent of any filesystem probing.
 ///
@@ -242,7 +234,7 @@ pub fn read_snapshot_or_kayfabe(
 /// or exercised end to end by simply setting `session_resets_in_minutes`
 /// negative alongside `session: 0`.
 ///
-/// Missing/unreadable is handled by the caller ([`read_snapshot_or_kayfabe`]);
+/// Missing/unreadable is handled by the caller ([`read_merged_or_kayfabe`]);
 /// this function only has to decide `Missing` for unparseable JSON.
 pub fn fake_snapshot(
     body: &str,
@@ -279,8 +271,117 @@ pub fn fake_snapshot(
             percent: field_f64("weekly"),
             resets_at: weekly_resets_at,
         }),
+        // An optional staged per-model row: `"fable": 71` puts "Fable" at
+        // 71%, sharing the weekly reset. Anchoring its fetched-at to
+        // `written_at` keeps the "as of" age suffix obeying `age_minutes`
+        // instead of growing while the demo is on screen.
+        scoped: field_f64("fable")
+            .map(|percent| {
+                vec![crate::appcache::ScopedMetric {
+                    name: "Fable".to_string(),
+                    metric: Metric {
+                        percent: Some(percent),
+                        resets_at: weekly_resets_at,
+                    },
+                }]
+            })
+            .unwrap_or_default(),
+        scoped_fetched_at: written_at,
         written_at,
         state: classify(written_at, now),
+        ..UsageSnapshot::default()
+    }
+}
+
+/// The read the tray actually polls. Probes `kayfabe_path` first (a cheap
+/// stat + read on every poll tick, so no state to go stale across the process
+/// lifetime):
+///
+/// * kayfabe file absent → the real path: the statusline hook cache
+///   ([`read_snapshot`]) merged with Claude Code's `.claude.json` usage blob
+///   via [`merge_snapshot`].
+/// * kayfabe file present and readable → its contents go through
+///   [`fake_snapshot`] and *become* the snapshot, both real sources ignored.
+/// * kayfabe file present but unreadable (permissions, race, etc.) →
+///   `Missing`, same as a missing real cache would be.
+pub fn read_merged_or_kayfabe(
+    cache_path: &Path,
+    app_cache_path: &Path,
+    kayfabe_path: &Path,
+    now: jiff::Timestamp,
+) -> UsageSnapshot {
+    match std::fs::read_to_string(kayfabe_path) {
+        Ok(body) => fake_snapshot(&body, cache_mtime(kayfabe_path), now),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => merge_snapshot(
+            read_snapshot(cache_path, now),
+            crate::appcache::read_app_usage(app_cache_path, now),
+            now,
+        ),
+        Err(_) => UsageSnapshot::missing(),
+    }
+}
+
+/// Merges the statusline-hook snapshot with Claude Code's own app-cache
+/// usage blob into the one snapshot the tray displays.
+///
+/// The rule, agreed with the user: freshest source wins, per metric.
+///
+/// * `session`/`weekly`: taken from whichever source reported more recently
+///   (hook mtime vs `fetchedAtMs`); a metric the winner lacks falls back to
+///   the other source rather than disappearing.
+/// * `scoped` (the per-model "Fable" buckets): always from the app cache —
+///   the hook never carries them, so "newest wins" would silently drop them
+///   whenever the hook is fresher, which is nearly always.
+/// * `written_at`/`state`: the winning source's timestamp, classified by the
+///   same staleness rule as before.
+/// * "No data" only when neither source yields anything.
+pub fn merge_snapshot(
+    hook: UsageSnapshot,
+    app: Option<crate::appcache::AppUsage>,
+    now: jiff::Timestamp,
+) -> UsageSnapshot {
+    let Some(app) = app else {
+        return hook;
+    };
+    let hook_missing = hook.state == SnapshotState::Missing;
+
+    // An undated app cache can't win a freshness contest, but a dated one
+    // beats a hook with no known mtime: data of known age over data of none.
+    let app_newer = match (app.fetched_at, hook.written_at) {
+        (Some(app_at), Some(hook_at)) => app_at > hook_at,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let (session, weekly, written_at) = if app_newer {
+        (
+            app.session.or(hook.session),
+            app.weekly.or(hook.weekly),
+            app.fetched_at,
+        )
+    } else {
+        (
+            hook.session.or(app.session),
+            hook.weekly.or(app.weekly),
+            hook.written_at.or(app.fetched_at),
+        )
+    };
+
+    let no_data_at_all =
+        hook_missing && session.is_none() && weekly.is_none() && app.scoped.is_empty();
+    let state = if no_data_at_all {
+        SnapshotState::Missing
+    } else {
+        classify(written_at, now)
+    };
+
+    UsageSnapshot {
+        session,
+        weekly,
+        scoped: app.scoped,
+        scoped_fetched_at: app.fetched_at,
+        written_at,
+        state,
+        hook_missing,
     }
 }
 
@@ -313,6 +414,7 @@ pub fn snapshot_from(
         weekly: limits.weekly,
         written_at,
         state: classify(written_at, now),
+        ..UsageSnapshot::default()
     }
 }
 
@@ -438,6 +540,203 @@ mod tests {
         assert_eq!(snap.state, SnapshotState::Fresh);
         assert_eq!(snap.written_at, None);
         assert!(snap.session.is_some());
+    }
+
+    fn hook_snapshot(written_at: i64, session: f64, weekly: f64) -> UsageSnapshot {
+        UsageSnapshot {
+            session: Some(Metric {
+                percent: Some(session),
+                resets_at: None,
+            }),
+            weekly: Some(Metric {
+                percent: Some(weekly),
+                resets_at: None,
+            }),
+            written_at: Some(ts(written_at)),
+            state: SnapshotState::Fresh,
+            ..UsageSnapshot::default()
+        }
+    }
+
+    fn app_usage(fetched_at: i64, session: f64, weekly: f64) -> crate::appcache::AppUsage {
+        crate::appcache::AppUsage {
+            session: Some(Metric {
+                percent: Some(session),
+                resets_at: None,
+            }),
+            weekly: Some(Metric {
+                percent: Some(weekly),
+                resets_at: None,
+            }),
+            scoped: vec![crate::appcache::ScopedMetric {
+                name: "Fable".to_string(),
+                metric: Metric {
+                    percent: Some(71.0),
+                    resets_at: None,
+                },
+            }],
+            fetched_at: Some(ts(fetched_at)),
+        }
+    }
+
+    const MERGE_NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn merge_prefers_the_app_cache_when_it_is_newer() {
+        let hook = hook_snapshot(MERGE_NOW - 300, 10.0, 40.0);
+        let app = app_usage(MERGE_NOW - 60, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(11.0));
+        assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(47.0));
+        assert_eq!(merged.written_at, Some(ts(MERGE_NOW - 60)));
+        assert_eq!(merged.state, SnapshotState::Fresh);
+        assert!(!merged.hook_missing);
+    }
+
+    #[test]
+    fn merge_prefers_the_hook_when_it_is_newer() {
+        let hook = hook_snapshot(MERGE_NOW - 60, 10.0, 40.0);
+        let app = app_usage(MERGE_NOW - 300, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(10.0));
+        assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(40.0));
+        assert_eq!(merged.written_at, Some(ts(MERGE_NOW - 60)));
+    }
+
+    #[test]
+    fn merge_keeps_the_scoped_rows_even_when_the_hook_wins() {
+        let hook = hook_snapshot(MERGE_NOW - 60, 10.0, 40.0);
+        let app = app_usage(MERGE_NOW - 300, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.scoped.len(), 1);
+        assert_eq!(merged.scoped[0].name, "Fable");
+        assert_eq!(merged.scoped_fetched_at, Some(ts(MERGE_NOW - 300)));
+    }
+
+    #[test]
+    fn merge_falls_back_per_metric_when_the_winner_lacks_one() {
+        // The winning (newer) hook has no weekly window at all; the app
+        // cache's weekly must survive rather than vanish.
+        let mut hook = hook_snapshot(MERGE_NOW - 60, 10.0, 0.0);
+        hook.weekly = None;
+        let app = app_usage(MERGE_NOW - 300, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(10.0));
+        assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(47.0));
+    }
+
+    #[test]
+    fn merge_with_a_missing_hook_uses_the_app_cache_and_flags_the_hook() {
+        let hook = UsageSnapshot::missing();
+        let app = app_usage(MERGE_NOW - 60, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(11.0));
+        assert_eq!(merged.state, SnapshotState::Fresh);
+        assert!(merged.hook_missing);
+    }
+
+    #[test]
+    fn merge_with_no_app_cache_is_the_hook_snapshot() {
+        let hook = hook_snapshot(MERGE_NOW - 60, 10.0, 40.0);
+        let merged = merge_snapshot(hook, None, ts(MERGE_NOW));
+        assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(10.0));
+        assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(40.0));
+        assert!(merged.scoped.is_empty());
+        assert!(!merged.hook_missing);
+    }
+
+    #[test]
+    fn merge_with_neither_source_is_missing() {
+        let merged = merge_snapshot(UsageSnapshot::missing(), None, ts(MERGE_NOW));
+        assert_eq!(merged.state, SnapshotState::Missing);
+        assert!(merged.hook_missing);
+    }
+
+    #[test]
+    fn merge_treats_an_undated_app_cache_as_older_than_any_hook() {
+        let hook = hook_snapshot(MERGE_NOW - 60, 10.0, 40.0);
+        let mut app = app_usage(MERGE_NOW - 300, 11.0, 47.0);
+        app.fetched_at = None;
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(10.0));
+        assert_eq!(merged.written_at, Some(ts(MERGE_NOW - 60)));
+        // The scoped rows still come along; they have no other source.
+        assert_eq!(merged.scoped.len(), 1);
+    }
+
+    #[test]
+    fn merge_classifies_staleness_from_the_winning_timestamp() {
+        // Both sources are old; the fresher of the two is still past the
+        // staleness threshold, so the merged snapshot is Stale, not Fresh.
+        let hook = hook_snapshot(MERGE_NOW - 5000, 10.0, 40.0);
+        let mut hook = hook;
+        hook.state = SnapshotState::Stale;
+        let app = app_usage(MERGE_NOW - 3000, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.written_at, Some(ts(MERGE_NOW - 3000)));
+        assert_eq!(merged.state, SnapshotState::Stale);
+    }
+
+    #[test]
+    fn kayfabe_can_stage_a_fable_row() {
+        let body = r#"{"session": 10, "weekly": 20, "fable": 71}"#;
+        let snap = fake_snapshot(body, Some(ts(MERGE_NOW)), ts(MERGE_NOW));
+        assert_eq!(snap.scoped.len(), 1);
+        assert_eq!(snap.scoped[0].name, "Fable");
+        assert_eq!(snap.scoped[0].metric.percent, Some(71.0));
+        // Anchored to `written_at` so a staged snapshot never grows the
+        // "as of" age suffix while the demo is being looked at.
+        assert_eq!(snap.scoped_fetched_at, snap.written_at);
+    }
+
+    #[test]
+    fn kayfabe_without_a_fable_key_stages_no_scoped_rows() {
+        let snap = fake_snapshot(r#"{"session": 10}"#, Some(ts(MERGE_NOW)), ts(MERGE_NOW));
+        assert!(snap.scoped.is_empty());
+    }
+
+    #[test]
+    fn read_merged_or_kayfabe_merges_the_two_real_files() {
+        let temp = TempDir::new("merged-read");
+        let hook_path = cache_path_in(temp.path());
+        write_cache(
+            &hook_path,
+            br#"{"rate_limits":{"five_hour":{"used_percentage":10}}}"#,
+        )
+        .expect("write hook cache");
+        let app_path = temp.path().join(".claude.json");
+        std::fs::write(
+            &app_path,
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1, "utilization": {"limits": [
+                {"kind": "weekly_scoped", "percent": 71,
+                 "scope": {"model": {"display_name": "Fable"}}}
+            ]}}}"#,
+        )
+        .expect("write app cache");
+        let snap = read_merged_or_kayfabe(
+            &hook_path,
+            &app_path,
+            &temp.path().join("kayfabe.json"),
+            jiff::Timestamp::now(),
+        );
+        assert_eq!(snap.session.as_ref().and_then(|m| m.percent), Some(10.0));
+        assert_eq!(snap.scoped.len(), 1);
+        assert!(!snap.hook_missing);
+    }
+
+    #[test]
+    fn read_merged_or_kayfabe_still_prefers_the_kayfabe_file() {
+        let temp = TempDir::new("merged-kayfabe");
+        let kayfabe = temp.path().join("kayfabe.json");
+        std::fs::write(&kayfabe, r#"{"session": 55, "fable": 71}"#).expect("write kayfabe");
+        let snap = read_merged_or_kayfabe(
+            &cache_path_in(temp.path()),
+            &temp.path().join(".claude.json"),
+            &kayfabe,
+            jiff::Timestamp::now(),
+        );
+        assert_eq!(snap.session.as_ref().and_then(|m| m.percent), Some(55.0));
+        assert_eq!(snap.scoped.len(), 1);
     }
 
     #[test]
@@ -775,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn read_snapshot_or_kayfabe_takes_the_reset_anchor_from_the_file_on_disk() {
+    fn read_merged_or_kayfabe_takes_the_reset_anchor_from_the_file_on_disk() {
         // End to end through the real stat, not just the pure helper.
         let temp = TempDir::new("kayfabe-anchor");
         let cache_path = temp.path().join(CACHE_FILE_NAME); // never created
@@ -786,8 +1085,8 @@ mod tests {
             1_700_000_000,
         );
 
-        let first = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_005));
-        let later = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_305));
+        let first = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_005));
+        let later = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_305));
         assert_eq!(
             first.session.expect("session").resets_at,
             Some(ts(1_700_000_000 + 30 * 60))
@@ -809,19 +1108,19 @@ mod tests {
     }
 
     #[test]
-    fn read_snapshot_or_kayfabe_falls_through_to_real_cache_when_kayfabe_absent() {
+    fn read_merged_or_kayfabe_falls_through_to_real_cache_when_kayfabe_absent() {
         let temp = TempDir::new("kayfabe-absent");
         let body = read_fixture("valid_full.json");
         let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
         let kayfabe_path = temp.path().join("kayfabe.json"); // never created
 
-        let snap = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_000 + 5));
+        let snap = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_000 + 5));
         assert_eq!(snap.state, SnapshotState::Fresh);
         assert_eq!(snap.session.expect("session").percent, Some(42.0));
     }
 
     #[test]
-    fn read_snapshot_or_kayfabe_uses_kayfabe_when_present() {
+    fn read_merged_or_kayfabe_uses_kayfabe_when_present() {
         let temp = TempDir::new("kayfabe-present");
         let body = read_fixture("valid_full.json");
         let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
@@ -829,20 +1128,20 @@ mod tests {
         std::fs::write(&kayfabe_path, r#"{"session": 82}"#).expect("write kayfabe");
 
         let now = ts(1_700_000_000 + 5);
-        let snap = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, now);
+        let snap = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, now);
         // The real cache says 42%; the kayfabe file wins.
         assert_eq!(snap.session.expect("session").percent, Some(82.0));
     }
 
     #[test]
-    fn read_snapshot_or_kayfabe_missing_file_content_yields_missing_state() {
+    fn read_merged_or_kayfabe_missing_file_content_yields_missing_state() {
         let temp = TempDir::new("kayfabe-garbage");
         let body = read_fixture("valid_full.json");
         let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
         let kayfabe_path = temp.path().join("kayfabe.json");
         std::fs::write(&kayfabe_path, "not json").expect("write kayfabe");
 
-        let snap = read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, ts(1_700_000_000 + 5));
+        let snap = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_000 + 5));
         assert_eq!(snap.state, SnapshotState::Missing);
     }
 

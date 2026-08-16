@@ -107,6 +107,35 @@ pub fn weekly_line(metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> St
     metric_line("Weekly", metric, now, tz)
 }
 
+/// `Fable weekly: 71% · resets Wed 10:13` — one per-model bucket from the
+/// app cache, plus ` · as of 2 h ago` once the blob it came from is more than
+/// an hour old. The suffix threshold is deliberately looser than the hook's
+/// 600 s staleness rule: Claude Code only refreshes the blob now and then,
+/// weekly percentages move slowly, and flagging the age on nearly every
+/// render would be noise rather than information.
+pub fn scoped_line(
+    scoped: &crate::appcache::ScopedMetric,
+    fetched_at: Option<Timestamp>,
+    now: Timestamp,
+    tz: &TimeZone,
+) -> String {
+    let line = metric_line(
+        &format!("{} weekly", scoped.name),
+        Some(&scoped.metric),
+        now,
+        tz,
+    );
+    match fetched_at {
+        Some(at) if age_secs(at, now) > SCOPED_AGE_SUFFIX_SECS => {
+            format!("{line} · as of {} ago", humanize_age(age_secs(at, now)))
+        }
+        _ => line,
+    }
+}
+
+/// Age beyond which a scoped row admits how old its data is.
+const SCOPED_AGE_SUFFIX_SECS: i64 = 3600;
+
 fn metric_line(label: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> String {
     let Some(metric) = metric else {
         return format!("{label}: no data");
@@ -169,7 +198,10 @@ pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, _tz: &TimeZone) -> 
         // instruction.
         SnapshotState::Missing => "⚠ Hook not installed — no data".to_string(),
         SnapshotState::Stale => match snapshot.written_at {
-            Some(at) => format!("⚠ Last updated {} ago", humanize_age(age_secs(at, now))),
+            Some(at) => format!(
+                "⚠ Claude Code CLI last reported {} ago",
+                humanize_age(age_secs(at, now))
+            ),
             None => "⚠ Stale".to_string(),
         },
         SnapshotState::Fresh => match snapshot.written_at {
@@ -184,14 +216,18 @@ pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, _tz: &TimeZone) -> 
     }
 }
 
-/// All three menu rows joined with newlines, for the tooltip body.
+/// All the info rows joined with newlines, for the tooltip body: session,
+/// weekly, any per-model scoped rows, then the freshness line.
 pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> String {
-    format!(
-        "{}\n{}\n{}",
+    let mut lines = vec![
         session_line(snapshot.session.as_ref(), now, tz),
         weekly_line(snapshot.weekly.as_ref(), now, tz),
-        status_line(snapshot, now, tz)
-    )
+    ];
+    for scoped in &snapshot.scoped {
+        lines.push(scoped_line(scoped, snapshot.scoped_fetched_at, now, tz));
+    }
+    lines.push(status_line(snapshot, now, tz));
+    lines.join("\n")
 }
 
 /// `Session 7%` / `Session —` — the compact form used in the refresh toast.
@@ -231,7 +267,7 @@ pub fn refresh_message(
             "No new data — Claude Code last reported at {}",
             humanize_reset(at, now, tz)
         ),
-        None => "No new data — Claude Code has not reported yet".to_string(),
+        None => "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update".to_string(),
     }
 }
 
@@ -280,14 +316,25 @@ pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -
         (Some(session), Some(weekly)) => format!("You've used {session} and {weekly}."),
         (Some(session), None) => format!("You've used {session}; weekly usage is unknown."),
         (None, Some(weekly)) => format!("You've used {weekly}; session usage is unknown."),
-        (None, None) => "No usage data reported.".to_string(),
+        (None, None) => "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update.".to_string(),
     };
+
+    for scoped in &snapshot.scoped {
+        if let Some(clause) = status_clause(
+            &format!("{} weekly limit", scoped.name),
+            Some(&scoped.metric),
+            now,
+            tz,
+        ) {
+            sentence.push_str(&format!(" You've used {clause}."));
+        }
+    }
 
     if snapshot.state == SnapshotState::Stale
         && let Some(at) = snapshot.written_at
     {
         sentence.push_str(&format!(
-            " Last updated {} ago.",
+            " Claude Code CLI last reported {} ago.",
             humanize_age(age_secs(at, now))
         ));
     }
@@ -295,11 +342,13 @@ pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -
     sentence
 }
 
-/// Whether the menu should offer the `Install hook` item. Only while there is
-/// no data at all: once the cache exists (even a stale one) the hook is
-/// demonstrably installed and the item would be noise.
-pub fn shows_install_item(state: &SnapshotState) -> bool {
-    *state == SnapshotState::Missing
+/// Whether the menu should offer the `Install hook` item: whenever the
+/// statusline hook's own cache is absent — even if app-cache data is filling
+/// in, because installing the hook would make the tray fresher. Once the hook
+/// cache exists (even a stale one) the hook is demonstrably installed and the
+/// item would be noise.
+pub fn shows_install_item(snapshot: &UsageSnapshot) -> bool {
+    snapshot.hook_missing || snapshot.state == SnapshotState::Missing
 }
 
 /// True when two snapshots differ in anything the tray displays. Used to avoid
@@ -309,6 +358,9 @@ pub fn snapshot_changed(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
         || a.written_at != b.written_at
         || a.session != b.session
         || a.weekly != b.weekly
+        || a.scoped != b.scoped
+        || a.scoped_fetched_at != b.scoped_fetched_at
+        || a.hook_missing != b.hook_missing
 }
 
 /// A threshold crossing the poll loop should turn into a desktop notification.
@@ -800,6 +852,9 @@ pub struct Settings {
     /// Whether the update checker may run, shared with its thread so that
     /// switching the setting off stops the *next* check without a restart.
     check_updates: Arc<AtomicBool>,
+    /// Whether the poll loop may spawn `claude -p "/usage"` to refresh the
+    /// app-cache usage blob; shared the same way so a toggle applies live.
+    cli_refresh: Arc<AtomicBool>,
     /// The release the update checker found, if any.
     update: UpdateHandle,
     /// The replacement binary, once one has been installed under this process.
@@ -818,12 +873,14 @@ impl Settings {
         let notify = NotifyHandle::new(NotifyPrefs::from_config(&config));
         let appearance = AppearanceHandle::new(config.icon_style);
         let check_updates = Arc::new(AtomicBool::new(config.check_updates));
+        let cli_refresh = Arc::new(AtomicBool::new(config.cli_refresh));
         Settings {
             config,
             interval: Arc::new(AtomicU64::new(effective)),
             notify,
             appearance,
             check_updates,
+            cli_refresh,
             update: UpdateHandle::new(),
             restart: RestartHandle::new(),
             env_locked: env_secs.is_some(),
@@ -850,6 +907,11 @@ impl Settings {
     /// switching the setting off takes effect without a restart.
     pub fn check_updates_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.check_updates)
+    }
+
+    /// The flag the poll loop reads before spawning a CLI usage refresh.
+    pub fn cli_refresh_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cli_refresh)
     }
 
     /// Handle for the update-checker thread (which writes it) — the menu reads
@@ -1038,6 +1100,13 @@ impl TrayCore {
     /// every request) but deliberately leaves an already-found update on the
     /// menu: hiding a result the user has already been shown would look like a
     /// bug, and the row is one click away from being acted on.
+    fn toggle_cli_refresh(&mut self) {
+        let enabled = !self.settings.config.cli_refresh;
+        self.settings.config.cli_refresh = enabled;
+        config::save(&self.settings.config);
+        self.settings.cli_refresh.store(enabled, Ordering::Relaxed);
+    }
+
     fn toggle_check_updates(&mut self) {
         let enabled = !self.settings.config.check_updates;
         self.settings.config.check_updates = enabled;
@@ -1062,6 +1131,7 @@ impl TrayCore {
             MenuAction::ToggleThreshold(threshold) => self.toggle_threshold(*threshold),
             MenuAction::ToggleNotifyOnReset => self.toggle_notify_on_reset(),
             MenuAction::ToggleCheckUpdates => self.toggle_check_updates(),
+            MenuAction::ToggleCliRefresh => self.toggle_cli_refresh(),
             MenuAction::RestartToUpdate => self.restart_to_update(),
         }
     }
@@ -1109,9 +1179,17 @@ impl TrayCore {
         let mut rows = vec![
             MenuRow::info(session_line(self.snapshot.session.as_ref(), now, &self.tz)),
             MenuRow::info(weekly_line(self.snapshot.weekly.as_ref(), now, &self.tz)),
-            MenuRow::info(status_line(&self.snapshot, now, &self.tz)),
         ];
-        if shows_install_item(&self.snapshot.state) {
+        for scoped in &self.snapshot.scoped {
+            rows.push(MenuRow::info(scoped_line(
+                scoped,
+                self.snapshot.scoped_fetched_at,
+                now,
+                &self.tz,
+            )));
+        }
+        rows.push(MenuRow::info(status_line(&self.snapshot, now, &self.tz)));
+        if shows_install_item(&self.snapshot) {
             // The one enabled row in the no-data state: everything else here
             // is a label, and a first-run user needs exactly one thing to do.
             rows.push(MenuRow::action("Install hook", MenuAction::InstallHook));
@@ -1224,6 +1302,12 @@ impl TrayCore {
             checked: self.settings.config.check_updates,
             enabled: can_persist,
         });
+        rows.push(MenuRow::Check {
+            label: "Refresh usage via Claude CLI".into(),
+            action: MenuAction::ToggleCliRefresh,
+            checked: self.settings.config.cli_refresh,
+            enabled: can_persist,
+        });
         MenuRow::SubMenu {
             label: "Settings".into(),
             rows,
@@ -1260,6 +1344,7 @@ mod tests {
             weekly: None,
             written_at: written_at.map(ts),
             state,
+            ..UsageSnapshot::default()
         }
     }
 
@@ -1364,10 +1449,113 @@ mod tests {
     }
 
     #[test]
-    fn the_install_item_appears_only_while_there_is_no_data() {
-        assert!(shows_install_item(&SnapshotState::Missing));
-        assert!(!shows_install_item(&SnapshotState::Stale));
-        assert!(!shows_install_item(&SnapshotState::Fresh));
+    fn the_install_item_follows_the_hook_not_the_merged_state() {
+        // No data at all: the classic first-run state.
+        assert!(shows_install_item(&snapshot(SnapshotState::Missing, None)));
+        // Hook installed and reporting: no item.
+        assert!(!shows_install_item(&snapshot(
+            SnapshotState::Fresh,
+            Some(BASE - 30)
+        )));
+        assert!(!shows_install_item(&snapshot(
+            SnapshotState::Stale,
+            Some(BASE - 7200)
+        )));
+        // App-cache data made the snapshot Fresh, but the hook is still not
+        // installed — the item must survive, or the user never finds out the
+        // tray could be fresher.
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.hook_missing = true;
+        assert!(shows_install_item(&s));
+    }
+
+    fn fable(percent: f64, resets_at: Option<i64>) -> crate::appcache::ScopedMetric {
+        crate::appcache::ScopedMetric {
+            name: "Fable".to_string(),
+            metric: metric(Some(percent), resets_at),
+        }
+    }
+
+    #[test]
+    fn scoped_line_reads_like_the_weekly_line() {
+        // BASE is Tue 22:13:20 UTC; +12h -> Wed 10:13.
+        let line = scoped_line(
+            &fable(71.0, Some(BASE + 12 * 3600)),
+            Some(ts(BASE - 30)),
+            ts(BASE),
+            &utc(),
+        );
+        assert_eq!(line, "Fable weekly: 71% · resets Wed 10:13");
+    }
+
+    #[test]
+    fn scoped_line_admits_its_age_past_an_hour() {
+        let line = scoped_line(
+            &fable(71.0, Some(BASE + 12 * 3600)),
+            Some(ts(BASE - 2 * 3600)),
+            ts(BASE),
+            &utc(),
+        );
+        assert_eq!(line, "Fable weekly: 71% · resets Wed 10:13 · as of 2 h ago");
+    }
+
+    #[test]
+    fn scoped_line_under_an_hour_carries_no_age_suffix() {
+        let line = scoped_line(
+            &fable(71.0, Some(BASE + 12 * 3600)),
+            Some(ts(BASE - 1800)),
+            ts(BASE),
+            &utc(),
+        );
+        assert!(!line.contains("as of"), "{line}");
+    }
+
+    #[test]
+    fn tooltip_lists_scoped_rows_between_weekly_and_status() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
+        s.scoped = vec![fable(71.0, Some(BASE + 12 * 3600))];
+        s.scoped_fetched_at = Some(ts(BASE - 30));
+        let tooltip = tooltip_text(&s, ts(BASE), &utc());
+        let lines: Vec<&str> = tooltip.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].starts_with("Weekly:"), "{tooltip}");
+        assert_eq!(lines[2], "Fable weekly: 71% · resets Wed 10:13");
+        assert!(lines[3].starts_with("Updated"), "{tooltip}");
+    }
+
+    #[test]
+    fn status_message_appends_a_sentence_per_scoped_row() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+        s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
+        s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
+        s.scoped = vec![fable(71.0, Some(BASE + 12 * 3600))];
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
+             of your weekly limit (resets Wed 10:13). You've used 71% of your \
+             Fable weekly limit (resets Wed 10:13)."
+        );
+    }
+
+    #[test]
+    fn snapshot_changed_sees_scoped_rows_and_hook_presence() {
+        let base = snapshot(SnapshotState::Fresh, Some(BASE - 30));
+
+        let mut with_scoped = base.clone();
+        with_scoped.scoped = vec![fable(71.0, None)];
+        assert!(snapshot_changed(&base, &with_scoped));
+
+        let mut moved = with_scoped.clone();
+        moved.scoped = vec![fable(72.0, None)];
+        assert!(snapshot_changed(&with_scoped, &moved));
+
+        let mut hookless = base.clone();
+        hookless.hook_missing = true;
+        assert!(snapshot_changed(&base, &hookless));
+
+        assert!(!snapshot_changed(&base, &base.clone()));
     }
 
     #[test]
@@ -1377,42 +1565,42 @@ mod tests {
         let s = snapshot(SnapshotState::Stale, Some(BASE - 11 * 60));
         assert_eq!(
             status_line(&s, ts(BASE), &utc()),
-            "⚠ Last updated 11 min ago"
+            "⚠ Claude Code CLI last reported 11 min ago"
         );
         let s = snapshot(SnapshotState::Stale, Some(BASE - 59 * 60));
         assert_eq!(
             status_line(&s, ts(BASE), &utc()),
-            "⚠ Last updated 59 min ago"
+            "⚠ Claude Code CLI last reported 59 min ago"
         );
     }
 
     #[test]
     fn status_line_stale_switches_to_hours_at_one_hour() {
         let s = snapshot(SnapshotState::Stale, Some(BASE - 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 1 h ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 1 h ago");
         let s = snapshot(SnapshotState::Stale, Some(BASE - 12 * 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 12 h ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 12 h ago");
     }
 
     #[test]
     fn status_line_stale_rounds_hours_to_the_nearest() {
         // 1 h 45 min is "2 h", not "1 h".
         let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 45 * 60)));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 2 h ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 2 h ago");
         // ...and 1 h 10 min still rounds down.
         let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 10 * 60)));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 1 h ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 1 h ago");
     }
 
     #[test]
     fn status_line_stale_switches_to_days_at_forty_eight_hours() {
         // 47 h stays in hours; 48 h is the first "2 d".
         let s = snapshot(SnapshotState::Stale, Some(BASE - 47 * 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 47 h ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 47 h ago");
         let s = snapshot(SnapshotState::Stale, Some(BASE - 48 * 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 2 d ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 2 d ago");
         let s = snapshot(SnapshotState::Stale, Some(BASE - 9 * 86_400));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 9 d ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 9 d ago");
     }
 
     #[test]
@@ -1425,7 +1613,7 @@ mod tests {
     fn status_line_stale_with_clock_skew_does_not_go_negative() {
         // A cache "written in the future" is a skewed clock, not time travel.
         let s = snapshot(SnapshotState::Stale, Some(BASE + 300));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Last updated 0 min ago");
+        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 0 min ago");
     }
 
     #[test]
@@ -1585,7 +1773,8 @@ mod tests {
         assert_eq!(
             status_message(&s, ts(BASE), &utc()),
             "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
-             of your weekly limit (resets Wed 10:13). Last updated 12 h ago."
+             of your weekly limit (resets Wed 10:13). Claude Code CLI last \
+             reported 12 h ago."
         );
     }
 
@@ -1640,7 +1829,10 @@ mod tests {
         // Valid JSON with no `rate_limits` at all (API-key billing): neither
         // window is known, but the hook is demonstrably installed and working.
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
-        assert_eq!(status_message(&s, ts(BASE), &utc()), "No usage data reported.");
+        assert_eq!(
+            status_message(&s, ts(BASE), &utc()),
+            "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update."
+        );
     }
 
     #[test]
@@ -2257,6 +2449,50 @@ mod tests {
     }
 
     #[test]
+    fn the_cli_refresh_flag_starts_from_the_config() {
+        for enabled in [true, false] {
+            let settings = Settings::new(
+                Config {
+                    cli_refresh: enabled,
+                    ..Config::default()
+                },
+                None,
+            );
+            assert_eq!(
+                settings.cli_refresh_handle().load(Ordering::Relaxed),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn the_cli_refresh_row_reflects_the_config() {
+        let (core, _rx) = core_for(
+            timeless(SnapshotState::Fresh),
+            Config {
+                cli_refresh: false,
+                ..Config::default()
+            },
+            None,
+        );
+        let menu = core.menu_with(ts(BASE), all_available());
+        let settings = submenu(&menu, "Settings");
+        let row = settings
+            .iter()
+            .find_map(|row| match row {
+                MenuRow::Check {
+                    label,
+                    checked,
+                    action,
+                    ..
+                } if label == "Refresh usage via Claude CLI" => Some((*checked, action.clone())),
+                _ => None,
+            })
+            .expect("the CLI refresh checkbox exists");
+        assert_eq!(row, (false, MenuAction::ToggleCliRefresh));
+    }
+
+    #[test]
     fn the_update_check_flag_starts_from_the_config() {
         for enabled in [true, false] {
             let settings = Settings::new(
@@ -2356,7 +2592,27 @@ mod tests {
             weekly: Some(metric(Some(61.0), None)),
             written_at: Some(ts(BASE - 60)),
             state,
+            ..UsageSnapshot::default()
         }
+    }
+
+    #[test]
+    fn the_menu_slots_scoped_rows_between_weekly_and_freshness() {
+        let mut snapshot = timeless(SnapshotState::Fresh);
+        snapshot.scoped = vec![fable(71.0, None)];
+        snapshot.scoped_fetched_at = Some(ts(BASE - 60));
+        let (core, _rx) = core_for(snapshot, Config::default(), None);
+        let rows = core.menu_with(ts(BASE), all_available());
+        assert_eq!(
+            &labels(&rows)[..4],
+            &[
+                "Session: 42%",
+                "Weekly: 61%",
+                "Fable weekly: 71%",
+                "Updated by Claude Code CLI 1 min ago",
+            ]
+        );
+        assert!(matches!(rows[2], MenuRow::Info { .. }));
     }
 
     #[test]
@@ -2510,6 +2766,7 @@ mod tests {
                 "<radio>",
                 "---",
                 "Check for updates",
+                "Refresh usage via Claude CLI",
             ]
         );
     }

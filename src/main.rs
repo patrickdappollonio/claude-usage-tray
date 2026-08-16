@@ -26,7 +26,9 @@
 //! summary), "Quit", "Install hook", and interval changes take effect
 //! immediately instead of on the next tick.
 
+mod appcache;
 mod binary;
+mod cli_refresh;
 mod config;
 mod hook;
 mod icon;
@@ -515,6 +517,7 @@ enum PostRead {
 
 fn run_tray() {
     let cache_path = source::default_cache_path();
+    let app_cache_path = appcache::app_cache_path();
     let kayfabe_path = source::default_kayfabe_path();
     let stored = config::load();
     let env_secs = config::env_override(std::env::var("CLAUDE_TRAY_POLL_SECS").ok().as_deref());
@@ -523,6 +526,7 @@ fn run_tray() {
     let notify_prefs = settings.notify_handle();
     let appearance = settings.appearance_handle();
     let check_updates = settings.check_updates_handle();
+    let cli_refresh = settings.cli_refresh_handle();
     let updates = settings.update_handle();
     let restart = settings.restart_handle();
     let tz = TimeZone::system();
@@ -555,7 +559,12 @@ fn run_tray() {
         });
     }
 
-    let snapshot = source::read_snapshot_or_kayfabe(&cache_path, &kayfabe_path, Timestamp::now());
+    let snapshot = source::read_merged_or_kayfabe(
+        &cache_path,
+        &app_cache_path,
+        &kayfabe_path,
+        Timestamp::now(),
+    );
 
     let core = ui::TrayCore::new(snapshot.clone(), settings, wake_tx);
     // Blocks for the rest of the program: on Linux the closure below runs on
@@ -566,8 +575,10 @@ fn run_tray() {
             handle,
             snapshot,
             &cache_path,
+            &app_cache_path,
             &kayfabe_path,
             &wake_rx,
+            &cli_refresh,
             &interval,
             &notify_prefs,
             &tz,
@@ -592,8 +603,10 @@ fn poll_loop(
     handle: platform::TrayHandle,
     mut snapshot: source::UsageSnapshot,
     cache_path: &std::path::Path,
+    app_cache_path: &std::path::Path,
     kayfabe_path: &std::path::Path,
     wake_rx: &mpsc::Receiver<Wake>,
+    cli_refresh: &std::sync::atomic::AtomicBool,
     interval: &std::sync::atomic::AtomicU64,
     notify_prefs: &ui::NotifyHandle,
     tz: &TimeZone,
@@ -605,6 +618,10 @@ fn poll_loop(
     // existed; see `Notifier`.
     let mut notifier = ui::Notifier::new(&notify_prefs.get().thresholds);
     let mut reset_notifier = ui::ResetNotifier::new();
+    // When this process last spawned `claude -p "/usage"`. Process-local on
+    // purpose: an hour-scale cadence does not need to survive restarts, and
+    // the blob's own `fetchedAtMs` already carries the cross-process truth.
+    let mut last_cli_refresh: Option<Timestamp> = None;
 
     loop {
         // Re-read the preferences every cycle so a menu toggle applies live.
@@ -612,6 +629,20 @@ fn poll_loop(
         notifier.set_enabled(&prefs.thresholds);
         if let Some(alert) = notifier.evaluate(snapshot.session.as_ref()) {
             notify(&alert);
+        }
+
+        // Optionally keep Claude Code's usage blob (the per-model rows'
+        // only source) from going stale: at most one headless CLI run per
+        // hour, gated by the settings toggle. The spawn is fire-and-forget;
+        // a later poll tick picks up whatever it wrote.
+        if cli_refresh::should_refresh(
+            cli_refresh.load(Ordering::Relaxed),
+            snapshot.scoped_fetched_at,
+            last_cli_refresh,
+            Timestamp::now(),
+        ) {
+            last_cli_refresh = Some(Timestamp::now());
+            cli_refresh::spawn_refresh();
         }
 
         // Has the program on disk been replaced since this process started? One
@@ -643,8 +674,12 @@ fn poll_loop(
             // re-read reports the fresh one (the reader zeroes a percentage
             // whose `resets_at` has passed), so the icon follows the
             // notification instead of lagging a whole interval behind it.
-            let next =
-                source::read_snapshot_or_kayfabe(cache_path, kayfabe_path, Timestamp::now());
+            let next = source::read_merged_or_kayfabe(
+                cache_path,
+                app_cache_path,
+                kayfabe_path,
+                Timestamp::now(),
+            );
             if ui::snapshot_changed(&snapshot, &next) {
                 handle.set_snapshot(next.clone());
             }
@@ -705,7 +740,12 @@ fn poll_loop(
             break;
         }
 
-        let next = source::read_snapshot_or_kayfabe(cache_path, kayfabe_path, Timestamp::now());
+        let next = source::read_merged_or_kayfabe(
+            cache_path,
+            app_cache_path,
+            kayfabe_path,
+            Timestamp::now(),
+        );
         if ui::snapshot_changed(&snapshot, &next) {
             handle.set_snapshot(next.clone());
         }
