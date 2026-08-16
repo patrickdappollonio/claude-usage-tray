@@ -144,6 +144,10 @@ pub struct Config {
     /// that gates a network request, which is why it is re-read on every
     /// cycle rather than captured at startup.
     pub check_updates: bool,
+    /// Whether the tray may run `claude -p "/usage"` (headless, token-free)
+    /// to refresh Claude Code's own usage blob once it is more than an hour
+    /// old — that blob is the only source of the per-model weekly rows.
+    pub cli_refresh: bool,
 }
 
 impl Default for Config {
@@ -155,6 +159,7 @@ impl Default for Config {
             notify_on_reset: true,
             icon_style: IconStyle::default(),
             check_updates: true,
+            cli_refresh: true,
         }
     }
 }
@@ -275,6 +280,10 @@ pub fn parse_config(body: &str) -> Config {
         notify_on_reset,
         icon_style,
         check_updates,
+        cli_refresh: table
+            .get("cli_refresh")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(defaults.cli_refresh),
     }
 }
 
@@ -290,13 +299,15 @@ pub fn render_config(config: &Config) -> String {
         .join(", ");
     format!(
         "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\n\
-         notify_on_reset = {}\nicon_style = \"{}\"\ncheck_updates = {}\n",
+         notify_on_reset = {}\nicon_style = \"{}\"\ncheck_updates = {}\n\
+         cli_refresh = {}\n",
         config.refresh_secs,
         config.launch_at_login,
         thresholds,
         config.notify_on_reset,
         config.icon_style.as_str(),
-        config.check_updates
+        config.check_updates,
+        config.cli_refresh
     )
 }
 
@@ -404,6 +415,7 @@ mod tests {
                 notify_on_reset: true,
                 icon_style: IconStyle::default(),
                 check_updates: true,
+                cli_refresh: true,
             }
         );
     }
@@ -424,6 +436,7 @@ mod tests {
                 notify_on_reset: false,
                 icon_style: IconStyle::Color,
                 check_updates: false,
+                ..Config::default()
             }
         );
     }
@@ -630,6 +643,25 @@ mod tests {
     }
 
     #[test]
+    fn cli_refresh_defaults_on_and_survives_a_round_trip() {
+        // Same posture as `check_updates`: missing, wrong-typed and
+        // unparseable all mean "leave it on"; explicit false turns it off.
+        assert!(parse_config("").cli_refresh);
+        assert!(parse_config("cli_refresh = 0\n").cli_refresh);
+        assert!(parse_config("cli_refresh = \"no\"\n").cli_refresh);
+        assert!(!parse_config("cli_refresh = false\n").cli_refresh);
+        assert!(parse_config("cli_refresh = true\n").cli_refresh);
+
+        for enabled in [true, false] {
+            let config = Config {
+                cli_refresh: enabled,
+                ..Config::default()
+            };
+            assert_eq!(parse_config(&render_config(&config)), config);
+        }
+    }
+
+    #[test]
     fn render_round_trips_through_parse() {
         let config = Config {
             refresh_secs: 60,
@@ -638,6 +670,7 @@ mod tests {
             notify_on_reset: false,
             icon_style: IconStyle::MonoAuto,
             check_updates: false,
+            cli_refresh: false,
         };
         assert_eq!(parse_config(&render_config(&config)), config);
 
@@ -670,6 +703,7 @@ mod tests {
             notify_on_reset: false,
             icon_style: IconStyle::MonoLight,
             check_updates: false,
+            cli_refresh: false,
         };
         save_to(&path, &config).expect("save succeeds");
         assert!(path.exists());

@@ -459,6 +459,7 @@ mod tests {
             }),
             written_at: None,
             state,
+            ..UsageSnapshot::default()
         }
     }
 
@@ -503,6 +504,7 @@ mod tests {
             weekly: None,
             written_at: None,
             state: SnapshotState::Missing,
+            ..UsageSnapshot::default()
         };
         let icons = render_icons(&snap, IconAppearance::Color);
         let icon = &icons[2]; // 48px: largest, most stable sampling
@@ -708,6 +710,7 @@ mod tests {
             weekly: None,
             written_at: None,
             state: SnapshotState::Missing,
+            ..UsageSnapshot::default()
         };
         let color = render_icons(&snap, IconAppearance::Color);
         for dark_ui in [true, false] {

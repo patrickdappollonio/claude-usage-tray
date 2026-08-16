@@ -40,6 +40,7 @@ pub enum MenuAction {
     ToggleNotifyOnReset,
     /// Flip the daily update check.
     ToggleCheckUpdates,
+    ToggleCliRefresh,
 }
 
 /// Which radio group a selection belongs to.
