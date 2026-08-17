@@ -217,6 +217,11 @@ const DIRECT_LAUNCH_PATIENCE: Duration = Duration::from_millis(300);
 /// lock across the spawn — to exit and release it.
 const CHILD_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the warden re-checks that the lock file it holds is still the
+/// one on disk. Deletion is rare; a minute of exposure is acceptable and the
+/// check is two stats.
+const WARDEN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The least time a just-SIGTERM'd tray is given to exit, even when the
 /// shared restart deadline is already spent. Killing a tray and then waiting
 /// zero milliseconds for it would turn a slow-but-clean exit into a reported
@@ -611,13 +616,28 @@ pub(crate) fn notify_restart_failure(body: &str) {
     let _ = done_rx.recv_timeout(Duration::from_secs(5));
 }
 
+/// Owns the instance lock for the life of the process, healing it if the
+/// lock file is deleted or replaced under us — otherwise a later launch
+/// would see a free path and start a second tray. The thread never returns,
+/// so the lock outlives every other holder of it — which is why the tray no
+/// longer simply leaks the open file.
+fn guard_lock(path: PathBuf, lock: instance::InstanceLock, interval: Duration) {
+    std::thread::spawn(move || {
+        let mut lock = lock;
+        loop {
+            std::thread::sleep(interval);
+            lock = instance::revalidate(&path, lock);
+        }
+    });
+}
+
 /// Takes the single-instance lock, then runs the tray for the life of the
-/// process. The lock is held by leaking the open file: the kernel releases it
-/// when this process ends, however it ends.
+/// process. The lock is held by a warden thread that never returns: the
+/// kernel releases it when this process ends, however it ends.
 fn run_tray_locked(spawned: bool) -> i32 {
     let patience = if spawned { CHILD_LOCK_TIMEOUT } else { DIRECT_LAUNCH_PATIENCE };
     match claim_instance(&instance::lock_path(), &instance::legacy_lock_paths(), patience) {
-        Claim::Held(lock) => lock.hold_forever(),
+        Claim::Held(lock) => guard_lock(instance::lock_path(), lock, WARDEN_INTERVAL),
         Claim::Busy => {
             eprintln!("{ALREADY_RUNNING}");
             return 1;
@@ -1278,6 +1298,18 @@ mod instance_claims {
         let temp = crate::testutil::TempDir::new("verify-down");
         let path = temp.path().join("tray.lock");
         assert!(!verify_replacement(&path, Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn a_guarded_lock_stays_held() {
+        let temp = crate::testutil::TempDir::new("warden-holds");
+        let path = temp.path().join("tray.lock");
+        let lock = crate::instance::try_acquire(&path).expect("acquire").expect("free");
+        // An hour-long interval: the leaked warden thread must never tick during
+        // the test run (it would recreate files under the deleted temp dir).
+        guard_lock(path.clone(), lock, Duration::from_secs(3600));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(crate::instance::try_acquire(&path).expect("probe").is_none());
     }
 }
 

@@ -44,17 +44,10 @@ impl InstanceLock {
         let _ = write_pid(&self._file, std::process::id());
     }
 
-    /// Keeps the lock for the rest of the process, deliberately never closing
-    /// the file. Used by the tray, which holds it until it exits.
-    pub fn hold_forever(self) {
-        std::mem::forget(self);
-    }
-
     /// Whether this lock's open file is still the file at `path`. False after
     /// the lock file has been deleted or replaced under the holder — at which
     /// point the flock, though still held, protects a file nobody else can
     /// see, and a second instance would sail right past it.
-    #[allow(dead_code)] // used from Task 5 on; the allow goes with it
     pub fn matches(&self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Ok(held) = self._file.metadata() else { return false };
@@ -69,7 +62,6 @@ impl InstanceLock {
 /// barrier now, but at that point *this* process is the one whose claim is
 /// ambiguous, so it must not fight; the caller's next revalidation tries
 /// again, and the loss is reported once on stderr.
-#[allow(dead_code)] // used from Task 5 on; the allow goes with it
 pub fn revalidate(path: &Path, lock: InstanceLock) -> InstanceLock {
     if lock.matches(path) {
         return lock;
