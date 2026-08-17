@@ -26,8 +26,9 @@ const LOCK_NAME: &str = "claude-usage-tray.lock";
 /// long as this value — which, in the tray, is the whole process.
 #[derive(Debug)]
 pub struct InstanceLock {
-    // Never read: the point is the file staying open. `flock` is released by
-    // the close that `File`'s `Drop` performs.
+    // Read only to compare identity with the on-disk file; the load-bearing
+    // part is it staying open, since `flock` is released by the close that
+    // `File`'s `Drop` performs.
     _file: File,
 }
 
@@ -47,6 +48,49 @@ impl InstanceLock {
     /// the file. Used by the tray, which holds it until it exits.
     pub fn hold_forever(self) {
         std::mem::forget(self);
+    }
+
+    /// Whether this lock's open file is still the file at `path`. False after
+    /// the lock file has been deleted or replaced under the holder — at which
+    /// point the flock, though still held, protects a file nobody else can
+    /// see, and a second instance would sail right past it.
+    #[allow(dead_code)] // used from Task 5 on; the allow goes with it
+    pub fn matches(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(held) = self._file.metadata() else { return false };
+        let Ok(on_disk) = std::fs::metadata(path) else { return false };
+        held.dev() == on_disk.dev() && held.ino() == on_disk.ino()
+    }
+}
+
+/// Hands back a lock that is actually visible at `path`, re-acquiring if the
+/// file was deleted or replaced under the current one. When somebody else
+/// already took the fresh file, the original lock is kept — worthless as a
+/// barrier now, but at that point *this* process is the one whose claim is
+/// ambiguous, so it must not fight; the caller's next revalidation tries
+/// again, and the loss is reported once on stderr.
+#[allow(dead_code)] // used from Task 5 on; the allow goes with it
+pub fn revalidate(path: &Path, lock: InstanceLock) -> InstanceLock {
+    if lock.matches(path) {
+        return lock;
+    }
+    match try_acquire(path) {
+        Ok(Some(fresh)) => {
+            fresh.record_pid();
+            fresh
+        }
+        _ => {
+            // Not eprintln!: a panicking write on a piped stderr would take
+            // the warden thread — and the lock — down with it.
+            use std::io::Write as _;
+            let _ = writeln!(
+                io::stderr(),
+                "claude-usage-tray: the lock file at {} was replaced under this instance \
+                 and could not be re-taken; another instance may now be running",
+                path.display()
+            );
+            lock
+        }
     }
 }
 
@@ -102,27 +146,77 @@ pub fn terminate(pid: i32) -> bool {
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Polls until the lock at `path` can be taken (releasing it again
-/// immediately), or `timeout` elapses. True means the previous holder is gone.
-pub fn wait_until_free(path: &Path, timeout: std::time::Duration) -> bool {
+/// What a create-nothing look at a lock path found.
+#[allow(dead_code)] // used from Task 3 on; the allow goes with it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// Somebody holds the flock right now.
+    Held,
+    /// Nothing holds it — including "the file does not even exist".
+    Free,
+    /// The file exists but could not be opened or locked, so there is no
+    /// answer. Callers decide how much benefit of the doubt that gets.
+    Unknown,
+}
+
+/// Asks whether the lock at `path` is held, creating nothing on disk.
+///
+/// Unlike [`try_acquire`] this never creates the file or its directory —
+/// essential for the legacy-path checks, which would otherwise re-create the
+/// very file the lock moved away from, forever. It is *not* contention-free:
+/// distinguishing Free from Held means taking `LOCK_EX` for a moment, which
+/// is why single-shot claimants were retired (see the launch patience
+/// constants in main.rs).
+#[allow(dead_code)] // used from Task 3 on; the allow goes with it
+pub fn probe_held(path: &Path) -> Probe {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Probe::Free,
+        Err(_) => return Probe::Unknown,
+    };
+    // SAFETY: `flock` takes a file descriptor and a flag word and touches
+    // nothing else; the descriptor is live for the whole call. (LOCK_EX does
+    // not require a writable descriptor.)
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // Taking it proved it free; dropping `file` releases it again.
+        return Probe::Free;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Probe::Held,
+        _ => Probe::Unknown,
+    }
+}
+
+/// Polls [`try_acquire`] until the lock is won, an I/O error says waiting
+/// will not help, or `timeout` passes (`Ok(None)`). A zero timeout is a
+/// single immediate attempt.
+///
+/// This is how a freshly spawned tray tolerates its own parent: `detach` and
+/// `restart` hold the lock *through* the spawn precisely so concurrent
+/// launches serialize on the file, which means the child's first attempts may
+/// find its parent still holding on for a few more milliseconds.
+#[allow(dead_code)] // used from Task 3 on; the allow goes with it
+pub fn acquire_with_retry(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<Option<InstanceLock>> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match try_acquire(path) {
-            // Taking it and dropping it straight away is the probe: something
-            // has to actually be able to lock the file for it to be free.
-            Ok(Some(lock)) => {
-                drop(lock);
-                return true;
-            }
-            // Unlockable for a reason that waiting will not fix.
-            Err(_) => return false,
-            Ok(None) => {}
+        if let Some(lock) = try_acquire(path)? {
+            return Ok(Some(lock));
         }
         if std::time::Instant::now() >= deadline {
-            return false;
+            return Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// Polls until the lock at `path` can be taken (releasing it again
+/// immediately), or `timeout` elapses. True means the previous holder is gone.
+pub fn wait_until_free(path: &Path, timeout: std::time::Duration) -> bool {
+    matches!(acquire_with_retry(path, timeout), Ok(Some(_)))
 }
 
 /// Picks the directory the lock file lives in, given what the platform
@@ -325,6 +419,101 @@ mod tests {
         let empty = temp.path().join("empty.lock");
         std::fs::write(&empty, b"").expect("write empty");
         assert_eq!(read_pid(&empty), None);
+    }
+
+    #[test]
+    fn probing_reports_held_free_and_missing_without_creating_anything() {
+        let temp = TempDir::new("instance-probe");
+        let path = temp.path().join("nested").join("tray.lock");
+        assert_eq!(probe_held(&path), Probe::Free);
+        assert!(!path.parent().unwrap().exists(), "a probe must not create directories");
+
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        assert_eq!(probe_held(&path), Probe::Held);
+        drop(held);
+        assert_eq!(probe_held(&path), Probe::Free);
+    }
+
+    #[test]
+    fn a_retrying_acquire_gets_the_lock_when_the_holder_leaves() {
+        let temp = TempDir::new("instance-retry-succeeds");
+        let path = temp.path().join("tray.lock");
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                // Handshake: the holder must still be holding when the retry
+                // starts, or this degrades into a plain try_acquire test.
+                ready_tx.send(()).expect("send");
+                acquire_with_retry(&path, std::time::Duration::from_secs(10))
+            })
+        };
+        ready_rx.recv().expect("recv");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+        let lock = handle.join().expect("join").expect("io ok");
+        assert!(lock.is_some(), "the retry must win once the holder is gone");
+    }
+
+    #[test]
+    fn a_retrying_acquire_gives_up_when_the_holder_stays() {
+        let temp = TempDir::new("instance-retry-gives-up");
+        let path = temp.path().join("tray.lock");
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        let lock = acquire_with_retry(&path, std::time::Duration::from_millis(250)).expect("io ok");
+        assert!(lock.is_none());
+        drop(held);
+    }
+
+    #[test]
+    fn a_zero_timeout_acquire_is_a_single_immediate_attempt() {
+        let temp = TempDir::new("instance-retry-zero");
+        let path = temp.path().join("tray.lock");
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        let started = std::time::Instant::now();
+        let lock = acquire_with_retry(&path, std::time::Duration::ZERO).expect("io ok");
+        assert!(lock.is_none());
+        // Discriminates "no sleep" from "one 100ms sleep" with room for a loaded
+        // machine; the filesystem work itself is microseconds on a local disk.
+        assert!(started.elapsed() < std::time::Duration::from_millis(90), "must not sleep");
+        drop(held);
+    }
+
+    #[test]
+    fn a_held_lock_matches_its_path_until_the_file_is_replaced() {
+        let temp = TempDir::new("instance-matches");
+        let path = temp.path().join("tray.lock");
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        assert!(held.matches(&path));
+        std::fs::remove_file(&path).expect("delete out from under the holder");
+        assert!(!held.matches(&path));
+        drop(held);
+    }
+
+    #[test]
+    fn revalidating_a_deleted_lock_takes_a_fresh_one_and_records_the_pid() {
+        let temp = TempDir::new("instance-revalidate");
+        let path = temp.path().join("tray.lock");
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        std::fs::remove_file(&path).expect("delete out from under the holder");
+
+        let renewed = revalidate(&path, held);
+        assert!(renewed.matches(&path), "the returned lock must be on the current file");
+        assert_eq!(read_pid(&path), Some(std::process::id() as i32));
+        // The fresh lock must actually be held.
+        assert!(try_acquire(&path).expect("probe").is_none());
+        drop(renewed);
+    }
+
+    #[test]
+    fn revalidating_an_intact_lock_changes_nothing() {
+        let temp = TempDir::new("instance-revalidate-noop");
+        let path = temp.path().join("tray.lock");
+        let held = try_acquire(&path).expect("acquire").expect("free");
+        let same = revalidate(&path, held);
+        assert!(same.matches(&path));
+        drop(same);
     }
 
     #[test]
