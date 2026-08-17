@@ -142,14 +142,21 @@ pub fn check() -> Option<Update> {
     is_newer(&version, current_version()).then_some(Update { version, url })
 }
 
-/// Opens a release page in the user's browser via `xdg-open`, detached.
+/// The platform's own "hand this URL to the default browser" command:
+/// `open` on macOS, `xdg-open` everywhere else.
+#[cfg(target_os = "macos")]
+const OPENER: &str = "open";
+#[cfg(not(target_os = "macos"))]
+const OPENER: &str = "xdg-open";
+
+/// Opens a release page in the user's browser via [`OPENER`], detached.
 ///
 /// Spawned and deliberately never waited on: this is called from the poll
 /// loop, and a browser that takes seconds to start (or an `xdg-open` that is
 /// not installed at all) must not stall it. A failure to spawn is silent for
 /// the same reason every other optional integration here is.
 pub fn open_url(url: &str) {
-    let _ = std::process::Command::new("xdg-open")
+    let _ = std::process::Command::new(OPENER)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -319,6 +326,17 @@ mod tests {
         // the whole feature, so pin the invariant here rather than finding out
         // from a user who never sees an update.
         assert!(numeric_triple(current_version()).is_some());
+    }
+
+    #[test]
+    fn the_url_opener_is_the_platform_native_command() {
+        // `xdg-open` does not exist on macOS, so a click on the update row
+        // there must reach for `open` instead — this silently did nothing on
+        // macOS for as long as the command was hardcoded.
+        #[cfg(target_os = "macos")]
+        assert_eq!(OPENER, "open");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(OPENER, "xdg-open");
     }
 
     #[test]
