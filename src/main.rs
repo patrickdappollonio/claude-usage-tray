@@ -188,8 +188,23 @@ const BACKGROUNDED: &str =
 const ALREADY_RUNNING: &str =
     "claude-usage-tray is already running (run 'claude-usage-tray restart' to replace it)";
 
-/// How long `restart` waits for the old instance to let go of the lock.
+/// How long `restart` waits for the old instance to let go of the lock: the
+/// overall deadline for clearing the way.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long `restart` waits to see the replacement actually holding the lock
+/// before declaring the restart failed. Generous: the child spends up to
+/// [`CHILD_LOCK_TIMEOUT`] just waiting out its own parent.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Exit code of `restart` meaning "this failed, and the failure was already
+/// shown to the user as a notification from this process". The watching tray
+/// (if one survives) must not toast the same failure again; code 1 means the
+/// opposite — nobody has reported it, so the watcher should. Deliberately
+/// not 2: that is this binary's usage-error code, and an older binary that
+/// does not know the `restart` subcommand exits 2 after printing usage — a
+/// failure that must be reported, not mistaken for "already reported".
+pub(crate) const EXIT_RESTART_REPORTED: i32 = 3;
 
 /// How long a direct launch (`claude-usage-tray`, `--foreground`) tries for
 /// the lock before concluding another instance runs. Not a single attempt:
@@ -276,7 +291,6 @@ enum ClearFailure {
 
 /// Stops whatever holds a pre-move lock at `path`, creating nothing.
 /// `Ok(signalled)` reports whether a SIGTERM was actually sent.
-#[allow(dead_code)] // used from Task 4 on; the allow goes with it
 fn clear_legacy(path: &Path, deadline: Instant) -> Result<bool, ClearFailure> {
     match instance::probe_held(path) {
         instance::Probe::Free => return Ok(false),
@@ -335,7 +349,6 @@ fn clear_legacy(path: &Path, deadline: Instant) -> Result<bool, ClearFailure> {
 /// Clears the primary lock path and ends *holding* it (PID recorded), so the
 /// gap between "the old tray is gone" and "the replacement is spawned" is
 /// never an unlocked one. `Ok((None, _))` means the lock file is unusable.
-#[allow(dead_code)] // used from Task 4 on; the allow goes with it
 fn clear_and_hold_primary(
     path: &Path,
     deadline: Instant,
@@ -489,50 +502,113 @@ fn spawn_background(held: Option<instance::InstanceLock>) -> Result<(), String> 
     }
 }
 
-/// The `restart` subcommand: stop whatever instance is running, then start a
-/// fresh one in the background.
+/// The `restart` subcommand: stop whatever instance is running — at the
+/// current lock path or a pre-move legacy one — then start a fresh tray and
+/// stay alive long enough to confirm it is really up.
 ///
-/// This is what makes an upgrade a one-liner. The newly installed binary
-/// cannot simply start — the old process still holds the lock — and asking
-/// people to hunt for a PID is a poor answer, so the tool does the hunting: the
-/// lock file carries the running instance's PID, and the lock itself is the
-/// proof that the PID is live.
+/// Reporting is split by who is alive (D1). While no SIGTERM has been sent,
+/// the tray that spawned this process is alive by construction, reads this
+/// process's stderr, and raises the toast on exit code 1. Once *any* SIGTERM
+/// is out — or an after-kill timeout says the target may or may not die at
+/// any moment — the toast comes from here, before the stderr write (D6: the
+/// pipe may be dead), and the exit code becomes [`EXIT_RESTART_REPORTED`] so
+/// a surviving watcher stays silent instead of duplicating it.
 fn run_restart() -> i32 {
-    let path = instance::lock_path();
-    match instance::try_acquire(&path) {
-        // Nothing running: "restart" is just "start".
-        Ok(Some(lock)) => drop(lock),
-        Err(_) => {}
-        Ok(None) => {
-            let Some(pid) = instance::read_pid(&path) else {
-                eprintln!(
-                    "claude-usage-tray: another instance is running but did not record its \
-                     process id, so it cannot be stopped from here; quit it from its tray menu \
-                     and try again"
-                );
-                return 1;
-            };
-            if !instance::terminate(pid) {
-                eprintln!("claude-usage-tray: could not stop the running instance (pid {pid})");
-                return 1;
-            }
-            if !instance::wait_until_free(&path, RESTART_TIMEOUT) {
-                eprintln!(
-                    "claude-usage-tray: the running instance (pid {pid}) did not exit; nothing \
-                     was started"
-                );
-                return 1;
-            }
-            println!("claude-usage-tray: stopped the running instance (pid {pid})");
+    let deadline = Instant::now() + RESTART_TIMEOUT;
+    let mut killed = false;
+    for legacy in instance::legacy_lock_paths() {
+        match clear_legacy(&legacy, deadline) {
+            Ok(signalled) => killed |= signalled,
+            Err(failure) => return report_restart_failure(failure, killed),
         }
     }
-    match spawn_background(None) {
-        Ok(()) => 0,
-        Err(message) => {
-            say(&message);
-            1
+    let primary = instance::lock_path();
+    let held = match clear_and_hold_primary(&primary, deadline) {
+        Ok((held, signalled)) => {
+            killed |= signalled;
+            held
         }
+        Err(failure) => return report_restart_failure(failure, killed),
+    };
+    let verifiable = held.is_some();
+    if let Err(message) = spawn_background(held) {
+        return report_failure_text(&message, killed);
     }
+    // An unusable lock file means nothing can ever hold it: verification
+    // would time out against a replacement that is running fine.
+    if verifiable && !verify_replacement(&primary, VERIFY_TIMEOUT) {
+        return report_failure_text(
+            "the new tray did not come up; check that the new binary runs",
+            killed,
+        );
+    }
+    0
+}
+
+/// Routes a clearing failure to whoever can still see it. `killed` is
+/// whether any SIGTERM was issued *earlier* in this run — an `AfterKill`
+/// failure implies one was issued inside the failing call itself.
+fn report_restart_failure(failure: ClearFailure, killed: bool) -> i32 {
+    match failure {
+        ClearFailure::BeforeKill(message) => report_failure_text(&message, killed),
+        ClearFailure::AfterKill(message) => report_failure_text(&message, true),
+    }
+}
+
+/// Reports a restart failure and returns the exit code that tells a
+/// surviving watcher whether it has been reported already. Toast before
+/// stderr: once a kill happened, the stderr pipe may have no reader (D6).
+fn report_failure_text(message: &str, reported_here: bool) -> i32 {
+    if reported_here {
+        notify_restart_failure(message);
+        say(message);
+        EXIT_RESTART_REPORTED
+    } else {
+        say(message);
+        1
+    }
+}
+
+/// Polls until *somebody* holds the lock at `path` — the replacement tray
+/// announcing itself — or gives up. Uses [`instance::probe_held`] because it
+/// creates nothing: `try_acquire` would manufacture the very file it is
+/// checking for. ("Somebody" rather than "my grandchild" is deliberate: if a
+/// concurrent restart's tray won instead, the user still has exactly one
+/// tray, which is the outcome being verified.)
+fn verify_replacement(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match instance::probe_held(path) {
+            instance::Probe::Held => return true,
+            instance::Probe::Free | instance::Probe::Unknown => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Raises the "Could not restart to update" toast. Time-bounded: on macOS a
+/// notification attempt from a short-lived process with no run loop could
+/// otherwise wedge this process open forever — the bound turns "maybe no
+/// toast" into the worst case instead of "a stuck process". When the sender
+/// thread is still busy at the deadline, returning lets the process exit,
+/// which reaps it.
+pub(crate) fn notify_restart_failure(body: &str) {
+    let toast = Toast {
+        summary: "Could not restart to update".to_string(),
+        body: body.to_string(),
+        urgency: Urgency::Normal,
+        // Worth scrolling back to, exactly like the threshold alerts.
+        transient: false,
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        platform::notify(&toast, Channel::Ephemeral);
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(Duration::from_secs(5));
 }
 
 /// Takes the single-instance lock, then runs the tray for the life of the
@@ -1175,6 +1251,33 @@ mod instance_claims {
             Err(ClearFailure::BeforeKill(_))
         ));
         drop(held);
+    }
+
+    #[test]
+    fn verification_sees_a_replacement_that_takes_the_lock() {
+        let temp = crate::testutil::TempDir::new("verify-up");
+        let path = temp.path().join("tray.lock");
+        let handle = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                // Retry rather than a single shot: verify_replacement's own probe
+                // holds LOCK_EX for an instant, and colliding with it must not
+                // fail the test.
+                crate::instance::acquire_with_retry(&path, Duration::from_secs(5))
+                    .expect("io ok")
+                    .expect("the lock must be winnable")
+            })
+        };
+        assert!(verify_replacement(&path, Duration::from_secs(10)));
+        drop(handle.join().expect("join"));
+    }
+
+    #[test]
+    fn verification_gives_up_when_nothing_ever_takes_the_lock() {
+        let temp = crate::testutil::TempDir::new("verify-down");
+        let path = temp.path().join("tray.lock");
+        assert!(!verify_replacement(&path, Duration::from_millis(300)));
     }
 }
 

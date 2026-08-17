@@ -104,23 +104,35 @@ fn write_pid(mut file: &File, pid: u32) -> io::Result<()> {
     file.flush()
 }
 
-/// Starts `exe arg` as a detached child: standard streams on `/dev/null` and a
-/// process group of its own, so it outlives the terminal (or the tray) that
-/// started it.
-///
-/// The single place that spelling lives, because two callers need exactly the
-/// same one: the parent that backgrounds the tray, and the `Restart to update`
-/// menu row that starts the newly installed binary's `restart`.
-pub fn spawn_detached(exe: &Path, arg: &str) -> io::Result<std::process::Child> {
+/// The one spelling of "run `exe arg` detached": own process group, stdio on
+/// `/dev/null`. [`spawn_detached`] and [`spawn_watched`] both build on it.
+fn detached_command(exe: &Path, arg: &str) -> std::process::Command {
     use std::os::unix::process::CommandExt;
-
-    std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg(arg)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    command
+}
+
+/// Starts `exe arg` fully detached, all standard streams on `/dev/null`.
+/// Used by the parent that backgrounds the tray; the `Restart to update`
+/// menu row uses [`spawn_watched`] instead, keeping the child's stderr.
+pub fn spawn_detached(exe: &Path, arg: &str) -> io::Result<std::process::Child> {
+    detached_command(exe, arg).spawn()
+}
+
+/// Like [`spawn_detached`], but with the child's stderr piped back so the
+/// caller can learn *why* a restart failed. The caller owns reaping the
+/// child (`wait_with_output`) — a dropped `Child` here would be a zombie per
+/// click of the restart row.
+pub fn spawn_watched(exe: &Path, arg: &str) -> io::Result<std::process::Child> {
+    let mut command = detached_command(exe, arg);
+    command.stderr(std::process::Stdio::piped());
+    command.spawn()
 }
 
 /// Parses the contents of a lock file into a PID.
@@ -208,12 +220,6 @@ pub fn acquire_with_retry(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-}
-
-/// Polls until the lock at `path` can be taken (releasing it again
-/// immediately), or `timeout` elapses. True means the previous holder is gone.
-pub fn wait_until_free(path: &Path, timeout: std::time::Duration) -> bool {
-    matches!(acquire_with_retry(path, timeout), Ok(Some(_)))
 }
 
 /// Picks the directory the lock file lives in, given what the platform
@@ -513,21 +519,22 @@ mod tests {
     }
 
     #[test]
-    fn waiting_returns_immediately_when_the_lock_is_free() {
-        let temp = TempDir::new("instance-wait-free");
-        let path = temp.path().join("tray.lock");
-        let started = std::time::Instant::now();
-        assert!(wait_until_free(&path, std::time::Duration::from_secs(10)));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    }
+    fn a_watched_spawn_pipes_stderr_and_can_be_reaped() {
+        let temp = TempDir::new("instance-watched");
+        let script = temp.path().join("fail.sh");
+        std::fs::write(&script, "#!/bin/sh\necho boom >&2\nexit 4\n").expect("write script");
+        crate::testutil::set_mode(&script, 0o755);
 
-    #[test]
-    fn waiting_gives_up_when_the_lock_stays_held() {
-        let temp = TempDir::new("instance-wait-held");
-        let path = temp.path().join("tray.lock");
-        let held = try_acquire(&path).expect("acquire").expect("free");
-        assert!(!wait_until_free(&path, std::time::Duration::from_millis(250)));
-        drop(held);
+        let child = match spawn_watched(&script, "unused") {
+            Ok(child) => child,
+            // A noexec temp mount cannot run the fixture; that is the host's
+            // shape, not a defect in spawn_watched.
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("spawn failed: {err}"),
+        };
+        let output = child.wait_with_output().expect("wait");
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "boom");
     }
 
     /// Signalling a PID that no longer exists is success: the end state the
