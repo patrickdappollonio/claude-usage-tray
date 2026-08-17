@@ -3,16 +3,16 @@
 //! Two copies of the tray would draw two icons, emit every notification twice,
 //! and fight over the same config file, so the second one refuses to start.
 //!
-//! The mechanism is `flock(2)` on a file in the runtime directory, held open
-//! for the life of the process. That choice is deliberate: a lock taken this
-//! way is owned by the *open file description*, so the kernel drops it when the
-//! process exits, however it exits. A PID file would need stale-entry cleanup
-//! after a crash or a kill -9; this needs none, and a leftover lock file on
-//! disk means nothing on its own.
+//! The mechanism is `flock(2)` on a file in a per-user directory
+//! ([`lock_path`]), held open for the life of the process. That choice is
+//! deliberate: a lock taken this way is owned by the *open file description*,
+//! so the kernel drops it when the process exits, however it exits. A PID file
+//! would need stale-entry cleanup after a crash or a kill -9; this needs none,
+//! and a leftover lock file on disk means nothing on its own.
 //!
 //! Both supported platforms are Unix, so there is a single implementation. The
 //! path is a parameter rather than a constant so the tests can lock inside a
-//! temp directory instead of the developer's real runtime directory.
+//! temp directory instead of the developer's real per-user directory.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -125,16 +125,55 @@ pub fn wait_until_free(path: &Path, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Where the lock file lives: the per-user runtime directory when the platform
-/// has one (`$XDG_RUNTIME_DIR` on Linux — tmpfs, wiped between logins, exactly
-/// what runtime state is for), otherwise the cache directory, otherwise the
-/// system temp directory. macOS has no runtime directory, so it lands in
-/// `~/Library/Caches`.
+/// Picks the directory the lock file lives in, given what the platform
+/// offers. Pure so both platform branches are testable from either OS.
+///
+/// Linux: the per-user runtime directory (`$XDG_RUNTIME_DIR` — tmpfs, wiped
+/// between logins, exactly what runtime state is for), then cache, then temp.
+/// macOS: `~/Library/Application Support`, then temp — deliberately *not*
+/// `~/Library/Caches`, which macOS may purge under disk pressure. A purged
+/// lock file would let a second tray start while the first still runs.
+fn choose_lock_dir(
+    macos: bool,
+    runtime: Option<PathBuf>,
+    data_local: Option<PathBuf>,
+    cache: Option<PathBuf>,
+    temp: PathBuf,
+) -> PathBuf {
+    if macos {
+        data_local.unwrap_or(temp)
+    } else {
+        runtime.or(cache).unwrap_or(temp)
+    }
+}
+
+/// Directories earlier releases kept the lock in. A freshly upgraded binary
+/// must still notice — and be able to stop — a tray from before the move, or
+/// "Restart to update" would start a second instance during the one upgrade
+/// that crosses the move.
+fn choose_legacy_lock_dirs(macos: bool, cache: Option<PathBuf>) -> Vec<PathBuf> {
+    if macos { cache.into_iter().collect() } else { Vec::new() }
+}
+
+/// Where the lock file lives. See [`choose_lock_dir`] for the reasoning.
 pub fn lock_path() -> PathBuf {
-    dirs::runtime_dir()
-        .or_else(dirs::cache_dir)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(LOCK_NAME)
+    choose_lock_dir(
+        cfg!(target_os = "macos"),
+        dirs::runtime_dir(),
+        dirs::data_local_dir(),
+        dirs::cache_dir(),
+        std::env::temp_dir(),
+    )
+    .join(LOCK_NAME)
+}
+
+/// Lock files earlier releases may still be holding. Empty on Linux.
+#[allow(dead_code)] // used from Task 3 on; the allow goes with it
+pub fn legacy_lock_paths() -> Vec<PathBuf> {
+    choose_legacy_lock_dirs(cfg!(target_os = "macos"), dirs::cache_dir())
+        .into_iter()
+        .map(|dir| dir.join(LOCK_NAME))
+        .collect()
 }
 
 /// Tries to take the lock at `path`.
@@ -322,5 +361,72 @@ mod tests {
         let path = lock_path();
         assert_eq!(path.file_name().unwrap(), LOCK_NAME);
         assert!(path.parent().is_some());
+    }
+
+    #[test]
+    fn the_lock_dir_on_macos_prefers_application_support_over_caches() {
+        // ~/Library/Caches is purgeable on macOS: a purged lock file would let a
+        // second tray start. Application Support is not.
+        let dir = choose_lock_dir(
+            true,
+            None, // macOS has no runtime dir
+            Some(PathBuf::from("/u/Library/Application Support")),
+            Some(PathBuf::from("/u/Library/Caches")),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(dir, PathBuf::from("/u/Library/Application Support"));
+    }
+
+    #[test]
+    fn the_lock_dir_on_macos_falls_back_to_temp_when_data_local_is_unknown() {
+        let dir = choose_lock_dir(
+            true,
+            None,
+            None,
+            Some(PathBuf::from("/u/Library/Caches")),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(dir, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn the_lock_dir_on_linux_is_unchanged_runtime_then_cache_then_temp() {
+        let runtime = Some(PathBuf::from("/run/user/1000"));
+        let cache = Some(PathBuf::from("/u/.cache"));
+        let data = Some(PathBuf::from("/u/.local/share"));
+        assert_eq!(
+            choose_lock_dir(false, runtime, data.clone(), cache.clone(), PathBuf::from("/tmp")),
+            PathBuf::from("/run/user/1000")
+        );
+        assert_eq!(
+            choose_lock_dir(false, None, data, cache, PathBuf::from("/tmp")),
+            PathBuf::from("/u/.cache")
+        );
+        assert_eq!(
+            choose_lock_dir(false, None, None, None, PathBuf::from("/tmp")),
+            PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn legacy_lock_dirs_exist_only_on_macos_and_point_at_caches() {
+        assert_eq!(
+            choose_legacy_lock_dirs(true, Some(PathBuf::from("/u/Library/Caches"))),
+            vec![PathBuf::from("/u/Library/Caches")]
+        );
+        assert!(choose_legacy_lock_dirs(true, None).is_empty());
+        assert!(choose_legacy_lock_dirs(false, Some(PathBuf::from("/u/.cache"))).is_empty());
+    }
+
+    #[test]
+    fn legacy_lock_paths_join_the_lock_name_onto_each_legacy_dir() {
+        // Exercised through the pure chooser so the assertion runs on Linux too,
+        // where legacy_lock_paths() itself is empty.
+        let paths: Vec<PathBuf> = choose_legacy_lock_dirs(true, Some(PathBuf::from("/u/Library/Caches")))
+            .into_iter()
+            .map(|dir| dir.join(LOCK_NAME))
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("/u/Library/Caches").join(LOCK_NAME)]);
+        assert!(legacy_lock_paths().iter().all(|p| p.file_name().unwrap() == LOCK_NAME));
     }
 }
