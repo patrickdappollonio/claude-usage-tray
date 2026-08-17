@@ -44,9 +44,11 @@ mod update;
 use jiff::{Timestamp, tz::TimeZone};
 use platform::{Channel, Toast, Urgency};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
+use std::time::Instant;
 use ui::{ResetAlert, UsageAlert, Wake};
 
 /// Builds the toast for a threshold crossing. Split out from [`notify`] so
@@ -189,14 +191,203 @@ const ALREADY_RUNNING: &str =
 /// How long `restart` waits for the old instance to let go of the lock.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a direct launch (`claude-usage-tray`, `--foreground`) tries for
+/// the lock before concluding another instance runs. Not a single attempt:
+/// the create-nothing probes other processes run take LOCK_EX momentarily,
+/// and one collision must not misread "held" — or worse, act on a stale PID
+/// left behind in a free lock file.
+const DIRECT_LAUNCH_PATIENCE: Duration = Duration::from_millis(300);
+
+/// How long a freshly spawned tray waits for its parent — which holds the
+/// lock across the spawn — to exit and release it.
+const CHILD_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The least time a just-SIGTERM'd tray is given to exit, even when the
+/// shared restart deadline is already spent. Killing a tray and then waiting
+/// zero milliseconds for it would turn a slow-but-clean exit into a reported
+/// failure.
+const POST_KILL_FLOOR: Duration = Duration::from_secs(2);
+
+/// Writes a diagnostic line to stderr, swallowing write failures. On the
+/// restart path stderr is a pipe into the old tray; once that tray is gone
+/// the pipe has no reader and a bare `eprintln!` would abort this process on
+/// the very line meant to explain the failure.
+fn say(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "claude-usage-tray: {message}");
+}
+
+/// The outcome of trying to become *the* instance.
+enum Claim {
+    /// This process now holds the lock (PID recorded). Keep it alive for as
+    /// long as being the instance matters.
+    Held(instance::InstanceLock),
+    /// Another instance is (or may be) running — here or at a pre-move
+    /// legacy path.
+    Busy,
+    /// The lock file is unusable (read-only directory, say). Not a reason to
+    /// keep the user from running the tray.
+    Unlockable,
+}
+
+/// Takes the primary lock and checks the legacy paths, in that order.
+///
+/// The PID is recorded the instant the lock is taken: a held lock whose file
+/// still names a previous holder would invite `restart` to signal a stale —
+/// possibly recycled — PID. (A hole the width of the acquire-to-record gap
+/// remains; it was previously the width of the whole spawn.) A legacy path
+/// that cannot be checked but names a PID counts as running: the only reason
+/// to look there is that an old tray might be holding it.
+fn claim_instance(primary: &Path, legacy: &[PathBuf], patience: Duration) -> Claim {
+    let lock = match instance::acquire_with_retry(primary, patience) {
+        Ok(Some(lock)) => {
+            lock.record_pid();
+            Some(lock)
+        }
+        Ok(None) => return Claim::Busy,
+        Err(_) => None,
+    };
+    for path in legacy {
+        match instance::probe_held(path) {
+            instance::Probe::Held => return Claim::Busy,
+            instance::Probe::Free => {}
+            instance::Probe::Unknown => {
+                if instance::read_pid(path).is_some() {
+                    return Claim::Busy;
+                }
+                say(&format!("could not check the old lock at {}", path.display()));
+            }
+        }
+    }
+    match lock {
+        Some(lock) => Claim::Held(lock),
+        None => Claim::Unlockable,
+    }
+}
+
+/// A failure to clear a lock path, split by whether a SIGTERM had already
+/// been issued: before the kill the old tray is alive to report the failure
+/// (it reads this process's stderr); after the kill only this process can.
+#[derive(Debug, PartialEq, Eq)]
+enum ClearFailure {
+    BeforeKill(String),
+    AfterKill(String),
+}
+
+/// Stops whatever holds a pre-move lock at `path`, creating nothing.
+/// `Ok(signalled)` reports whether a SIGTERM was actually sent.
+#[allow(dead_code)] // used from Task 4 on; the allow goes with it
+fn clear_legacy(path: &Path, deadline: Instant) -> Result<bool, ClearFailure> {
+    match instance::probe_held(path) {
+        instance::Probe::Free => return Ok(false),
+        instance::Probe::Unknown => {
+            // The one probe answer that must not mean "go ahead": the only
+            // reason to look here is that an old tray might be holding it.
+            return match instance::read_pid(path) {
+                Some(_) => Err(ClearFailure::BeforeKill(format!(
+                    "an older instance may still be running (lock: {}), but it cannot \
+                     be checked from here; quit it from its tray menu and try again",
+                    path.display()
+                ))),
+                None => {
+                    say(&format!("could not check the old lock at {}", path.display()));
+                    Ok(false)
+                }
+            };
+        }
+        instance::Probe::Held => {}
+    }
+    let Some(pid) = instance::read_pid(path) else {
+        return Err(ClearFailure::BeforeKill(
+            "another instance is running but did not record its process id, so it \
+             cannot be stopped from here; quit it from its tray menu and try again"
+                .to_string(),
+        ));
+    };
+    if !instance::terminate(pid) {
+        return Err(ClearFailure::BeforeKill(format!(
+            "could not stop the running instance (pid {pid})"
+        )));
+    }
+    // From here on the failure mode changes owner: a SIGTERM is out, so the
+    // tray it went to may no longer be around to report anything. The floor
+    // keeps an exhausted deadline from turning a clean-but-slow exit into a
+    // reported failure (D9).
+    let deadline = deadline.max(Instant::now() + POST_KILL_FLOOR);
+    loop {
+        match instance::probe_held(path) {
+            instance::Probe::Free => break,
+            // Unknown is not "gone": a transiently unreadable lock must not
+            // let a still-running tray be declared stopped.
+            instance::Probe::Held | instance::Probe::Unknown => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(ClearFailure::AfterKill(format!(
+                "the running instance (pid {pid}) did not exit; nothing was started"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    say(&format!("stopped the running instance (pid {pid})"));
+    Ok(true)
+}
+
+/// Clears the primary lock path and ends *holding* it (PID recorded), so the
+/// gap between "the old tray is gone" and "the replacement is spawned" is
+/// never an unlocked one. `Ok((None, _))` means the lock file is unusable.
+#[allow(dead_code)] // used from Task 4 on; the allow goes with it
+fn clear_and_hold_primary(
+    path: &Path,
+    deadline: Instant,
+) -> Result<(Option<instance::InstanceLock>, bool), ClearFailure> {
+    match instance::acquire_with_retry(path, DIRECT_LAUNCH_PATIENCE) {
+        Ok(Some(lock)) => {
+            lock.record_pid();
+            return Ok((Some(lock), false));
+        }
+        Err(_) => return Ok((None, false)),
+        Ok(None) => {}
+    }
+    let Some(pid) = instance::read_pid(path) else {
+        return Err(ClearFailure::BeforeKill(
+            "another instance is running but did not record its process id, so it \
+             cannot be stopped from here; quit it from its tray menu and try again"
+                .to_string(),
+        ));
+    };
+    if !instance::terminate(pid) {
+        return Err(ClearFailure::BeforeKill(format!(
+            "could not stop the running instance (pid {pid})"
+        )));
+    }
+    // The floor keeps an exhausted deadline from meaning "kill, then wait
+    // zero milliseconds" (D9).
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(POST_KILL_FLOOR);
+    match instance::acquire_with_retry(path, remaining) {
+        Ok(Some(lock)) => {
+            lock.record_pid();
+            say(&format!("stopped the running instance (pid {pid})"));
+            Ok((Some(lock), true))
+        }
+        Ok(None) => Err(ClearFailure::AfterKill(format!(
+            "the running instance (pid {pid}) did not exit; nothing was started"
+        ))),
+        Err(_) => Ok((None, true)),
+    }
+}
+
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// Bare invocation: re-exec into the background and return the terminal.
     Detach,
     /// Run the tray in this process (`--foreground`, or the private flag the
-    /// detaching parent uses).
-    Foreground,
+    /// detaching parent uses). `spawned` distinguishes the two: a child that
+    /// was just spawned waits out its parent's hold on the lock, while a
+    /// user's own `--foreground` beside a running tray is answered promptly.
+    Foreground { spawned: bool },
     /// Replace whichever instance is running.
     Restart,
     Statusline,
@@ -207,8 +398,12 @@ enum Mode {
 fn parse_mode(args: &[String]) -> Mode {
     match args.first().map(String::as_str) {
         None => Mode::Detach,
-        Some(flag) if flag == FOREGROUND_FLAG && args.len() == 1 => Mode::Foreground,
-        Some(flag) if flag == RUN_FOREGROUND_FLAG && args.len() == 1 => Mode::Foreground,
+        Some(flag) if flag == FOREGROUND_FLAG && args.len() == 1 => {
+            Mode::Foreground { spawned: false }
+        }
+        Some(flag) if flag == RUN_FOREGROUND_FLAG && args.len() == 1 => {
+            Mode::Foreground { spawned: true }
+        }
         Some(command) if command == RESTART_COMMAND && args.len() == 1 => Mode::Restart,
         Some("statusline") => Mode::Statusline,
         Some("hook") => Mode::Hook,
@@ -220,7 +415,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match parse_mode(&args) {
         Mode::Detach => detach(),
-        Mode::Foreground => run_tray_locked(),
+        Mode::Foreground { spawned } => run_tray_locked(spawned),
         Mode::Restart => run_restart(),
         // Never detached, and never single-instanced: both are synchronous
         // commands the user (or Claude Code) is waiting on the exit of, and
@@ -248,43 +443,49 @@ fn main() {
 /// would be invisible; doing it in the parent is what makes "already running"
 /// something the user actually reads, with a nonzero exit to match.
 fn detach() -> i32 {
-    match instance::try_acquire(&instance::lock_path()) {
-        Ok(None) => {
+    // The claim is handed to spawn_background, which holds it across the
+    // spawn. The child retries the lock until this process releases it, so
+    // concurrent launches serialize on the lock file instead of slipping
+    // through a probe-then-spawn gap.
+    let held = match claim_instance(
+        &instance::lock_path(),
+        &instance::legacy_lock_paths(),
+        DIRECT_LAUNCH_PATIENCE,
+    ) {
+        Claim::Busy => {
             eprintln!("{ALREADY_RUNNING}");
             return 1;
         }
-        // Free: release it again immediately so the child can take it. The
-        // gap is a race only against another launch in the same instant, and
-        // the child's own check is what closes it.
-        Ok(Some(lock)) => drop(lock),
-        // The lock file is unusable (read-only runtime directory, say). Not a
-        // reason to refuse to run the tray.
-        Err(_) => {}
+        Claim::Held(lock) => Some(lock),
+        Claim::Unlockable => None,
+    };
+    match spawn_background(held) {
+        Ok(()) => 0,
+        Err(message) => {
+            say(&message);
+            1
+        }
     }
-    spawn_background()
 }
 
-/// Spawns the detached child and reports it. Split from [`detach`] so
-/// `restart` can reuse it after clearing the way.
-fn spawn_background() -> i32 {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            eprintln!("claude-usage-tray: cannot determine my own path: {err}");
-            return 1;
-        }
-    };
+/// Spawns the detached child and reports it. `held` is the instance lock the
+/// caller kept across the clearing of the way; it is released the moment the
+/// spawn has happened, deliberately *before* the stdout write — a stalled
+/// stdout reader must not keep the lock from the child, which only retries
+/// for a few seconds. Failures come back as text: the caller knows whether a
+/// human, a pipe, or a toast is listening.
+fn spawn_background(held: Option<instance::InstanceLock>) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("cannot determine my own path: {err}"))?;
     // Detached in its own process group, so closing the terminal (or a Ctrl-C
     // meant for whatever the user runs next) does not take the tray with it.
     match instance::spawn_detached(&exe, RUN_FOREGROUND_FLAG) {
         Ok(_) => {
+            drop(held);
             println!("{BACKGROUNDED}");
-            0
+            Ok(())
         }
-        Err(err) => {
-            eprintln!("claude-usage-tray: could not start in the background: {err}");
-            1
-        }
+        Err(err) => Err(format!("could not start in the background: {err}")),
     }
 }
 
@@ -325,23 +526,27 @@ fn run_restart() -> i32 {
             println!("claude-usage-tray: stopped the running instance (pid {pid})");
         }
     }
-    spawn_background()
+    match spawn_background(None) {
+        Ok(()) => 0,
+        Err(message) => {
+            say(&message);
+            1
+        }
+    }
 }
 
 /// Takes the single-instance lock, then runs the tray for the life of the
 /// process. The lock is held by leaking the open file: the kernel releases it
 /// when this process ends, however it ends.
-fn run_tray_locked() -> i32 {
-    match instance::try_acquire(&instance::lock_path()) {
-        Ok(Some(lock)) => {
-            lock.record_pid();
-            lock.hold_forever();
-        }
-        Ok(None) => {
+fn run_tray_locked(spawned: bool) -> i32 {
+    let patience = if spawned { CHILD_LOCK_TIMEOUT } else { DIRECT_LAUNCH_PATIENCE };
+    match claim_instance(&instance::lock_path(), &instance::legacy_lock_paths(), patience) {
+        Claim::Held(lock) => lock.hold_forever(),
+        Claim::Busy => {
             eprintln!("{ALREADY_RUNNING}");
             return 1;
         }
-        Err(_) => {}
+        Claim::Unlockable => {}
     }
     run_tray();
     0
@@ -787,10 +992,16 @@ mod command_line {
         assert_eq!(mode(&[]), Mode::Detach);
     }
 
+    /// Both run the tray here; they differ only in `spawned`, which is what
+    /// decides how long the lock is waited for — a spawned child waits out
+    /// its parent, a user's own `--foreground` does not.
     #[test]
     fn the_foreground_flag_and_the_private_flag_both_run_here() {
-        assert_eq!(mode(&["--foreground"]), Mode::Foreground);
-        assert_eq!(mode(&["__run-foreground"]), Mode::Foreground);
+        assert_eq!(mode(&["--foreground"]), Mode::Foreground { spawned: false });
+        assert_eq!(
+            mode(&["__run-foreground"]),
+            Mode::Foreground { spawned: true }
+        );
     }
 
     #[test]
@@ -842,6 +1053,128 @@ mod command_line {
     fn the_background_notice_mentions_how_to_stay_attached() {
         assert!(BACKGROUNDED.contains("running in the background"));
         assert!(BACKGROUNDED.contains(FOREGROUND_FLAG));
+    }
+}
+
+#[cfg(test)]
+mod instance_claims {
+    use super::*;
+
+    #[test]
+    fn claiming_records_this_process_pid_the_moment_the_lock_is_taken() {
+        let temp = crate::testutil::TempDir::new("claim-pid");
+        let primary = temp.path().join("tray.lock");
+        let claim = claim_instance(&primary, &[], Duration::ZERO);
+        let Claim::Held(lock) = claim else { panic!("expected Held") };
+        assert_eq!(crate::instance::read_pid(&primary), Some(std::process::id() as i32));
+        drop(lock);
+    }
+
+    #[test]
+    fn claiming_refuses_when_the_primary_lock_is_held() {
+        let temp = crate::testutil::TempDir::new("claim-primary-busy");
+        let primary = temp.path().join("tray.lock");
+        let held = crate::instance::try_acquire(&primary).expect("acquire").expect("free");
+        assert!(matches!(claim_instance(&primary, &[], Duration::ZERO), Claim::Busy));
+        drop(held);
+    }
+
+    #[test]
+    fn claiming_refuses_when_a_legacy_lock_is_held_and_releases_the_primary() {
+        let temp = crate::testutil::TempDir::new("claim-legacy-busy");
+        let primary = temp.path().join("tray.lock");
+        let legacy = temp.path().join("legacy.lock");
+        let old_tray = crate::instance::try_acquire(&legacy).expect("acquire").expect("free");
+        assert!(matches!(
+            claim_instance(&primary, std::slice::from_ref(&legacy), Duration::ZERO),
+            Claim::Busy
+        ));
+        // The primary taken during the refused claim must have been released.
+        assert!(crate::instance::try_acquire(&primary).expect("probe").is_some());
+        drop(old_tray);
+    }
+
+    #[test]
+    fn claiming_ignores_a_legacy_path_that_does_not_exist_and_creates_nothing() {
+        let temp = crate::testutil::TempDir::new("claim-legacy-absent");
+        let primary = temp.path().join("tray.lock");
+        let legacy = temp.path().join("caches").join("legacy.lock");
+        let claim = claim_instance(&primary, std::slice::from_ref(&legacy), Duration::ZERO);
+        assert!(matches!(claim, Claim::Held(_)));
+        assert!(!legacy.exists(), "probing must not resurrect the legacy file");
+    }
+
+    #[test]
+    fn clearing_a_free_or_absent_legacy_path_is_a_no_op() {
+        let temp = crate::testutil::TempDir::new("clear-legacy-free");
+        let legacy = temp.path().join("legacy.lock");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(clear_legacy(&legacy, deadline), Ok(false));
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn clearing_a_legacy_holder_that_ignores_the_signal_times_out_after_the_kill() {
+        let temp = crate::testutil::TempDir::new("clear-legacy-deaf");
+        let legacy = temp.path().join("legacy.lock");
+        let held = crate::instance::try_acquire(&legacy).expect("acquire").expect("free");
+        // A PID that does not exist: terminate() reports success (ESRCH), but the
+        // lock stays held by this test, so waiting must time out. Writing the file
+        // does not release the flock — the lock lives on `held`'s descriptor.
+        std::fs::write(&legacy, b"2147483632\n").expect("write pid");
+        let deadline = Instant::now() + Duration::from_millis(200);
+        assert!(matches!(clear_legacy(&legacy, deadline), Err(ClearFailure::AfterKill(_))));
+        drop(held);
+    }
+
+    #[test]
+    fn clearing_a_legacy_holder_with_no_recorded_pid_fails_before_any_kill() {
+        let temp = crate::testutil::TempDir::new("clear-legacy-no-pid");
+        let legacy = temp.path().join("legacy.lock");
+        let held = crate::instance::try_acquire(&legacy).expect("acquire").expect("free");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(matches!(clear_legacy(&legacy, deadline), Err(ClearFailure::BeforeKill(_))));
+        drop(held);
+    }
+
+    #[test]
+    fn holding_the_primary_when_it_is_free_records_the_pid_and_keeps_the_lock() {
+        let temp = crate::testutil::TempDir::new("hold-primary-free");
+        let primary = temp.path().join("tray.lock");
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let (held, signalled) = clear_and_hold_primary(&primary, deadline).expect("no error");
+        assert!(!signalled);
+        let held = held.expect("a lock");
+        assert_eq!(crate::instance::read_pid(&primary), Some(std::process::id() as i32));
+        assert!(crate::instance::try_acquire(&primary).expect("probe").is_none(), "still held");
+        drop(held);
+    }
+
+    #[test]
+    fn holding_the_primary_against_a_deaf_holder_times_out_after_the_kill() {
+        let temp = crate::testutil::TempDir::new("hold-primary-deaf");
+        let primary = temp.path().join("tray.lock");
+        let held = crate::instance::try_acquire(&primary).expect("acquire").expect("free");
+        std::fs::write(&primary, b"2147483632\n").expect("write pid");
+        let deadline = Instant::now() + Duration::from_millis(600);
+        assert!(matches!(
+            clear_and_hold_primary(&primary, deadline),
+            Err(ClearFailure::AfterKill(_))
+        ));
+        drop(held);
+    }
+
+    #[test]
+    fn holding_the_primary_against_a_holder_with_no_pid_fails_before_any_kill() {
+        let temp = crate::testutil::TempDir::new("hold-primary-no-pid");
+        let primary = temp.path().join("tray.lock");
+        let held = crate::instance::try_acquire(&primary).expect("acquire").expect("free");
+        let deadline = Instant::now() + Duration::from_millis(600);
+        assert!(matches!(
+            clear_and_hold_primary(&primary, deadline),
+            Err(ClearFailure::BeforeKill(_))
+        ));
+        drop(held);
     }
 }
 

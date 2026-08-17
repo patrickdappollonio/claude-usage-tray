@@ -147,7 +147,6 @@ pub fn terminate(pid: i32) -> bool {
 }
 
 /// What a create-nothing look at a lock path found.
-#[allow(dead_code)] // used from Task 3 on; the allow goes with it
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Probe {
     /// Somebody holds the flock right now.
@@ -167,7 +166,6 @@ pub enum Probe {
 /// distinguishing Free from Held means taking `LOCK_EX` for a moment, which
 /// is why single-shot claimants were retired (see the launch patience
 /// constants in main.rs).
-#[allow(dead_code)] // used from Task 3 on; the allow goes with it
 pub fn probe_held(path: &Path) -> Probe {
     let file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
@@ -196,7 +194,6 @@ pub fn probe_held(path: &Path) -> Probe {
 /// `restart` hold the lock *through* the spawn precisely so concurrent
 /// launches serialize on the file, which means the child's first attempts may
 /// find its parent still holding on for a few more milliseconds.
-#[allow(dead_code)] // used from Task 3 on; the allow goes with it
 pub fn acquire_with_retry(
     path: &Path,
     timeout: std::time::Duration,
@@ -262,7 +259,6 @@ pub fn lock_path() -> PathBuf {
 }
 
 /// Lock files earlier releases may still be holding. Empty on Linux.
-#[allow(dead_code)] // used from Task 3 on; the allow goes with it
 pub fn legacy_lock_paths() -> Vec<PathBuf> {
     choose_legacy_lock_dirs(cfg!(target_os = "macos"), dirs::cache_dir())
         .into_iter()
