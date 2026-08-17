@@ -517,12 +517,10 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\necho boom >&2\nexit 4\n").expect("write script");
         crate::testutil::set_mode(&script, 0o755);
 
-        let child = match spawn_watched(&script, "unused") {
-            Ok(child) => child,
-            // A noexec temp mount cannot run the fixture; that is the host's
-            // shape, not a defect in spawn_watched.
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("spawn failed: {err}"),
+        // A noexec temp mount cannot run the fixture; that is the host's
+        // shape, not a defect in spawn_watched.
+        let Some(child) = crate::testutil::spawn_script(|| spawn_watched(&script, "unused")) else {
+            return;
         };
         let output = child.wait_with_output().expect("wait");
         assert_eq!(output.status.code(), Some(4));

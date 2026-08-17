@@ -32,6 +32,31 @@ pub fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("set mode");
 }
 
+/// Spawns a just-written script fixture, absorbing the two host-shaped ways
+/// that spawn can fail.
+///
+/// `ETXTBSY` is the interesting one: another test's `fork` can inherit the
+/// write handle this thread's `fs::write` already closed, and for the width of
+/// that child's fork→exec window the kernel sees the script as open for
+/// writing and refuses to exec it. Nothing in the fixture is wrong, so retry
+/// briefly instead of failing the suite. `PermissionDenied` means a `noexec`
+/// temp mount that can never run the fixture, so the caller skips.
+pub fn spawn_script(
+    mut spawn: impl FnMut() -> std::io::Result<std::process::Child>,
+) -> Option<std::process::Child> {
+    for _ in 0..20 {
+        match spawn() {
+            Ok(child) => return Some(child),
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("spawn failed: {err}"),
+        }
+    }
+    panic!("spawn stayed ETXTBSY after 20 attempts");
+}
+
 /// Sets the modification time of `path` to `secs` since the epoch. Used by the
 /// binary-swap tests to move an mtime deliberately instead of hoping the clock
 /// ticks between two writes.

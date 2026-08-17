@@ -1160,15 +1160,26 @@ impl TrayCore {
             return;
         };
         std::thread::spawn(move || {
+            // The toast goes out before the stderr line, and the stderr write
+            // cannot panic: under `--foreground` the reader on that pipe may
+            // already be gone, and a panicking write would take the toast with
+            // it.
+            use std::io::Write as _;
             match crate::instance::spawn_watched(&exe, crate::RESTART_COMMAND) {
                 Ok(child) => watch_restart(child, |body| {
-                    eprintln!("claude-usage-tray: restart to update failed: {body}");
                     crate::notify_restart_failure(&body);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "claude-usage-tray: restart to update failed: {body}"
+                    );
                 }),
                 Err(err) => {
                     let body = format!("could not start the new binary: {err}");
-                    eprintln!("claude-usage-tray: restart to update failed: {body}");
                     crate::notify_restart_failure(&body);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "claude-usage-tray: restart to update failed: {body}"
+                    );
                 }
             }
         });
@@ -3003,10 +3014,10 @@ mod tests {
         crate::testutil::set_mode(&script, 0o755);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let child = match crate::instance::spawn_watched(&script, "unused") {
-            Ok(child) => child,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("spawn failed: {err}"),
+        let Some(child) = crate::testutil::spawn_script(|| {
+            crate::instance::spawn_watched(&script, "unused")
+        }) else {
+            return;
         };
         watch_restart(child, move |body| tx.send(body).expect("send"));
         let body = rx
@@ -3026,10 +3037,10 @@ mod tests {
         crate::testutil::set_mode(&script, 0o755);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let child = match crate::instance::spawn_watched(&script, "unused") {
-            Ok(child) => child,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("spawn failed: {err}"),
+        let Some(child) = crate::testutil::spawn_script(|| {
+            crate::instance::spawn_watched(&script, "unused")
+        }) else {
+            return;
         };
         watch_restart(child, move |body| tx.send(body).expect("send"));
         assert!(
@@ -3046,10 +3057,10 @@ mod tests {
         crate::testutil::set_mode(&script, 0o755);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let child = match crate::instance::spawn_watched(&script, "unused") {
-            Ok(child) => child,
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(err) => panic!("spawn failed: {err}"),
+        let Some(child) = crate::testutil::spawn_script(|| {
+            crate::instance::spawn_watched(&script, "unused")
+        }) else {
+            return;
         };
         watch_restart(child, move |body| tx.send(body).expect("send"));
         assert!(

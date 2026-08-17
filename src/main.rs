@@ -500,7 +500,9 @@ fn spawn_background(held: Option<instance::InstanceLock>) -> Result<(), String> 
     match instance::spawn_detached(&exe, RUN_FOREGROUND_FLAG) {
         Ok(_) => {
             drop(held);
-            println!("{BACKGROUNDED}");
+            // The tray is already up; a dead stdout reader must not turn this
+            // last courtesy line into an abort.
+            let _ = writeln!(std::io::stdout(), "{BACKGROUNDED}");
             Ok(())
         }
         Err(err) => Err(format!("could not start in the background: {err}")),
