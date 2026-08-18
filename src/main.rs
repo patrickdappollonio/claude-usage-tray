@@ -30,6 +30,7 @@ mod appcache;
 mod binary;
 mod cli_refresh;
 mod config;
+mod greeting;
 mod hook;
 mod icon;
 mod instance;
@@ -118,6 +119,51 @@ fn binary_swapped_toast() -> (Toast, Channel) {
         },
         Channel::Ephemeral,
     )
+}
+
+/// Builds the toast shown once, on the app's very first launch. Its real job
+/// on macOS is to trigger the system notification-permission prompt right
+/// after install (see [`greeting`]); the friendly wording is the excuse.
+/// Normal urgency and not transient: a once-ever hello is worth surviving in
+/// notification history. Ephemeral, so it never competes with a threshold
+/// alert for the replaceable slot.
+fn welcome_toast() -> (Toast, Channel) {
+    (
+        Toast {
+            summary: "Claude usage tray".to_string(),
+            body: "Hooray! 🎉 The tray is up and running — you'll get an alert \
+                   here when your Claude usage nears its limits."
+                .to_string(),
+            urgency: Urgency::Normal,
+            transient: false,
+        },
+        Channel::Ephemeral,
+    )
+}
+
+/// Builds the toast shown once after an upgrade. Low urgency and transient,
+/// like [`refresh_toast`]: routine good news that should not pile up in
+/// notification history.
+fn updated_toast(version: &str) -> (Toast, Channel) {
+    (
+        Toast {
+            summary: "Claude usage tray".to_string(),
+            body: format!("Updated to v{version}."),
+            urgency: Urgency::Low,
+            transient: true,
+        },
+        Channel::Ephemeral,
+    )
+}
+
+/// Emits the first-launch or post-upgrade greeting, if this launch earned one.
+fn notify_greeting(greeting: &greeting::Greeting) {
+    let (toast, channel) = match greeting {
+        greeting::Greeting::FirstLaunch => welcome_toast(),
+        greeting::Greeting::Updated(version) => updated_toast(version),
+        greeting::Greeting::None => return,
+    };
+    platform::notify(&toast, channel);
 }
 
 /// Emits a threshold notification. Failures (no notification daemon, D-Bus
@@ -766,6 +812,24 @@ const FIRST_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(5);
 /// Interval between update checks thereafter.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long after startup the greeting toast fires. It must not fire inline
+/// before [`platform::run`]: the macOS backend refuses to post until the main
+/// run loop is pumping (`MainThreadNotRunning`), and its built-in retry only
+/// helps once the loop exists at all. Two seconds is comfortably past that
+/// window without making the welcome feel unrelated to the launch.
+const GREETING_DELAY: Duration = Duration::from_secs(2);
+
+/// Fires the first-launch or post-upgrade greeting, if any, from its own
+/// short-lived thread. The thread is deliberately never joined: it sleeps,
+/// posts at most one toast, and exits.
+fn spawn_greeting() {
+    std::thread::spawn(|| {
+        std::thread::sleep(GREETING_DELAY);
+        let greeting = greeting::check_and_record(&greeting::state_path(), update::current_version());
+        notify_greeting(&greeting);
+    });
+}
+
 /// Runs the update check on its own thread, forever: once shortly after
 /// startup, then daily.
 ///
@@ -846,6 +910,11 @@ fn run_tray() {
     // The only network activity in the whole program, and the only thing the
     // `check_updates` setting gates.
     spawn_update_checker(check_updates, updates, wake_tx.clone());
+
+    // The one toast every fresh install gets. On macOS this is what makes the
+    // notification-permission prompt appear right after install, instead of
+    // whenever the first threshold alert would have tried (and failed).
+    spawn_greeting();
 
     // Watch the desktop's light/dark preference regardless of the current
     // style: it costs one thread and one D-Bus connection, and it means
@@ -1377,5 +1446,22 @@ mod notify_channel_routing {
         let (toast, channel) = refresh_toast("2 requests today");
         assert_eq!(channel, Channel::Ephemeral);
         assert!(toast.transient);
+    }
+
+    #[test]
+    fn welcome_toast_is_ephemeral_and_not_transient() {
+        let (toast, channel) = welcome_toast();
+        assert_eq!(channel, Channel::Ephemeral);
+        assert_eq!(toast.urgency, Urgency::Normal);
+        assert!(!toast.transient, "a once-ever hello belongs in history");
+    }
+
+    #[test]
+    fn updated_toast_mentions_version_and_is_transient() {
+        let (toast, channel) = updated_toast("0.2.0");
+        assert_eq!(channel, Channel::Ephemeral);
+        assert_eq!(toast.urgency, Urgency::Low);
+        assert!(toast.transient);
+        assert!(toast.body.contains("v0.2.0"));
     }
 }
