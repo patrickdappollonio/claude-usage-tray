@@ -34,7 +34,7 @@ The icon is a small gauge, and it tells you two things at once.
 - **A question mark in the middle** means the numbers haven't been updated recently. You still see the last known reading, it just might not be current.
 - **A gray icon** means there's no data yet, usually because the hook isn't installed.
 
-On Linux, left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets at 03:50) and 33% of your weekly limit (resets Tue 09:00)." It appears briefly and disappears on its own. On macOS any click simply opens the menu, as menu bar items do, and the same numbers lead it.
+On Linux, left-click the icon for a plain summary, something like "You've used 32% of your 5-hour session (resets in 3 h) and 33% of your weekly limit (resets in 2 d)." It appears briefly and disappears on its own. On macOS any click simply opens the menu, as menu bar items do, and the same numbers lead it.
 
 Stale doesn't mean wrong, by the way. Reset times are real timestamps, so the countdowns stay accurate on their own. When a 5-hour window rolls over, the session percentage drops back to 0% even if nothing has reported in hours.
 

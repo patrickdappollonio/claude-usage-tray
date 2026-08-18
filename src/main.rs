@@ -41,7 +41,7 @@ mod testutil;
 mod ui;
 mod update;
 
-use jiff::{Timestamp, tz::TimeZone};
+use jiff::Timestamp;
 use platform::{Channel, Toast, Urgency};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -832,7 +832,6 @@ fn run_tray() {
     let cli_refresh = settings.cli_refresh_handle();
     let updates = settings.update_handle();
     let restart = settings.restart_handle();
-    let tz = TimeZone::system();
 
     // The path of the binary this process was started from, watched for the
     // moment a package upgrade replaces it. Recorded here, before anything
@@ -884,7 +883,6 @@ fn run_tray() {
             &cli_refresh,
             &interval,
             &notify_prefs,
-            &tz,
             binary_watch.as_mut(),
             &restart,
         );
@@ -912,7 +910,6 @@ fn poll_loop(
     cli_refresh: &std::sync::atomic::AtomicBool,
     interval: &std::sync::atomic::AtomicU64,
     notify_prefs: &ui::NotifyHandle,
-    tz: &TimeZone,
     mut binary_watch: Option<&mut binary::BinaryWatch>,
     restart: &ui::RestartHandle,
 ) {
@@ -920,7 +917,12 @@ fn poll_loop(
     // volley of alerts for crossings that happened before this process
     // existed; see `Notifier`.
     let mut notifier = ui::Notifier::new(&notify_prefs.get().thresholds);
-    let mut reset_notifier = ui::ResetNotifier::new();
+    let mut reset_notifiers = ui::ResetNotifiers::new();
+    // What the info rows last said, verbatim. Relative countdowns drift out of
+    // truth as the wall clock advances even when the data does not, so every
+    // cycle re-renders this and pushes a refresh on any difference — the
+    // "ticker" that keeps `resets in 17 h` honest overnight.
+    let mut last_rendered = ui::tooltip_text(&snapshot, Timestamp::now());
     // When this process last spawned `claude -p "/usage"`. Process-local on
     // purpose: an hour-scale cadence does not need to survive restarts, and
     // the blob's own `fetchedAtMs` already carries the cross-process truth.
@@ -962,14 +964,10 @@ fn poll_loop(
         }
 
         let now = Timestamp::now();
-        // Whether the window we were waiting on has now come due — recorded
+        // Whether any window we were waiting on has now come due — recorded
         // before `evaluate` consumes it.
-        let window_rolled_over = reset_notifier.deadline().is_some_and(|at| at <= now);
-        let session_reset = snapshot
-            .session
-            .as_ref()
-            .and_then(|session| session.resets_at);
-        if let Some(alert) = reset_notifier.evaluate(session_reset, now, prefs.on_reset) {
+        let window_rolled_over = reset_notifiers.deadline().is_some_and(|at| at <= now);
+        for alert in reset_notifiers.evaluate(&snapshot, now, prefs.on_reset) {
             notify_reset(&alert);
         }
         if window_rolled_over {
@@ -985,6 +983,7 @@ fn poll_loop(
             );
             if ui::snapshot_changed(&snapshot, &next) {
                 handle.set_snapshot(next.clone());
+                last_rendered = ui::tooltip_text(&next, Timestamp::now());
             }
             snapshot = next;
             continue;
@@ -994,7 +993,7 @@ fn poll_loop(
         // and never sleep past a pending quota reset.
         let wait = ui::poll_wait(
             interval.load(Ordering::Relaxed),
-            reset_notifier.deadline(),
+            reset_notifiers.deadline(),
             Timestamp::now(),
         );
         let post_read = match wake_rx.recv_timeout(wait) {
@@ -1049,24 +1048,32 @@ fn poll_loop(
             kayfabe_path,
             Timestamp::now(),
         );
-        if ui::snapshot_changed(&snapshot, &next) {
+        let pushed = ui::snapshot_changed(&snapshot, &next);
+        if pushed {
             handle.set_snapshot(next.clone());
         }
         match post_read {
             PostRead::RefreshToast => {
-                notify_refresh(&ui::refresh_message(
-                    &snapshot,
-                    &next,
-                    Timestamp::now(),
-                    tz,
-                ));
+                notify_refresh(&ui::refresh_message(&snapshot, &next, Timestamp::now()));
             }
             PostRead::StatusToast => {
-                notify_refresh(&ui::status_message(&next, Timestamp::now(), tz));
+                notify_refresh(&ui::status_message(&next, Timestamp::now()));
             }
             PostRead::Silent => {}
         }
         snapshot = next;
+        // The ticker half of the relative countdowns: the text is a function
+        // of the wall clock as much as of the data, so a tick with unchanged
+        // data still needs a repaint once `resets in 17 h` should read
+        // `resets in 16 h`. Comparing the rendered lines (rather than always
+        // refreshing) keeps the actual pushes to about one a minute.
+        let rendered = ui::tooltip_text(&snapshot, Timestamp::now());
+        if rendered != last_rendered {
+            if !pushed {
+                handle.refresh();
+            }
+            last_rendered = rendered;
+        }
     }
 }
 
@@ -1351,6 +1358,7 @@ mod notify_channel_routing {
     #[test]
     fn reset_alert_routes_to_ephemeral_channel() {
         let alert = ResetAlert {
+            window: ui::ResetWindow::Session,
             at: Timestamp::now(),
         };
         let (_, channel) = reset_toast(&alert);

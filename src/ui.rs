@@ -2,8 +2,8 @@
 //! text, and the menu model — with nothing platform-specific in it.
 //!
 //! Everything that produces user-visible text lives here as a free function
-//! taking `now` and a `TimeZone` explicitly, so it can be unit-tested without a
-//! desktop, a D-Bus session, or a dependency on the machine's clock and locale.
+//! taking `now` explicitly, so it can be unit-tested without a desktop, a
+//! D-Bus session, or a dependency on the machine's clock and locale.
 //! [`TrayCore`] is a thin shell that calls those helpers with the real clock,
 //! and the platform backend in [`crate::platform`] is a thin shell around
 //! *that*: it renders [`TrayCore::menu`] with its native menu API and hands
@@ -21,7 +21,7 @@ use crate::icon::IconAppearance;
 use crate::menu::{MenuAction, MenuRow, RadioGroup, RadioOption};
 use crate::source::{Metric, SnapshotState, UsageSnapshot};
 use crate::update::Update;
-use jiff::{Timestamp, tz::TimeZone};
+use jiff::Timestamp;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -75,39 +75,38 @@ pub const RESTART_TO_UPDATE_LABEL: &str = "⟳ Restart to update";
 /// because the menu row keeps the offer standing afterwards.
 pub const RESTART_TO_UPDATE_TOAST: &str = "Update installed — restart to apply";
 
-/// Furthest a reset time may be from `now` before `humanize_reset` stops
-/// using the weekday form: past this many days the `%a` abbreviation reads
-/// as "this week", which is misleading for something further out.
-const WEEKDAY_FORM_MAX_DAYS: i32 = 6;
-
-/// Formats a reset timestamp for display: `HH:MM` when it falls on the same
-/// local day as `now`; `Day HH:MM` (e.g. `Mon 12:59`) when it's within the
-/// next `WEEKDAY_FORM_MAX_DAYS` days, since a bare weekday reads as "this
-/// week"; otherwise `Mon DD HH:MM` (e.g. `Aug 20 09:00`) so a target further
-/// out doesn't get misread as being within the week.
-pub fn humanize_reset(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
-    let at = at.to_zoned(tz.clone());
-    let now = now.to_zoned(tz.clone());
-    if at.date() == now.date() {
-        at.strftime("%H:%M").to_string()
-    } else if (at.date() - now.date()).get_days().abs() <= WEEKDAY_FORM_MAX_DAYS {
-        at.strftime("%a %H:%M").to_string()
+/// The countdown suffix for a reset timestamp: `resets in 45 min`,
+/// `resets in 17 h`, `resets in 3 d` — relative rather than a wall-clock
+/// time, so the reader never has to do the subtraction themselves. Computed
+/// from `now` on every render; the poll loop re-renders when the text would
+/// change, so it stays true without any new data arriving.
+///
+/// `None` once the moment has passed: the readers have already zeroed the
+/// percentage for a rolled-over window, and counting *up* from a reset would
+/// only describe how stale the cache is — the freshness line already does
+/// that job.
+pub fn reset_suffix(at: Timestamp, now: Timestamp) -> Option<String> {
+    let secs = at.as_second() - now.as_second();
+    if secs <= 0 {
+        None
+    } else if secs < 60 {
+        Some("resets in <1 min".to_string())
     } else {
-        at.strftime("%b %d %H:%M").to_string()
+        Some(format!("resets in {}", humanize_age(secs)))
     }
 }
 
-/// `Session: 42% · resets 18:00`
-pub fn session_line(metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> String {
-    metric_line("Session", metric, now, tz)
+/// `Session: 42% · resets in 3 h`
+pub fn session_line(metric: Option<&Metric>, now: Timestamp) -> String {
+    metric_line("Session", metric, now)
 }
 
-/// `Weekly: 61% · resets Mon 12:59`
-pub fn weekly_line(metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> String {
-    metric_line("Weekly", metric, now, tz)
+/// `Weekly: 61% · resets in 3 d`
+pub fn weekly_line(metric: Option<&Metric>, now: Timestamp) -> String {
+    metric_line("Weekly", metric, now)
 }
 
-/// `Fable weekly: 71% · resets Wed 10:13` — one per-model bucket from the
+/// `Fable weekly: 71% · resets in 12 h` — one per-model bucket from the
 /// app cache, plus ` · as of 2 h ago` once the blob it came from is more than
 /// an hour old. The suffix threshold is deliberately looser than the hook's
 /// 600 s staleness rule: Claude Code only refreshes the blob now and then,
@@ -117,14 +116,8 @@ pub fn scoped_line(
     scoped: &crate::appcache::ScopedMetric,
     fetched_at: Option<Timestamp>,
     now: Timestamp,
-    tz: &TimeZone,
 ) -> String {
-    let line = metric_line(
-        &format!("{} weekly", scoped.name),
-        Some(&scoped.metric),
-        now,
-        tz,
-    );
+    let line = metric_line(&format!("{} weekly", scoped.name), Some(&scoped.metric), now);
     match fetched_at {
         Some(at) if age_secs(at, now) > SCOPED_AGE_SUFFIX_SECS => {
             format!("{line} · as of {} ago", humanize_age(age_secs(at, now)))
@@ -136,7 +129,7 @@ pub fn scoped_line(
 /// Age beyond which a scoped row admits how old its data is.
 const SCOPED_AGE_SUFFIX_SECS: i64 = 3600;
 
-fn metric_line(label: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> String {
+fn metric_line(label: &str, metric: Option<&Metric>, now: Timestamp) -> String {
     let Some(metric) = metric else {
         return format!("{label}: no data");
     };
@@ -145,8 +138,8 @@ fn metric_line(label: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZo
         // Em dash: the window exists in the cache but carries no percentage.
         None => "—".to_string(),
     };
-    match metric.resets_at {
-        Some(at) => format!("{label}: {percent} · resets {}", humanize_reset(at, now, tz)),
+    match metric.resets_at.and_then(|at| reset_suffix(at, now)) {
+        Some(suffix) => format!("{label}: {percent} · {suffix}"),
         None => format!("{label}: {percent}"),
     }
 }
@@ -186,12 +179,7 @@ fn humanize_age(secs: i64) -> String {
 
 /// The third menu row: freshness of the cache, or an explanation of why there
 /// is nothing to show.
-///
-/// `_tz` is unused now that every branch reports an elapsed duration rather
-/// than a wall-clock time, but it stays in the signature: it is a public
-/// helper alongside `session_line`/`weekly_line`, and dropping the parameter
-/// would break their symmetry for no gain.
-pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, _tz: &TimeZone) -> String {
+pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp) -> String {
     match snapshot.state {
         // First-run wording: the actionable `Install hook` item sits directly
         // under this row, so the row states the diagnosis and the item is the
@@ -218,15 +206,15 @@ pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp, _tz: &TimeZone) -> 
 
 /// All the info rows joined with newlines, for the tooltip body: session,
 /// weekly, any per-model scoped rows, then the freshness line.
-pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> String {
+pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp) -> String {
     let mut lines = vec![
-        session_line(snapshot.session.as_ref(), now, tz),
-        weekly_line(snapshot.weekly.as_ref(), now, tz),
+        session_line(snapshot.session.as_ref(), now),
+        weekly_line(snapshot.weekly.as_ref(), now),
     ];
     for scoped in &snapshot.scoped {
-        lines.push(scoped_line(scoped, snapshot.scoped_fetched_at, now, tz));
+        lines.push(scoped_line(scoped, snapshot.scoped_fetched_at, now));
     }
-    lines.push(status_line(snapshot, now, tz));
+    lines.push(status_line(snapshot, now));
     lines.join("\n")
 }
 
@@ -243,12 +231,7 @@ fn short_metric(label: &str, metric: Option<&Metric>) -> String {
 /// Pure so the three outcomes are unit-testable: the cache moved forward, it
 /// didn't, or there is no cache at all. Timer-driven polls never call this —
 /// see the poll loop in `main.rs`.
-pub fn refresh_message(
-    previous: &UsageSnapshot,
-    current: &UsageSnapshot,
-    now: Timestamp,
-    tz: &TimeZone,
-) -> String {
+pub fn refresh_message(previous: &UsageSnapshot, current: &UsageSnapshot, now: Timestamp) -> String {
     if current.state == SnapshotState::Missing {
         return "No data — install the statusline hook".to_string();
     }
@@ -264,37 +247,24 @@ pub fn refresh_message(
     }
     match current.written_at {
         Some(at) => format!(
-            "No new data — Claude Code last reported at {}",
-            humanize_reset(at, now, tz)
+            "No new data — Claude Code last reported {} ago",
+            humanize_age(age_secs(at, now))
         ),
         None => "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update".to_string(),
     }
 }
 
 /// One metric's contribution to [`status_message`]: `32% of your 5-hour
-/// session (resets at 03:50)`. `None` when the percentage itself is unknown —
+/// session (resets in 3 h)`. `None` when the percentage itself is unknown —
 /// a window that exists in the cache but carries no percentage is treated the
-/// same as no window at all, matching [`short_metric`].
-fn status_clause(noun: &str, metric: Option<&Metric>, now: Timestamp, tz: &TimeZone) -> Option<String> {
+/// same as no window at all, matching [`short_metric`]. The parenthetical
+/// follows [`reset_suffix`]'s rules, so an already-passed reset gets none.
+fn status_clause(noun: &str, metric: Option<&Metric>, now: Timestamp) -> Option<String> {
     let percent = metric?.percent?;
     let base = format!("{}% of your {noun}", percent.round());
-    match metric?.resets_at {
-        Some(at) => Some(format!("{base} ({})", status_reset_clause(at, now, tz))),
+    match metric?.resets_at.and_then(|at| reset_suffix(at, now)) {
+        Some(suffix) => Some(format!("{base} ({suffix})")),
         None => Some(base),
-    }
-}
-
-/// `resets at 03:50` for a same-day reset, `resets Tue 09:00` for a further
-/// one — `humanize_reset` already drops the weekday for same-day resets, so
-/// "at" only reads naturally in that first form; prefixing it onto "Tue
-/// 09:00" would misparse as "at Tuesday".
-fn status_reset_clause(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
-    let text = humanize_reset(at, now, tz);
-    let same_day = at.to_zoned(tz.clone()).date() == now.to_zoned(tz.clone()).date();
-    if same_day {
-        format!("resets at {text}")
-    } else {
-        format!("resets {text}")
     }
 }
 
@@ -304,13 +274,13 @@ fn status_reset_clause(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
 /// Pure so every combination of known/unknown/stale is unit-testable. Unlike
 /// [`refresh_message`], this never compares against a previous snapshot — a
 /// left-click re-reads the cache but does not care whether it moved.
-pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -> String {
+pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp) -> String {
     if snapshot.state == SnapshotState::Missing {
         return "No usage data — install the statusline hook.".to_string();
     }
 
-    let session = status_clause("5-hour session", snapshot.session.as_ref(), now, tz);
-    let weekly = status_clause("weekly limit", snapshot.weekly.as_ref(), now, tz);
+    let session = status_clause("5-hour session", snapshot.session.as_ref(), now);
+    let weekly = status_clause("weekly limit", snapshot.weekly.as_ref(), now);
 
     let mut sentence = match (session, weekly) {
         (Some(session), Some(weekly)) => format!("You've used {session} and {weekly}."),
@@ -324,7 +294,6 @@ pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp, tz: &TimeZone) -
             &format!("{} weekly limit", scoped.name),
             Some(&scoped.metric),
             now,
-            tz,
         ) {
             sentence.push_str(&format!(" You've used {clause}."));
         }
@@ -543,9 +512,22 @@ impl Notifier {
     }
 }
 
-/// The "your 5-hour window rolled over" notification.
+/// Which usage window a [`ResetAlert`] is about — it decides the wording.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResetWindow {
+    /// The 5-hour session window.
+    Session,
+    /// The all-models weekly window.
+    Weekly,
+    /// A per-model weekly bucket, e.g. `Fable`.
+    Scoped(String),
+}
+
+/// The "your usage window rolled over" notification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResetAlert {
+    /// The window that rolled over.
+    pub window: ResetWindow,
     /// The `resets_at` that came due.
     pub at: Timestamp,
 }
@@ -556,7 +538,11 @@ impl ResetAlert {
     }
 
     pub fn body(&self) -> String {
-        "Session quota reset — fresh 5-hour window".to_string()
+        match &self.window {
+            ResetWindow::Session => "Session quota reset — fresh 5-hour window".to_string(),
+            ResetWindow::Weekly => "Weekly quota reset — fresh week".to_string(),
+            ResetWindow::Scoped(name) => format!("{name} weekly quota reset — fresh week"),
+        }
     }
 }
 
@@ -582,20 +568,17 @@ pub struct ResetNotifier {
 }
 
 impl ResetNotifier {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Feeds in the session window's `resets_at` and the current time.
-    /// `enabled` is the user's `notify_on_reset` setting: when off, the
-    /// crossing is still consumed (so switching it back on later cannot
-    /// resurrect an old one), it just produces no alert.
+    /// Feeds in one window's `resets_at` and the current time, returning the
+    /// deadline that just came due, if any. `enabled` is the user's
+    /// `notify_on_reset` setting: when off, the crossing is still consumed
+    /// (so switching it back on later cannot resurrect an old one), it just
+    /// reports nothing.
     pub fn evaluate(
         &mut self,
         resets_at: Option<Timestamp>,
         now: Timestamp,
         enabled: bool,
-    ) -> Option<ResetAlert> {
+    ) -> Option<Timestamp> {
         // A watched window comes due on the tray's own clock, whether or not
         // the cache still reports it. Consuming it here and not under
         // `resets_at` is what keeps a cache that went missing mid-window from
@@ -605,7 +588,7 @@ impl ResetNotifier {
             Some(at) if at <= now => {
                 self.pending = None;
                 self.handled = Some(at);
-                enabled.then_some(ResetAlert { at })
+                enabled.then_some(at)
             }
             _ => None,
         };
@@ -624,6 +607,87 @@ impl ResetNotifier {
     /// is not delayed by a long refresh interval.
     pub fn deadline(&self) -> Option<Timestamp> {
         self.pending
+    }
+}
+
+/// One [`ResetNotifier`] per usage window the tray displays: the session, the
+/// weekly, and each per-model bucket as it appears. Every window's rollover is
+/// worth the same wall-clock treatment — a reset time seen once stays true no
+/// matter how stale the cache gets.
+#[derive(Debug, Default)]
+pub struct ResetNotifiers {
+    session: ResetNotifier,
+    weekly: ResetNotifier,
+    /// Keyed by bucket name (`Fable`, …). A bucket that vanishes from the
+    /// cache keeps its notifier: a pending deadline must still be consumed
+    /// when it comes due (see the busy-wait note in
+    /// [`ResetNotifier::evaluate`]), and the map only ever holds a handful of
+    /// model names.
+    scoped: std::collections::HashMap<String, ResetNotifier>,
+}
+
+impl ResetNotifiers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds every window from `snapshot` through its notifier and returns
+    /// the alerts that came due — at most one per window per crossing.
+    pub fn evaluate(
+        &mut self,
+        snapshot: &UsageSnapshot,
+        now: Timestamp,
+        enabled: bool,
+    ) -> Vec<ResetAlert> {
+        let mut alerts = Vec::new();
+        let session = snapshot.session.as_ref().and_then(|m| m.resets_at);
+        if let Some(at) = self.session.evaluate(session, now, enabled) {
+            alerts.push(ResetAlert {
+                window: ResetWindow::Session,
+                at,
+            });
+        }
+        let weekly = snapshot.weekly.as_ref().and_then(|m| m.resets_at);
+        if let Some(at) = self.weekly.evaluate(weekly, now, enabled) {
+            alerts.push(ResetAlert {
+                window: ResetWindow::Weekly,
+                at,
+            });
+        }
+        // First the buckets present in this snapshot (arming as needed) …
+        for scoped in &snapshot.scoped {
+            let notifier = self.scoped.entry(scoped.name.clone()).or_default();
+            if let Some(at) = notifier.evaluate(scoped.metric.resets_at, now, enabled) {
+                alerts.push(ResetAlert {
+                    window: ResetWindow::Scoped(scoped.name.clone()),
+                    at,
+                });
+            }
+        }
+        // … then any bucket the cache no longer mentions, so a deadline armed
+        // earlier is still consumed (and announced) on time.
+        for (name, notifier) in &mut self.scoped {
+            if snapshot.scoped.iter().any(|scoped| &scoped.name == name) {
+                continue;
+            }
+            if let Some(at) = notifier.evaluate(None, now, enabled) {
+                alerts.push(ResetAlert {
+                    window: ResetWindow::Scoped(name.clone()),
+                    at,
+                });
+            }
+        }
+        alerts
+    }
+
+    /// The earliest pending deadline across every window, for [`poll_wait`].
+    pub fn deadline(&self) -> Option<Timestamp> {
+        let mut deadlines: Vec<Timestamp> = [self.session.deadline(), self.weekly.deadline()]
+            .into_iter()
+            .flatten()
+            .collect();
+        deadlines.extend(self.scoped.values().filter_map(ResetNotifier::deadline));
+        deadlines.into_iter().min()
     }
 }
 
@@ -971,7 +1035,6 @@ impl MenuEnv {
 pub struct TrayCore {
     pub snapshot: UsageSnapshot,
     settings: Settings,
-    tz: TimeZone,
     wake: Sender<Wake>,
 }
 
@@ -980,7 +1043,6 @@ impl TrayCore {
         TrayCore {
             snapshot,
             settings,
-            tz: TimeZone::system(),
             wake,
         }
     }
@@ -1010,7 +1072,7 @@ impl TrayCore {
 
     /// The tooltip body: the same three lines the menu opens with.
     pub fn tooltip(&self) -> String {
-        tooltip_text(&self.snapshot, Timestamp::now(), &self.tz)
+        tooltip_text(&self.snapshot, Timestamp::now())
     }
 
     /// Left-click: show a worded summary of current usage. Unlike "Check for
@@ -1202,18 +1264,17 @@ impl TrayCore {
     /// be pinned by a test.
     pub fn menu_with(&self, now: Timestamp, env: MenuEnv) -> Vec<MenuRow> {
         let mut rows = vec![
-            MenuRow::info(session_line(self.snapshot.session.as_ref(), now, &self.tz)),
-            MenuRow::info(weekly_line(self.snapshot.weekly.as_ref(), now, &self.tz)),
+            MenuRow::info(session_line(self.snapshot.session.as_ref(), now)),
+            MenuRow::info(weekly_line(self.snapshot.weekly.as_ref(), now)),
         ];
         for scoped in &self.snapshot.scoped {
             rows.push(MenuRow::info(scoped_line(
                 scoped,
                 self.snapshot.scoped_fetched_at,
                 now,
-                &self.tz,
             )));
         }
-        rows.push(MenuRow::info(status_line(&self.snapshot, now, &self.tz)));
+        rows.push(MenuRow::info(status_line(&self.snapshot, now)));
         if shows_install_item(&self.snapshot) {
             // The one enabled row in the no-data state: everything else here
             // is a label, and a first-run user needs exactly one thing to do.
@@ -1382,10 +1443,6 @@ mod tests {
     // 2023-11-14 22:13:20 UTC (a Tuesday)
     const BASE: i64 = 1_700_000_000;
 
-    fn utc() -> TimeZone {
-        TimeZone::UTC
-    }
-
     fn metric(percent: Option<f64>, resets_at: Option<i64>) -> Metric {
         Metric {
             percent,
@@ -1404,46 +1461,47 @@ mod tests {
     }
 
     #[test]
-    fn humanize_reset_same_day_is_time_only() {
-        // BASE is 22:13:20 UTC; +1000s -> 22:30 same day
-        assert_eq!(humanize_reset(ts(BASE + 1000), ts(BASE), &utc()), "22:30");
+    fn reset_suffix_past_is_dropped() {
+        // A reset in the past means the window already rolled over; the
+        // readers zeroed its percentage and the suffix says nothing.
+        assert_eq!(reset_suffix(ts(BASE - 1), ts(BASE)), None);
+        assert_eq!(reset_suffix(ts(BASE), ts(BASE)), None);
     }
 
     #[test]
-    fn humanize_reset_other_day_includes_weekday() {
-        // BASE + 12h crosses midnight into Wednesday 10:13
+    fn reset_suffix_under_a_minute_avoids_zero_minutes() {
         assert_eq!(
-            humanize_reset(ts(BASE + 12 * 3600), ts(BASE), &utc()),
-            "Wed 10:13"
+            reset_suffix(ts(BASE + 30), ts(BASE)).as_deref(),
+            Some("resets in <1 min")
         );
     }
 
     #[test]
-    fn humanize_reset_six_days_out_still_uses_weekday_form() {
-        // BASE is Tue 2023-11-14; +6 days is Mon 2023-11-20 — still "this
-        // week enough" to read unambiguously as a weekday.
+    fn reset_suffix_minutes() {
         assert_eq!(
-            humanize_reset(ts(BASE + 6 * 86_400), ts(BASE), &utc()),
-            "Mon 22:13"
+            reset_suffix(ts(BASE + 1000), ts(BASE)).as_deref(),
+            Some("resets in 16 min")
         );
     }
 
     #[test]
-    fn humanize_reset_more_than_six_days_out_uses_month_day_form() {
-        // BASE is Tue 2023-11-14; +7 days is Tue 2023-11-21 — a bare "Tue"
-        // would misleadingly read as "this week", so fall back to Mon DD.
+    fn reset_suffix_hours_are_rounded() {
         assert_eq!(
-            humanize_reset(ts(BASE + 7 * 86_400), ts(BASE), &utc()),
-            "Nov 21 22:13"
+            reset_suffix(ts(BASE + 12 * 3600), ts(BASE)).as_deref(),
+            Some("resets in 12 h")
+        );
+        // 11 h 40 min reads better as "12 h" than as "11 h".
+        assert_eq!(
+            reset_suffix(ts(BASE + 12 * 3600 - 1200), ts(BASE)).as_deref(),
+            Some("resets in 12 h")
         );
     }
 
     #[test]
-    fn humanize_reset_far_future_uses_month_day_form() {
-        // BASE + 8 days -> Wed 2023-11-22.
+    fn reset_suffix_days_beyond_two() {
         assert_eq!(
-            humanize_reset(ts(BASE + 8 * 86_400), ts(BASE), &utc()),
-            "Nov 22 22:13"
+            reset_suffix(ts(BASE + 3 * 86_400), ts(BASE)).as_deref(),
+            Some("resets in 3 d")
         );
     }
 
@@ -1451,8 +1509,8 @@ mod tests {
     fn session_line_with_percent_and_reset() {
         let m = metric(Some(42.0), Some(BASE + 1000));
         assert_eq!(
-            session_line(Some(&m), ts(BASE), &utc()),
-            "Session: 42% · resets 22:30"
+            session_line(Some(&m), ts(BASE)),
+            "Session: 42% · resets in 16 min"
         );
     }
 
@@ -1460,37 +1518,45 @@ mod tests {
     fn session_line_rounds_fractional_percent() {
         let m = metric(Some(61.5), Some(BASE + 1000));
         assert_eq!(
-            session_line(Some(&m), ts(BASE), &utc()),
-            "Session: 62% · resets 22:30"
+            session_line(Some(&m), ts(BASE)),
+            "Session: 62% · resets in 16 min"
         );
     }
 
     #[test]
     fn session_line_without_reset_omits_reset_clause() {
         let m = metric(Some(42.0), None);
-        assert_eq!(session_line(Some(&m), ts(BASE), &utc()), "Session: 42%");
+        assert_eq!(session_line(Some(&m), ts(BASE)), "Session: 42%");
     }
 
     #[test]
     fn session_line_without_percent_uses_dash() {
         let m = metric(None, Some(BASE + 1000));
         assert_eq!(
-            session_line(Some(&m), ts(BASE), &utc()),
-            "Session: — · resets 22:30"
+            session_line(Some(&m), ts(BASE)),
+            "Session: — · resets in 16 min"
         );
     }
 
     #[test]
+    fn session_line_drops_the_suffix_once_the_reset_has_passed() {
+        // A stale cache keeps reporting the old window: percentage already
+        // zeroed by the readers, countdown gone rather than counting up.
+        let m = metric(Some(0.0), Some(BASE - 3600));
+        assert_eq!(session_line(Some(&m), ts(BASE)), "Session: 0%");
+    }
+
+    #[test]
     fn session_line_absent_metric_is_no_data() {
-        assert_eq!(session_line(None, ts(BASE), &utc()), "Session: no data");
+        assert_eq!(session_line(None, ts(BASE)), "Session: no data");
     }
 
     #[test]
     fn weekly_line_uses_weekly_label() {
         let m = metric(Some(61.0), Some(BASE + 12 * 3600));
         assert_eq!(
-            weekly_line(Some(&m), ts(BASE), &utc()),
-            "Weekly: 61% · resets Wed 10:13"
+            weekly_line(Some(&m), ts(BASE)),
+            "Weekly: 61% · resets in 12 h"
         );
     }
 
@@ -1498,7 +1564,7 @@ mod tests {
     fn status_line_missing_says_the_hook_is_not_installed() {
         let s = snapshot(SnapshotState::Missing, None);
         assert_eq!(
-            status_line(&s, ts(BASE), &utc()),
+            status_line(&s, ts(BASE)),
             "⚠ Hook not installed — no data"
         );
     }
@@ -1533,14 +1599,12 @@ mod tests {
 
     #[test]
     fn scoped_line_reads_like_the_weekly_line() {
-        // BASE is Tue 22:13:20 UTC; +12h -> Wed 10:13.
         let line = scoped_line(
             &fable(71.0, Some(BASE + 12 * 3600)),
             Some(ts(BASE - 30)),
             ts(BASE),
-            &utc(),
         );
-        assert_eq!(line, "Fable weekly: 71% · resets Wed 10:13");
+        assert_eq!(line, "Fable weekly: 71% · resets in 12 h");
     }
 
     #[test]
@@ -1549,9 +1613,8 @@ mod tests {
             &fable(71.0, Some(BASE + 12 * 3600)),
             Some(ts(BASE - 2 * 3600)),
             ts(BASE),
-            &utc(),
         );
-        assert_eq!(line, "Fable weekly: 71% · resets Wed 10:13 · as of 2 h ago");
+        assert_eq!(line, "Fable weekly: 71% · resets in 12 h · as of 2 h ago");
     }
 
     #[test]
@@ -1560,7 +1623,6 @@ mod tests {
             &fable(71.0, Some(BASE + 12 * 3600)),
             Some(ts(BASE - 1800)),
             ts(BASE),
-            &utc(),
         );
         assert!(!line.contains("as of"), "{line}");
     }
@@ -1572,11 +1634,11 @@ mod tests {
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         s.scoped = vec![fable(71.0, Some(BASE + 12 * 3600))];
         s.scoped_fetched_at = Some(ts(BASE - 30));
-        let tooltip = tooltip_text(&s, ts(BASE), &utc());
+        let tooltip = tooltip_text(&s, ts(BASE));
         let lines: Vec<&str> = tooltip.lines().collect();
         assert_eq!(lines.len(), 4);
         assert!(lines[1].starts_with("Weekly:"), "{tooltip}");
-        assert_eq!(lines[2], "Fable weekly: 71% · resets Wed 10:13");
+        assert_eq!(lines[2], "Fable weekly: 71% · resets in 12 h");
         assert!(lines[3].starts_with("Updated"), "{tooltip}");
     }
 
@@ -1587,10 +1649,10 @@ mod tests {
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         s.scoped = vec![fable(71.0, Some(BASE + 12 * 3600))];
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
-             of your weekly limit (resets Wed 10:13). You've used 71% of your \
-             Fable weekly limit (resets Wed 10:13)."
+            status_message(&s, ts(BASE)),
+            "You've used 32% of your 5-hour session (resets in 16 min) and 33% \
+             of your weekly limit (resets in 12 h). You've used 71% of your \
+             Fable weekly limit (resets in 12 h)."
         );
     }
 
@@ -1619,12 +1681,12 @@ mod tests {
         // ever has to describe.
         let s = snapshot(SnapshotState::Stale, Some(BASE - 11 * 60));
         assert_eq!(
-            status_line(&s, ts(BASE), &utc()),
+            status_line(&s, ts(BASE)),
             "⚠ Claude Code CLI last reported 11 min ago"
         );
         let s = snapshot(SnapshotState::Stale, Some(BASE - 59 * 60));
         assert_eq!(
-            status_line(&s, ts(BASE), &utc()),
+            status_line(&s, ts(BASE)),
             "⚠ Claude Code CLI last reported 59 min ago"
         );
     }
@@ -1632,67 +1694,67 @@ mod tests {
     #[test]
     fn status_line_stale_switches_to_hours_at_one_hour() {
         let s = snapshot(SnapshotState::Stale, Some(BASE - 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 1 h ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 1 h ago");
         let s = snapshot(SnapshotState::Stale, Some(BASE - 12 * 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 12 h ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 12 h ago");
     }
 
     #[test]
     fn status_line_stale_rounds_hours_to_the_nearest() {
         // 1 h 45 min is "2 h", not "1 h".
         let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 45 * 60)));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 2 h ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 2 h ago");
         // ...and 1 h 10 min still rounds down.
         let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 10 * 60)));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 1 h ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 1 h ago");
     }
 
     #[test]
     fn status_line_stale_switches_to_days_at_forty_eight_hours() {
         // 47 h stays in hours; 48 h is the first "2 d".
         let s = snapshot(SnapshotState::Stale, Some(BASE - 47 * 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 47 h ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 47 h ago");
         let s = snapshot(SnapshotState::Stale, Some(BASE - 48 * 3600));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 2 d ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 2 d ago");
         let s = snapshot(SnapshotState::Stale, Some(BASE - 9 * 86_400));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 9 d ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 9 d ago");
     }
 
     #[test]
     fn status_line_stale_without_a_timestamp_just_says_stale() {
         let s = snapshot(SnapshotState::Stale, None);
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Stale");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Stale");
     }
 
     #[test]
     fn status_line_stale_with_clock_skew_does_not_go_negative() {
         // A cache "written in the future" is a skewed clock, not time travel.
         let s = snapshot(SnapshotState::Stale, Some(BASE + 300));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "⚠ Claude Code CLI last reported 0 min ago");
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 0 min ago");
     }
 
     #[test]
     fn status_line_fresh_under_a_minute_is_just_now() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI just now");
+        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI just now");
     }
 
     #[test]
     fn status_line_fresh_one_minute_is_singular() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 60));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI 1 min ago");
+        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI 1 min ago");
     }
 
     #[test]
     fn status_line_fresh_minutes_ago() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 185));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI 3 min ago");
+        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI 3 min ago");
     }
 
     #[test]
     fn status_line_fresh_with_clock_skew_is_just_now() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE + 30));
-        assert_eq!(status_line(&s, ts(BASE), &utc()), "Updated by Claude Code CLI just now");
+        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI just now");
     }
 
     #[test]
@@ -1701,8 +1763,8 @@ mod tests {
         s.session = Some(metric(Some(42.0), Some(BASE + 1000)));
         s.weekly = Some(metric(Some(61.0), Some(BASE + 1000)));
         assert_eq!(
-            tooltip_text(&s, ts(BASE), &utc()),
-            "Session: 42% · resets 22:30\nWeekly: 61% · resets 22:30\nUpdated by Claude Code CLI just now"
+            tooltip_text(&s, ts(BASE)),
+            "Session: 42% · resets in 16 min\nWeekly: 61% · resets in 16 min\nUpdated by Claude Code CLI just now"
         );
     }
 
@@ -1719,7 +1781,7 @@ mod tests {
         let before = full(SnapshotState::Fresh, BASE - 300, 5.0, 27.0);
         let after = full(SnapshotState::Fresh, BASE - 10, 7.0, 28.0);
         assert_eq!(
-            refresh_message(&before, &after, ts(BASE), &utc()),
+            refresh_message(&before, &after, ts(BASE)),
             "Updated — Session 7%, Weekly 28%"
         );
     }
@@ -1730,7 +1792,7 @@ mod tests {
         let before = full(SnapshotState::Fresh, BASE - 300, 7.0, 28.0);
         let after = full(SnapshotState::Fresh, BASE - 10, 7.0, 28.0);
         assert_eq!(
-            refresh_message(&before, &after, ts(BASE), &utc()),
+            refresh_message(&before, &after, ts(BASE)),
             "Updated — Session 7%, Weekly 28%"
         );
     }
@@ -1740,18 +1802,18 @@ mod tests {
         let before = snapshot(SnapshotState::Fresh, Some(BASE - 300));
         let after = snapshot(SnapshotState::Fresh, Some(BASE - 10));
         assert_eq!(
-            refresh_message(&before, &after, ts(BASE), &utc()),
+            refresh_message(&before, &after, ts(BASE)),
             "Updated — Session —, Weekly —"
         );
     }
 
     #[test]
-    fn refresh_message_reports_no_new_data_with_the_last_report_time() {
+    fn refresh_message_reports_no_new_data_with_the_last_report_age() {
         let before = full(SnapshotState::Fresh, BASE - 3600, 7.0, 28.0);
         let after = before.clone();
         assert_eq!(
-            refresh_message(&before, &after, ts(BASE), &utc()),
-            "No new data — Claude Code last reported at 21:13"
+            refresh_message(&before, &after, ts(BASE)),
+            "No new data — Claude Code last reported 1 h ago"
         );
     }
 
@@ -1760,7 +1822,7 @@ mod tests {
         let before = full(SnapshotState::Stale, BASE - 3600, 7.0, 28.0);
         let mut after = before.clone();
         after.state = SnapshotState::Stale;
-        assert!(refresh_message(&before, &after, ts(BASE), &utc()).starts_with("No new data — "));
+        assert!(refresh_message(&before, &after, ts(BASE)).starts_with("No new data — "));
     }
 
     #[test]
@@ -1768,7 +1830,7 @@ mod tests {
         let before = snapshot(SnapshotState::Missing, None);
         let after = snapshot(SnapshotState::Missing, None);
         assert_eq!(
-            refresh_message(&before, &after, ts(BASE), &utc()),
+            refresh_message(&before, &after, ts(BASE)),
             "No data — install the statusline hook"
         );
     }
@@ -1779,7 +1841,7 @@ mod tests {
         let before = full(SnapshotState::Fresh, BASE - 300, 7.0, 28.0);
         let after = snapshot(SnapshotState::Missing, None);
         assert_eq!(
-            refresh_message(&before, &after, ts(BASE), &utc()),
+            refresh_message(&before, &after, ts(BASE)),
             "No data — install the statusline hook"
         );
     }
@@ -1788,23 +1850,20 @@ mod tests {
     fn status_message_missing_points_at_the_hook() {
         let s = snapshot(SnapshotState::Missing, None);
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
+            status_message(&s, ts(BASE)),
             "No usage data — install the statusline hook."
         );
     }
 
     #[test]
     fn status_message_fresh_with_both_percents() {
-        // BASE is 22:13:20 UTC (Tue); +1000s -> 22:30 same day (session);
-        // +12h -> Wed 10:13 (weekly), well past `WEEKDAY_FORM_MAX_DAYS`... no,
-        // within it, so it takes the weekday form.
         let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
         s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
-             of your weekly limit (resets Wed 10:13)."
+            status_message(&s, ts(BASE)),
+            "You've used 32% of your 5-hour session (resets in 16 min) and 33% \
+             of your weekly limit (resets in 12 h)."
         );
     }
 
@@ -1814,9 +1873,9 @@ mod tests {
         s.session = Some(metric(Some(32.4), Some(BASE + 1000)));
         s.weekly = Some(metric(Some(32.5), Some(BASE + 1000)));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
-             of your weekly limit (resets at 22:30)."
+            status_message(&s, ts(BASE)),
+            "You've used 32% of your 5-hour session (resets in 16 min) and 33% \
+             of your weekly limit (resets in 16 min)."
         );
     }
 
@@ -1826,9 +1885,9 @@ mod tests {
         s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 32% of your 5-hour session (resets at 22:30) and 33% \
-             of your weekly limit (resets Wed 10:13). Claude Code CLI last \
+            status_message(&s, ts(BASE)),
+            "You've used 32% of your 5-hour session (resets in 16 min) and 33% \
+             of your weekly limit (resets in 12 h). Claude Code CLI last \
              reported 12 h ago."
         );
     }
@@ -1838,7 +1897,7 @@ mod tests {
         let mut s = snapshot(SnapshotState::Stale, None);
         s.session = Some(metric(Some(32.0), None));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
+            status_message(&s, ts(BASE)),
             "You've used 32% of your 5-hour session; weekly usage is unknown."
         );
     }
@@ -1848,8 +1907,8 @@ mod tests {
         let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
         s.session = Some(metric(Some(32.0), Some(BASE + 1000)));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 32% of your 5-hour session (resets at 22:30); weekly \
+            status_message(&s, ts(BASE)),
+            "You've used 32% of your 5-hour session (resets in 16 min); weekly \
              usage is unknown."
         );
     }
@@ -1859,8 +1918,8 @@ mod tests {
         let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 33% of your weekly limit (resets Wed 10:13); session \
+            status_message(&s, ts(BASE)),
+            "You've used 33% of your weekly limit (resets in 12 h); session \
              usage is unknown."
         );
     }
@@ -1873,8 +1932,8 @@ mod tests {
         s.session = Some(metric(None, Some(BASE + 1000)));
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
-            "You've used 33% of your weekly limit (resets Wed 10:13); session \
+            status_message(&s, ts(BASE)),
+            "You've used 33% of your weekly limit (resets in 12 h); session \
              usage is unknown."
         );
     }
@@ -1885,7 +1944,7 @@ mod tests {
         // window is known, but the hook is demonstrably installed and working.
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
+            status_message(&s, ts(BASE)),
             "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update."
         );
     }
@@ -1896,7 +1955,7 @@ mod tests {
         s.session = Some(metric(Some(32.0), None));
         s.weekly = Some(metric(Some(33.0), None));
         assert_eq!(
-            status_message(&s, ts(BASE), &utc()),
+            status_message(&s, ts(BASE)),
             "You've used 32% of your 5-hour session and 33% of your weekly limit."
         );
     }
@@ -2234,16 +2293,15 @@ mod tests {
 
     #[test]
     fn reset_notifier_fires_once_when_the_window_it_watched_comes_due() {
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         let at = ts(BASE + 600);
         assert_eq!(r.evaluate(Some(at), ts(BASE), true), None);
         assert_eq!(r.deadline(), Some(at));
 
-        let alert = r
+        let fired = r
             .evaluate(Some(at), ts(BASE + 600), true)
             .expect("due at exactly resets_at");
-        assert_eq!(alert.at, at);
-        assert_eq!(alert.body(), "Session quota reset — fresh 5-hour window");
+        assert_eq!(fired, at);
         assert_eq!(r.deadline(), None);
 
         // The cache still reports the same (now past) resets_at for as long as
@@ -2254,22 +2312,22 @@ mod tests {
 
     #[test]
     fn reset_notifier_fires_again_for_the_next_window() {
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         let first = ts(BASE + 600);
         r.evaluate(Some(first), ts(BASE), true);
         assert!(r.evaluate(Some(first), ts(BASE + 600), true).is_some());
 
         let second = ts(BASE + 18_600);
         assert_eq!(r.evaluate(Some(second), ts(BASE + 700), true), None);
-        let alert = r
+        let fired = r
             .evaluate(Some(second), ts(BASE + 18_600), true)
             .expect("the next window fires too");
-        assert_eq!(alert.at, second);
+        assert_eq!(fired, second);
     }
 
     #[test]
     fn reset_notifier_stays_silent_without_a_resets_at() {
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         assert_eq!(r.evaluate(None, ts(BASE), true), None);
         assert_eq!(r.evaluate(None, ts(BASE + 100_000), true), None);
         assert_eq!(r.deadline(), None);
@@ -2279,14 +2337,14 @@ mod tests {
     fn reset_notifier_ignores_a_window_that_expired_before_the_tray_saw_it() {
         // Startup against a stale cache: announcing a reset that happened
         // hours ago would be noise.
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         assert_eq!(r.evaluate(Some(ts(BASE - 3600)), ts(BASE), true), None);
         assert_eq!(r.deadline(), None);
     }
 
     #[test]
     fn reset_notifier_consumes_the_crossing_while_disabled() {
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         let at = ts(BASE + 600);
         r.evaluate(Some(at), ts(BASE), false);
         assert_eq!(r.evaluate(Some(at), ts(BASE + 600), false), None);
@@ -2299,13 +2357,13 @@ mod tests {
         // Claude Code idle plus a deleted cache file: the reset is still a
         // fact about the clock, and the pending deadline must be consumed
         // either way — a deadline that stayed due would spin the poll loop.
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         let at = ts(BASE + 600);
         r.evaluate(Some(at), ts(BASE), true);
-        let alert = r
+        let fired = r
             .evaluate(None, ts(BASE + 600), true)
             .expect("fires from the clock alone");
-        assert_eq!(alert.at, at);
+        assert_eq!(fired, at);
         assert_eq!(r.deadline(), None);
         assert_eq!(r.evaluate(None, ts(BASE + 601), true), None);
         assert_eq!(r.deadline(), None);
@@ -2313,11 +2371,98 @@ mod tests {
 
     #[test]
     fn reset_notifier_consumes_the_deadline_even_when_disabled() {
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         let at = ts(BASE + 600);
         r.evaluate(Some(at), ts(BASE), false);
         assert_eq!(r.evaluate(None, ts(BASE + 600), false), None);
         assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn reset_alert_bodies_name_their_window() {
+        let at = ts(BASE);
+        let body = |window| ResetAlert { window, at }.body();
+        assert_eq!(
+            body(ResetWindow::Session),
+            "Session quota reset — fresh 5-hour window"
+        );
+        assert_eq!(body(ResetWindow::Weekly), "Weekly quota reset — fresh week");
+        assert_eq!(
+            body(ResetWindow::Scoped("Fable".to_string())),
+            "Fable weekly quota reset — fresh week"
+        );
+    }
+
+    /// A snapshot with all three window kinds armed at distinct deadlines.
+    fn all_windows_snapshot() -> UsageSnapshot {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE));
+        s.session = Some(metric(Some(42.0), Some(BASE + 600)));
+        s.weekly = Some(metric(Some(61.0), Some(BASE + 1200)));
+        s.scoped = vec![fable(71.0, Some(BASE + 1800))];
+        s
+    }
+
+    #[test]
+    fn reset_notifiers_deadline_is_the_earliest_pending_window() {
+        let mut r = ResetNotifiers::new();
+        assert!(r.evaluate(&all_windows_snapshot(), ts(BASE), true).is_empty());
+        assert_eq!(r.deadline(), Some(ts(BASE + 600)));
+    }
+
+    #[test]
+    fn reset_notifiers_fire_each_window_with_its_own_label() {
+        let mut r = ResetNotifiers::new();
+        let s = all_windows_snapshot();
+        r.evaluate(&s, ts(BASE), true);
+
+        let alerts = r.evaluate(&s, ts(BASE + 600), true);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].window, ResetWindow::Session);
+        assert_eq!(alerts[0].at, ts(BASE + 600));
+        assert_eq!(r.deadline(), Some(ts(BASE + 1200)));
+
+        // Both remaining windows come due while the loop was asleep: one
+        // alert each, in the same pass.
+        let alerts = r.evaluate(&s, ts(BASE + 1800), true);
+        let windows: Vec<&ResetWindow> = alerts.iter().map(|alert| &alert.window).collect();
+        assert!(windows.contains(&&ResetWindow::Weekly), "{windows:?}");
+        assert!(
+            windows.contains(&&ResetWindow::Scoped("Fable".to_string())),
+            "{windows:?}"
+        );
+        assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn reset_notifiers_still_fire_a_bucket_that_vanished_from_the_cache() {
+        // The app cache can stop mentioning a model bucket (a fresh blob with
+        // fewer rows); its reset is still a fact about the clock.
+        let mut r = ResetNotifiers::new();
+        r.evaluate(&all_windows_snapshot(), ts(BASE), true);
+
+        let mut without_fable = all_windows_snapshot();
+        without_fable.scoped.clear();
+        let alerts = r.evaluate(&without_fable, ts(BASE + 1800), true);
+        assert!(
+            alerts
+                .iter()
+                .any(|alert| alert.window == ResetWindow::Scoped("Fable".to_string())),
+            "{alerts:?}"
+        );
+        assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn tooltip_countdown_moves_with_the_clock_alone() {
+        // The substrate of the poll loop's ticker: with the data frozen, the
+        // rendered text still changes as `now` advances, which is what the
+        // loop's rendered-text comparison keys off.
+        let s = all_windows_snapshot();
+        let early = tooltip_text(&s, ts(BASE));
+        assert!(early.contains("resets in 10 min"), "{early}");
+        let later = tooltip_text(&s, ts(BASE + 300));
+        assert!(later.contains("resets in 5 min"), "{later}");
+        assert_ne!(early, later);
     }
 
     #[test]
@@ -2353,7 +2498,7 @@ mod tests {
     /// spin.
     #[test]
     fn simulated_poll_loop_fires_the_reset_on_time_without_spinning() {
-        let mut r = ResetNotifier::new();
+        let mut r = ResetNotifier::default();
         let reset_at = BASE + 1_000;
         let mut now = BASE;
         let mut fired_at: Option<i64> = None;
@@ -2363,8 +2508,8 @@ mod tests {
             if now > BASE + 3_600 {
                 break;
             }
-            if let Some(alert) = r.evaluate(Some(ts(reset_at)), ts(now), true) {
-                assert_eq!(alert.at, ts(reset_at));
+            if let Some(fired) = r.evaluate(Some(ts(reset_at)), ts(now), true) {
+                assert_eq!(fired, ts(reset_at));
                 assert!(fired_at.is_none(), "fired twice");
                 fired_at = Some(now);
             }
