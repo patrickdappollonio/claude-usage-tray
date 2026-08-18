@@ -1146,18 +1146,43 @@ impl TrayCore {
     /// means the menu row and the command line cannot drift apart, and the
     /// old process needs no special handling of its own — it just gets a
     /// `SIGTERM` like any other.
+    ///
+    /// The child is spawned and watched from a worker thread: menu callbacks
+    /// must stay fast, and the watcher is what reaps the child and reports a
+    /// failure that happens while this process is still alive to report it.
+    /// (Failures after this process is SIGTERM'd are the child's own to
+    /// report.) The toast itself is emitted by main.rs, keeping this module
+    /// side-effect free.
     fn restart_to_update(&self) {
         let Some(exe) = self.settings.restart.get() else {
             // The row is only drawn when the slot is full; a click that races
             // it losing its value has nothing to do.
             return;
         };
-        if let Err(err) = crate::instance::spawn_detached(&exe, crate::RESTART_COMMAND) {
-            // Nothing louder is possible or wanted: this may well be running
-            // with stderr on /dev/null, and a failed restart leaves a
-            // perfectly working tray behind.
-            eprintln!("claude-usage-tray: could not restart into the new binary: {err}");
-        }
+        std::thread::spawn(move || {
+            // The toast goes out before the stderr line, and the stderr write
+            // cannot panic: under `--foreground` the reader on that pipe may
+            // already be gone, and a panicking write would take the toast with
+            // it.
+            use std::io::Write as _;
+            match crate::instance::spawn_watched(&exe, crate::RESTART_COMMAND) {
+                Ok(child) => watch_restart(child, |body| {
+                    crate::notify_restart_failure(&body);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "claude-usage-tray: restart to update failed: {body}"
+                    );
+                }),
+                Err(err) => {
+                    let body = format!("could not start the new binary: {err}");
+                    crate::notify_restart_failure(&body);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "claude-usage-tray: restart to update failed: {body}"
+                    );
+                }
+            }
+        });
     }
 
     /// Runs a radio-group selection.
@@ -1313,6 +1338,36 @@ impl TrayCore {
             rows,
         }
     }
+}
+
+/// Reaps the restart child on the current (worker) thread and hands its last
+/// words to `report` only when it failed *and nobody has told the user yet*.
+/// Success needs no message (the child is about to SIGTERM this process),
+/// and [`crate::EXIT_RESTART_REPORTED`] means the child already raised the
+/// toast itself — reporting again here would show the same failure twice.
+fn watch_restart(child: std::process::Child, report: impl FnOnce(String) + Send + 'static) {
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) if output.status.code() == Some(crate::EXIT_RESTART_REPORTED) => {}
+        Ok(output) => report(restart_failure_body(&String::from_utf8_lossy(&output.stderr))),
+        Err(err) => report(format!("could not observe the restart: {err}")),
+    }
+}
+
+/// The toast body for a failed restart: the child's last diagnostic line,
+/// stripped of the program-name prefix stderr lines carry.
+fn restart_failure_body(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            line.strip_prefix("claude-usage-tray: ")
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "the restart command failed without saying why".to_string())
 }
 
 #[cfg(test)]
@@ -2930,6 +2985,87 @@ mod tests {
         assert_eq!(
             settings[9],
             MenuRow::info("(CLAUDE_TRAY_POLL_SECS=7 is in effect)")
+        );
+    }
+
+    #[test]
+    fn a_restart_failure_body_is_the_last_stderr_line_without_the_program_prefix() {
+        let stderr = "claude-usage-tray: could not check the old lock at /x\n\
+                      claude-usage-tray: could not stop the running instance (pid 4)\n\n";
+        assert_eq!(
+            restart_failure_body(stderr),
+            "could not stop the running instance (pid 4)"
+        );
+    }
+
+    #[test]
+    fn a_restart_failure_with_no_stderr_still_says_something_actionable() {
+        let body = restart_failure_body("");
+        assert!(!body.is_empty());
+        assert!(body.contains("restart"), "got {body:?}");
+    }
+
+    #[test]
+    fn watching_a_failing_child_reports_its_last_stderr_line() {
+        let temp = crate::testutil::TempDir::new("watch-restart");
+        let script = temp.path().join("fail.sh");
+        std::fs::write(&script, "#!/bin/sh\necho 'claude-usage-tray: boom' >&2\nexit 1\n")
+            .expect("write script");
+        crate::testutil::set_mode(&script, 0o755);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Some(child) = crate::testutil::spawn_script(|| {
+            crate::instance::spawn_watched(&script, "unused")
+        }) else {
+            return;
+        };
+        watch_restart(child, move |body| tx.send(body).expect("send"));
+        let body = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a failing child must be reported");
+        assert_eq!(body, "boom");
+    }
+
+    #[test]
+    fn watching_a_child_that_already_reported_stays_silent() {
+        let temp = crate::testutil::TempDir::new("watch-restart-reported");
+        let script = temp.path().join("reported.sh");
+        // Exit code 3 is EXIT_RESTART_REPORTED: the child says it has already
+        // toasted the failure itself, so a second toast here would duplicate it.
+        std::fs::write(&script, "#!/bin/sh\necho 'claude-usage-tray: boom' >&2\nexit 3\n")
+            .expect("write script");
+        crate::testutil::set_mode(&script, 0o755);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Some(child) = crate::testutil::spawn_script(|| {
+            crate::instance::spawn_watched(&script, "unused")
+        }) else {
+            return;
+        };
+        watch_restart(child, move |body| tx.send(body).expect("send"));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_err(),
+            "an already-reported failure must not be reported again"
+        );
+    }
+
+    #[test]
+    fn watching_a_succeeding_child_reports_nothing() {
+        let temp = crate::testutil::TempDir::new("watch-restart-ok");
+        let script = temp.path().join("ok.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+        crate::testutil::set_mode(&script, 0o755);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Some(child) = crate::testutil::spawn_script(|| {
+            crate::instance::spawn_watched(&script, "unused")
+        }) else {
+            return;
+        };
+        watch_restart(child, move |body| tx.send(body).expect("send"));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_err(),
+            "a clean exit must not be reported"
         );
     }
 }
