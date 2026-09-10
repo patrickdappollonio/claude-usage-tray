@@ -378,24 +378,24 @@ impl UsageAlert {
 const WINDOW_JITTER_TOLERANCE_SECS: i64 = 60;
 
 /// Whether two `resets_at` readings describe the same window, within
-/// [`WINDOW_JITTER_TOLERANCE_SECS`]. "No reset time" is only the same window
-/// as "no reset time".
-fn same_window(a: Option<Timestamp>, b: Option<Timestamp>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => (a.as_second() - b.as_second()).abs() <= WINDOW_JITTER_TOLERANCE_SECS,
-        (None, None) => true,
-        _ => false,
-    }
+/// [`WINDOW_JITTER_TOLERANCE_SECS`].
+fn same_window(a: Timestamp, b: Timestamp) -> bool {
+    (a.as_second() - b.as_second()).abs() <= WINDOW_JITTER_TOLERANCE_SECS
 }
 
 /// Pure state machine deciding when a threshold notification should fire.
 ///
-/// Each threshold fires once per crossing. A threshold re-arms when the
-/// session percentage drops back below it, or when `resets_at` moves by more
-/// than [`WINDOW_JITTER_TOLERANCE_SECS`] (a new 5-hour window began; smaller
-/// movements are jitter, not a rollover). Readings without a percentage are ignored entirely:
-/// they neither fire nor re-arm, so a temporarily unreadable cache cannot
-/// cause a duplicate alert.
+/// Each threshold fires once per window. The only thing that re-arms it is
+/// `resets_at` moving by more than [`WINDOW_JITTER_TOLERANCE_SECS`] (a new
+/// 5-hour window began; smaller movements are jitter, not a rollover). A
+/// percentage that *falls* inside the same window does **not** re-arm
+/// anything: real usage never goes down within a window, so a lower reading
+/// means the merge switched to a source that rounds differently (the hook
+/// cache and the app cache routinely disagree by a point), and re-arming on
+/// the dip would announce the same crossing on every flip. Readings without
+/// a percentage are ignored entirely, and readings without a reset time keep
+/// the current window rather than counting as a new one, so a temporarily
+/// incomplete cache cannot cause a duplicate alert.
 ///
 /// The **first reading that carries a percentage is a baseline, not a
 /// crossing**: every threshold at or below it is recorded as delivered and
@@ -409,17 +409,18 @@ fn same_window(a: Option<Timestamp>, b: Option<Timestamp>) -> bool {
 /// Fired state is tracked for *every* threshold in [`NOTIFY_THRESHOLDS`],
 /// including the ones currently switched off. That is what makes toggling
 /// safe: a threshold the user re-enables while usage is already past it is
-/// recorded as delivered, so it stays quiet until the next real crossing,
-/// exactly as if it had been on the whole time. It is also what makes a jump
-/// past several thresholds fire only the highest one.
+/// recorded as delivered, so it stays quiet until the next window, exactly as
+/// if it had been on the whole time. It is also what makes a jump past
+/// several thresholds fire only the highest one.
 #[derive(Debug)]
 pub struct Notifier {
     /// The enabled subset of [`NOTIFY_THRESHOLDS`].
     enabled: Vec<u8>,
     /// Thresholds already delivered (or passed) for the current window.
     fired: Vec<u8>,
+    /// The `resets_at` of the window the fired state belongs to. `None` until
+    /// a reading carries one.
     window: Option<Timestamp>,
-    seen_window: bool,
     /// Whether a reading with a real percentage has been seen yet. The first
     /// one is the baseline (see [`Notifier::evaluate`]) and never alerts.
     baselined: bool,
@@ -432,7 +433,6 @@ impl Notifier {
             enabled: enabled.to_vec(),
             fired: Vec::new(),
             window: None,
-            seen_window: false,
             baselined: false,
         }
     }
@@ -463,15 +463,16 @@ impl Notifier {
         let metric = session?;
         let percent = metric.percent?;
 
-        if !self.seen_window || !same_window(self.window, metric.resets_at) {
-            self.seen_window = true;
-            self.fired.clear();
-        }
-        // Recorded on every reading, not only on a re-arm: the comparison is
-        // against the *previous* reading, so a reset time that creeps forward
+        // A rollover is the only thing that re-arms. The comparison is against
+        // the *previous* dated reading, so a reset time that creeps forward
         // by a second at a time never accumulates its way into a false
-        // rollover.
-        self.window = metric.resets_at;
+        // rollover; a reading with no reset time leaves the window as it was.
+        if let Some(resets_at) = metric.resets_at {
+            if self.window.is_some_and(|previous| !same_window(previous, resets_at)) {
+                self.fired.clear();
+            }
+            self.window = Some(resets_at);
+        }
 
         // The startup baseline. Usage that was already past a threshold when
         // the tray started is not a crossing the tray witnessed, and
@@ -482,10 +483,6 @@ impl Notifier {
             self.baseline(percent);
             return None;
         }
-
-        // Anything usage has fallen back below is armed again.
-        self.fired
-            .retain(|&threshold| percent >= f64::from(threshold));
 
         let alert = self
             .enabled
@@ -2072,15 +2069,33 @@ mod tests {
     }
 
     #[test]
-    fn notifier_rearms_when_percent_drops_below_threshold() {
+    fn notifier_does_not_refire_when_percent_wobbles_across_a_threshold() {
+        // The hook cache and the app cache round the same window differently
+        // and the merge flips between them as each refreshes, so at the
+        // limit the notifier sees 100 -> 99 -> 100. One alert, not one per flip.
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
+        assert!(n.evaluate(Some(&metric(Some(100.0), Some(BASE)))).is_some());
+        assert_eq!(n.evaluate(Some(&metric(Some(99.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(100.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(99.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(100.0), Some(BASE)))), None);
+    }
+
+    #[test]
+    fn notifier_does_not_rearm_on_a_drop_within_the_same_window() {
+        // Usage never really falls inside a 5-hour window; a lower reading
+        // is another source's rounding, not a fresh crossing.
         let mut n = all_on();
         n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
         assert!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))).is_some());
         assert_eq!(n.evaluate(Some(&metric(Some(60.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(77.0), Some(BASE)))), None);
+        // The next threshold up is still a real crossing.
         let alert = n
-            .evaluate(Some(&metric(Some(77.0), Some(BASE))))
-            .expect("re-armed by the drop");
-        assert_eq!(alert.threshold, 75);
+            .evaluate(Some(&metric(Some(90.0), Some(BASE))))
+            .expect("90 crossed for the first time");
+        assert_eq!(alert.threshold, 90);
     }
 
     #[test]
@@ -2129,14 +2144,28 @@ mod tests {
     }
 
     #[test]
-    fn notifier_treats_appearing_and_disappearing_reset_times_as_new_windows() {
+    fn notifier_ignores_a_reading_without_a_reset_time_for_window_tracking() {
         let mut n = all_on();
         n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
         assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
-        // A reading that lost its reset time is not "the same window".
-        assert!(n.evaluate(Some(&metric(Some(82.0), None))).is_some());
+        // Losing and regaining the reset time is not a rollover.
         assert_eq!(n.evaluate(Some(&metric(Some(82.0), None))), None);
-        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))).is_some());
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), None))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
+        // A genuinely new window seen after the gap still re-arms.
+        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE + 18_000)))).is_some());
+    }
+
+    #[test]
+    fn notifier_without_any_reset_time_never_rearms() {
+        // A source that never reports `resets_at` cannot tell windows apart,
+        // so each threshold fires once for the life of the process rather
+        // than on every wobble.
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), None)));
+        assert!(n.evaluate(Some(&metric(Some(82.0), None))).is_some());
+        assert_eq!(n.evaluate(Some(&metric(Some(70.0), None))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(82.0), None))), None);
     }
 
     #[test]
@@ -2158,16 +2187,12 @@ mod tests {
     }
 
     #[test]
-    fn notifier_baseline_still_re_arms_on_a_drop_and_re_rise() {
+    fn notifier_baseline_stays_quiet_through_a_dip_and_re_rise() {
         let mut n = all_on();
         assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
-        // Below 75 again: that threshold is armed even though its "crossing"
-        // was never announced.
+        // A dip below 75 and back is source disagreement, not a crossing.
         assert_eq!(n.evaluate(Some(&metric(Some(70.0), Some(BASE)))), None);
-        let alert = n
-            .evaluate(Some(&metric(Some(76.0), Some(BASE))))
-            .expect("a real crossing after the baseline");
-        assert_eq!(alert.threshold, 75);
+        assert_eq!(n.evaluate(Some(&metric(Some(76.0), Some(BASE)))), None);
     }
 
     #[test]
@@ -2241,17 +2266,18 @@ mod tests {
     }
 
     #[test]
-    fn notifier_reenabling_after_a_drop_fires_on_the_next_crossing() {
+    fn notifier_reenabling_stays_quiet_until_the_next_window() {
         let mut n = Notifier::new(&[50, 75]);
         // The startup baseline, which is silent whatever it reads.
         assert_eq!(n.evaluate(Some(&metric(Some(95.0), Some(BASE)))), None);
         n.set_enabled(&NOTIFY_THRESHOLDS);
-        // Usage falls back below 90, then climbs again: now it is a crossing
-        // the user has asked to hear about.
+        // A dip and re-rise inside the same window is still not a crossing.
         assert_eq!(n.evaluate(Some(&metric(Some(80.0), Some(BASE)))), None);
+        assert_eq!(n.evaluate(Some(&metric(Some(92.0), Some(BASE)))), None);
+        // The next window is.
         let alert = n
-            .evaluate(Some(&metric(Some(92.0), Some(BASE))))
-            .expect("re-armed by the drop");
+            .evaluate(Some(&metric(Some(92.0), Some(BASE + 18_000))))
+            .expect("new window");
         assert_eq!(alert.threshold, 90);
     }
 

@@ -221,8 +221,8 @@ pub fn default_kayfabe_path() -> PathBuf {
 /// follows the file's mtime, so it is *stable* for an unedited file: anchoring
 /// it to `now` moved every reset time forward a few seconds per tick, and the
 /// threshold notifier reads a changed `resets_at` as "a new 5-hour window
-/// began" — which re-armed every threshold and re-fired the alert on every
-/// single poll. An mtime-anchored reset only moves when the fixture is
+/// began" — which re-arms every threshold and would re-fire the alert on
+/// every single poll. An mtime-anchored reset only moves when the fixture is
 /// actually edited, which is exactly when a re-arm is wanted. A file whose
 /// mtime cannot be read falls back to `now`, which is no worse than the old
 /// behaviour.

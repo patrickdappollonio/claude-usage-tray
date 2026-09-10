@@ -49,7 +49,7 @@ impl IconImage {
     #[cfg(any(target_os = "macos", test))]
     pub fn to_rgba(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.data.len());
-        for px in self.data.chunks_exact(4) {
+        for px in self.data.as_chunks::<4>().0 {
             out.extend_from_slice(&[px[1], px[2], px[3], px[0]]);
         }
         out
@@ -424,7 +424,7 @@ fn arc_path(cx: f32, cy: f32, radius: f32, start_deg: f32, sweep_deg: f32) -> Op
 /// i.e. alpha byte first).
 fn premultiplied_rgba_to_argb_be(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    for px in data.chunks_exact(4) {
+    for px in data.as_chunks::<4>().0 {
         let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
         let (r, g, b) = if a == 0 {
             (0, 0, 0)
@@ -491,7 +491,7 @@ mod tests {
             let expected_len = (expected as usize) * (expected as usize) * 4;
             assert_eq!(icon.data.len(), expected_len);
             assert!(
-                icon.data.chunks_exact(4).any(|px| px[0] != 0),
+                icon.data.as_chunks::<4>().0.iter().any(|px| px[0] != 0),
                 "expected at least one non-transparent (alpha != 0) pixel"
             );
         }
@@ -511,7 +511,7 @@ mod tests {
 
         let mut gray_like = 0usize;
         let mut visible = 0usize;
-        for px in icon.data.chunks_exact(4) {
+        for px in icon.data.as_chunks::<4>().0 {
             let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
             if a == 0 {
                 continue;
@@ -535,7 +535,7 @@ mod tests {
     fn zero_percent_session_draws_no_arc_but_still_renders_ring_and_dot() {
         let snap = snapshot(SnapshotState::Fresh, Some(0.0), Some(0.0));
         let icons = render_icons(&snap, IconAppearance::Color);
-        assert!(icons[2].data.chunks_exact(4).any(|px| px[0] != 0));
+        assert!(icons[2].data.as_chunks::<4>().0.iter().any(|px| px[0] != 0));
     }
 
     /// A `None` percent must render as neutral gray, never as the green that
@@ -549,7 +549,7 @@ mod tests {
         let green = (67u8, 160u8, 71u8);
         let mut green_like = 0usize;
         let mut visible = 0usize;
-        for px in icon.data.chunks_exact(4) {
+        for px in icon.data.as_chunks::<4>().0 {
             let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
             if a == 0 {
                 continue;
@@ -608,7 +608,7 @@ mod tests {
     /// premultiplication already undone by the ARGB conversion.
     fn visible_pixels(icon: &IconImage) -> Vec<(u8, u8, u8)> {
         icon.data
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .filter(|px| px[0] != 0)
             .map(|px| (px[1], px[2], px[3]))
             .collect()
@@ -816,7 +816,7 @@ mod tests {
             let fresh = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
             let stale = snapshot(SnapshotState::Stale, Some(70.0), Some(30.0));
             let max_alpha =
-                |icon: &IconImage| icon.data.chunks_exact(4).map(|px| px[0]).max().unwrap_or(0);
+                |icon: &IconImage| icon.data.as_chunks::<4>().0.iter().map(|px| px[0]).max().unwrap_or(0);
             for (f, s) in render_icons(&fresh, appearance)
                 .iter()
                 .zip(render_icons(&stale, appearance).iter())
@@ -1010,7 +1010,7 @@ mod tests {
         );
         let icon = &icons[2];
         let rgba = icon.to_rgba();
-        let alphas: Vec<u8> = rgba.chunks_exact(4).map(|px| px[3]).collect();
+        let alphas: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
         assert!(alphas.contains(&0), "nothing is transparent");
         assert!(alphas.iter().any(|&a| a > 200), "nothing is drawn");
     }
