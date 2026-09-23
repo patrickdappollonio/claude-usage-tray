@@ -131,13 +131,15 @@ pub fn write_cache(path: &Path, body: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Whether a parsed statusline document has a non-null `rate_limits` key.
+fn value_has_rate_limits(value: &serde_json::Value) -> bool {
+    matches!(value.get("rate_limits"), Some(v) if !v.is_null())
+}
+
 /// Whether a document (raw statusline bytes) has a non-null `rate_limits`
 /// key. Malformed JSON and an explicit `null` both count as "lacks it".
 fn has_rate_limits(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    matches!(value.get("rate_limits"), Some(v) if !v.is_null())
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| value_has_rate_limits(&v))
 }
 
 /// Decides whether the `statusline` subcommand should overwrite the cache
@@ -148,14 +150,22 @@ fn has_rate_limits(body: &[u8]) -> bool {
 /// verbatim would clobber a previous cache that *did* have real usage data,
 /// and the tray would show "no data" until the session's first real turn.
 ///
-/// So: skip the write only when the incoming payload lacks `rate_limits` and
-/// an existing cache is present and *does* have it — that's the one case
-/// where writing loses information. Every other case writes: there's no
-/// cache yet, the incoming payload carries real data, or the existing cache
-/// was equally empty (an empty-but-present cache is still better than none
-/// for first-run UX, and mtime freshness should still tick forward).
+/// Incoming bytes that are not JSON at all (a truncated or interrupted stdin
+/// delivery) never write: the tray reads unparseable bytes as "no data", so
+/// they are never better than whatever the cache already holds.
+///
+/// Otherwise, skip the write only when the incoming payload lacks
+/// `rate_limits` and an existing cache is present and *does* have it — that's
+/// the one case where writing loses information. Every other case writes:
+/// there's no cache yet, the incoming payload carries real data, or the
+/// existing cache was equally empty (an empty-but-present cache is still
+/// better than none for first-run UX, and mtime freshness should still tick
+/// forward).
 pub fn should_write_cache(incoming: &[u8], existing: Option<&[u8]>) -> bool {
-    if has_rate_limits(incoming) {
+    let Ok(incoming) = serde_json::from_slice::<serde_json::Value>(incoming) else {
+        return false;
+    };
+    if value_has_rate_limits(&incoming) {
         return true;
     }
     match existing {
@@ -937,6 +947,23 @@ mod tests {
         let incoming = b"not json";
         let existing = br#"{"rate_limits":{"five_hour":{"used_percentage":1}}}"#;
         assert!(!should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_skips_when_incoming_malformed_and_existing_lacks_rate_limits() {
+        let incoming = br#"{"model":{"id":"op"#;
+        let existing = br#"{"model":"sonnet"}"#;
+        assert!(!should_write_cache(incoming, Some(existing)));
+    }
+
+    #[test]
+    fn should_write_cache_skips_when_incoming_malformed_and_no_existing_cache() {
+        assert!(!should_write_cache(br#"{"rate_limits":{"five_"#, None));
+    }
+
+    #[test]
+    fn should_write_cache_skips_empty_input() {
+        assert!(!should_write_cache(b"", None));
     }
 
     #[test]

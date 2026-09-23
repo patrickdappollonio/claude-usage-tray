@@ -730,10 +730,12 @@ fn run_statusline(args: &[String]) -> i32 {
     };
 
     let mut stdin = std::io::stdin().lock();
-    let (input, complete) = read_capped(&mut stdin, STATUSLINE_INPUT_LIMIT);
-    // An oversized payload was cut off at the cap, so it is not a whole JSON
-    // document and there is nothing worth caching.
-    if complete {
+    let (input, end) = read_capped(&mut stdin, STATUSLINE_INPUT_LIMIT);
+    // Only a whole payload is worth caching. An oversized one was cut off at
+    // the cap, and a failed read holds only what arrived before the error:
+    // neither is a whole JSON document, and a partial one must not replace
+    // the last good cache.
+    if end == InputEnd::Complete {
         let cache_path = source::default_cache_path();
         let existing = std::fs::read(&cache_path).ok();
         if source::should_write_cache(&input, existing.as_deref()) {
@@ -754,7 +756,7 @@ fn run_statusline(args: &[String]) -> i32 {
             .spawn();
         if let Ok(mut child) = child {
             if let Some(mut pipe) = child.stdin.take() {
-                let _ = forward(&input, complete, &mut stdin, &mut pipe);
+                let _ = forward(&input, end, &mut stdin, &mut pipe);
                 // Dropping closes the pipe, so a child reading to EOF finishes.
                 drop(pipe);
             }
@@ -769,17 +771,27 @@ fn run_statusline(args: &[String]) -> i32 {
 /// from growing a process that runs on every prompt render.
 const STATUSLINE_INPUT_LIMIT: u64 = 1024 * 1024;
 
-/// Reads from `reader` until it ends or passes `limit` bytes. The flag is
-/// `true` when the stream ended within the limit; when it is `false`, the
-/// buffer holds one byte over the limit and more may remain unread.
-///
-/// A read error leaves whatever arrived before it and counts as the end of
-/// the stream; there is nothing better to do with it than carry on.
-fn read_capped(reader: &mut impl Read, limit: u64) -> (Vec<u8>, bool) {
+/// How reading the statusline payload ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputEnd {
+    /// The stream ended within the limit.
+    Complete,
+    /// The stream passed the limit; the buffer holds one byte over it and
+    /// more may remain unread.
+    OverLimit,
+    /// A read error stopped the stream; the buffer holds what arrived first.
+    Failed,
+}
+
+/// Reads from `reader` until it ends, fails, or passes `limit` bytes.
+fn read_capped(reader: &mut impl Read, limit: u64) -> (Vec<u8>, InputEnd) {
     let mut input = Vec::new();
-    let _ = reader.take(limit + 1).read_to_end(&mut input);
-    let complete = input.len() as u64 <= limit;
-    (input, complete)
+    let end = match reader.take(limit + 1).read_to_end(&mut input) {
+        Err(_) => InputEnd::Failed,
+        Ok(_) if input.len() as u64 > limit => InputEnd::OverLimit,
+        Ok(_) => InputEnd::Complete,
+    };
+    (input, end)
 }
 
 /// Writes the bytes already read to `sink`, then, when the stream was cut
@@ -787,12 +799,12 @@ fn read_capped(reader: &mut impl Read, limit: u64) -> (Vec<u8>, bool) {
 /// all, so the `--exec` command still sees the whole payload.
 fn forward(
     head: &[u8],
-    complete: bool,
+    end: InputEnd,
     reader: &mut impl Read,
     sink: &mut impl Write,
 ) -> std::io::Result<()> {
     sink.write_all(head)?;
-    if !complete {
+    if end == InputEnd::OverLimit {
         std::io::copy(reader, sink)?;
     }
     Ok(())
@@ -1242,24 +1254,24 @@ mod statusline_input {
 
     #[test]
     fn a_payload_within_the_limit_is_read_whole() {
-        let (input, complete) = read_capped(&mut &b"{\"a\":1}"[..], 16);
+        let (input, end) = read_capped(&mut &b"{\"a\":1}"[..], 16);
         assert_eq!(input, b"{\"a\":1}");
-        assert!(complete);
+        assert_eq!(end, InputEnd::Complete);
     }
 
     #[test]
     fn a_payload_exactly_at_the_limit_is_complete() {
-        let (input, complete) = read_capped(&mut &b"12345678"[..], 8);
+        let (input, end) = read_capped(&mut &b"12345678"[..], 8);
         assert_eq!(input, b"12345678");
-        assert!(complete);
+        assert_eq!(end, InputEnd::Complete);
     }
 
     #[test]
     fn a_payload_over_the_limit_stops_one_byte_past_it() {
         let mut reader = &b"0123456789abcdef"[..];
-        let (input, complete) = read_capped(&mut reader, 8);
+        let (input, end) = read_capped(&mut reader, 8);
         assert_eq!(input, b"012345678");
-        assert!(!complete);
+        assert_eq!(end, InputEnd::OverLimit);
         assert_eq!(reader, b"9abcdef");
     }
 
@@ -1267,19 +1279,52 @@ mod statusline_input {
     fn an_oversized_payload_reaches_the_command_whole() {
         let payload: Vec<u8> = (0..=255).cycle().take(10_000).collect();
         let mut reader = &payload[..];
-        let (head, complete) = read_capped(&mut reader, 100);
+        let (head, end) = read_capped(&mut reader, 100);
         let mut sink = Vec::new();
-        forward(&head, complete, &mut reader, &mut sink).unwrap();
+        forward(&head, end, &mut reader, &mut sink).unwrap();
         assert_eq!(sink, payload);
     }
 
     #[test]
     fn a_complete_payload_is_forwarded_once() {
         let mut reader = &b"{}"[..];
-        let (head, complete) = read_capped(&mut reader, 100);
+        let (head, end) = read_capped(&mut reader, 100);
         let mut sink = Vec::new();
-        forward(&head, complete, &mut reader, &mut sink).unwrap();
+        forward(&head, end, &mut reader, &mut sink).unwrap();
         assert_eq!(sink, b"{}");
+    }
+
+    /// Hands out `head`, then fails, the way an interrupted pipe does.
+    struct FailsAfter<'a> {
+        head: &'a [u8],
+    }
+
+    impl Read for FailsAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.head.is_empty() {
+                return Err(std::io::Error::other("interrupted"));
+            }
+            self.head.read(buf)
+        }
+    }
+
+    #[test]
+    fn a_failed_read_keeps_what_arrived_and_reports_the_failure() {
+        let mut reader = FailsAfter {
+            head: br#"{"model":{"id":"op"#,
+        };
+        let (input, end) = read_capped(&mut reader, 100);
+        assert_eq!(input, br#"{"model":{"id":"op"#);
+        assert_eq!(end, InputEnd::Failed);
+    }
+
+    #[test]
+    fn a_failed_read_forwards_only_what_arrived() {
+        let mut reader = FailsAfter { head: b"{\"a\"" };
+        let (head, end) = read_capped(&mut reader, 100);
+        let mut sink = Vec::new();
+        forward(&head, end, &mut reader, &mut sink).unwrap();
+        assert_eq!(sink, b"{\"a\"");
     }
 }
 
