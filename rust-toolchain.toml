@@ -1,0 +1,6 @@
+# Every build, local and CI, uses exactly this toolchain; rustup reads this
+# file on its own. Bump it deliberately, in its own change, after checking that
+# `cargo fmt --check`, clippy and the tests still pass on the new version.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]

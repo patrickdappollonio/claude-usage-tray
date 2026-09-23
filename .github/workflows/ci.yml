@@ -22,9 +22,15 @@ jobs:
       # No system dependencies are installed on purpose: this crate is pure
       # Rust with zero C dependencies (zbus speaks D-Bus over a socket, no
       # libdbus; tiny-skia is pure Rust; no GTK, no OpenSSL).
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      #
+      # Installs the version pinned in rust-toolchain.toml, with its
+      # components, so CI never moves to a new Rust on its own.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      # First, since it needs no build: a formatting slip fails in seconds.
+      - name: Format
+        run: cargo fmt --all --check
 
       - uses: Swatinem/rust-cache@v2
 
@@ -46,9 +52,11 @@ jobs:
       # Also no system dependencies: the macOS backend is AppKit through
       # tray-icon/muda/tao, all of which bind the system frameworks that ship
       # with the Xcode command line tools the runner already has.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      #
+      # Installs the version pinned in rust-toolchain.toml, with its
+      # components, so CI never moves to a new Rust on its own.
+      - name: Install Rust
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
         with:
