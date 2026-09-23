@@ -41,6 +41,7 @@ mod source;
 mod testutil;
 mod ui;
 mod update;
+mod wrapped;
 
 use jiff::Timestamp;
 use platform::{Channel, Toast, Urgency};
@@ -714,7 +715,7 @@ fn run_tray_locked(spawned: bool) -> i32 {
 /// The `statusline` subcommand: pure transport. Reads Claude Code's statusline
 /// JSON from stdin, writes it verbatim to the cache, and — with `--exec` —
 /// hands the same bytes to the user's own statusline command and lets its
-/// stdout through untouched.
+/// stdout through untouched, killing it if it runs past [`wrapped::TIMEOUT`].
 ///
 /// It exits 0 whatever happens short of a usage error: a broken cache write or
 /// a failing child must never make somebody's statusline worse, and this
@@ -744,24 +745,13 @@ fn run_statusline(args: &[String]) -> i32 {
     }
 
     if let Some(command) = exec {
-        // stdout is inherited rather than piped and copied, so the child's
-        // bytes reach Claude Code exactly as written — no added newline, no
-        // buffering surprises.
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn();
-        if let Ok(mut child) = child {
-            if let Some(mut pipe) = child.stdin.take() {
-                let _ = forward(&input, end, &mut stdin, &mut pipe);
-                // Dropping closes the pipe, so a child reading to EOF finishes.
-                drop(pipe);
-            }
-            let _ = child.wait();
-        }
+        // The feed runs on another thread, and the rest of an oversized
+        // payload is read there, so this thread must let go of stdin.
+        drop(stdin);
+        let feed = move |pipe: &mut std::process::ChildStdin| {
+            let _ = forward(&input, end, &mut std::io::stdin(), pipe);
+        };
+        let _ = wrapped::run(&command, feed, wrapped::TIMEOUT);
     }
     0
 }
