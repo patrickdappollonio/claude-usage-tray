@@ -18,6 +18,63 @@
 
 use std::path::{Path, PathBuf};
 
+/// The path to record anywhere this program has to be found again later: the
+/// statusline hook, the autostart entry, the upgrade watch.
+///
+/// Usually that is just `current_exe()`, but a Homebrew install needs more
+/// care. On Linux `current_exe()` always resolves symlinks, so it reports
+/// `<prefix>/Cellar/<name>/<version>/bin/<binary>`. That path stops existing
+/// once `brew upgrade` cleans up the old version. See [`stable_path`].
+pub fn current() -> std::io::Result<PathBuf> {
+    std::env::current_exe().map(|exe| stable_path(&exe))
+}
+
+/// Maps a binary inside a versioned Homebrew directory to the link Homebrew
+/// keeps pointing at the installed version, and returns anything else
+/// unchanged.
+///
+/// The versioned layouts are `<prefix>/Cellar/<name>/<version>/…` (formulae)
+/// and `<prefix>/Caskroom/<name>/<version>/…` (casks). The candidates are
+/// `<prefix>/bin/<binary>`, the one on `PATH`, then for formulae
+/// `<prefix>/opt/<name>/…`. A candidate is only used when it resolves to the
+/// very file `exe` names, so a link that belongs to some other installation
+/// or version is never picked.
+pub fn stable_path(exe: &Path) -> PathBuf {
+    let Some(file_name) = exe.file_name() else {
+        return exe.to_path_buf();
+    };
+    let Ok(real) = std::fs::canonicalize(exe) else {
+        return exe.to_path_buf();
+    };
+    let components: Vec<_> = exe.components().collect();
+    // `…/<Cellar|Caskroom>/<name>/<version>/<rest…>`: the keg directory sits
+    // three components before the rest.
+    for (index, component) in components.iter().enumerate() {
+        let keg_root = component.as_os_str();
+        if keg_root != "Cellar" && keg_root != "Caskroom" {
+            continue;
+        }
+        let (Some(name), Some(_version)) = (components.get(index + 1), components.get(index + 2))
+        else {
+            continue;
+        };
+        let prefix: PathBuf = components[..index].iter().collect();
+        let rest: PathBuf = components[index + 3..].iter().collect();
+
+        let mut candidates = vec![prefix.join("bin").join(file_name)];
+        if keg_root == "Cellar" && !rest.as_os_str().is_empty() {
+            candidates.push(prefix.join("opt").join(name).join(&rest));
+        }
+        if let Some(found) = candidates
+            .into_iter()
+            .find(|candidate| std::fs::canonicalize(candidate).is_ok_and(|c| c == real))
+        {
+            return found;
+        }
+    }
+    exe.to_path_buf()
+}
+
 /// What `stat` says about the file a path points at, reduced to the fields
 /// that change when a file is replaced or rewritten.
 ///
@@ -226,6 +283,74 @@ mod tests {
         let exe = temp.path().join("tray");
         let watch = BinaryWatch::new(&exe);
         assert_eq!(watch.path(), exe);
+    }
+
+    /// Lays out `<prefix>/<keg_root>/tray/<version>/<rest>` with a binary in
+    /// it and returns the binary's path.
+    fn keg(prefix: &Path, keg_root: &str, version: &str, rest: &str) -> PathBuf {
+        let exe = prefix.join(keg_root).join("tray").join(version).join(rest);
+        std::fs::create_dir_all(exe.parent().expect("parent")).expect("create keg");
+        std::fs::write(&exe, version).expect("write binary");
+        exe
+    }
+
+    fn link(target: &str, at: &Path) {
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("create link dir");
+        std::os::unix::fs::symlink(target, at).expect("symlink");
+    }
+
+    #[test]
+    fn a_formula_binary_maps_to_the_prefix_bin_link() {
+        let temp = TempDir::new("stable-formula");
+        let exe = keg(temp.path(), "Cellar", "1.0.3", "bin/tray");
+        let bin = temp.path().join("bin/tray");
+        link("../Cellar/tray/1.0.3/bin/tray", &bin);
+
+        assert_eq!(stable_path(&exe), bin);
+    }
+
+    #[test]
+    fn a_cask_binary_maps_to_the_prefix_bin_link() {
+        let temp = TempDir::new("stable-cask");
+        let exe = keg(temp.path(), "Caskroom", "1.0.3", "tray");
+        let bin = temp.path().join("bin/tray");
+        link("../Caskroom/tray/1.0.3/tray", &bin);
+
+        assert_eq!(stable_path(&exe), bin);
+    }
+
+    /// An unlinked formula has no `bin/` entry, but `opt/` still exists.
+    #[test]
+    fn a_formula_without_a_bin_link_falls_back_to_opt() {
+        let temp = TempDir::new("stable-opt");
+        let exe = keg(temp.path(), "Cellar", "1.0.3", "bin/tray");
+        link("../Cellar/tray/1.0.3", &temp.path().join("opt/tray"));
+
+        assert_eq!(stable_path(&exe), temp.path().join("opt/tray/bin/tray"));
+    }
+
+    /// A newer version is linked but this one is still running: the link is
+    /// not this binary, so it is not what this binary records.
+    #[test]
+    fn a_link_to_another_version_is_not_used() {
+        let temp = TempDir::new("stable-other-version");
+        let exe = keg(temp.path(), "Cellar", "1.0.3", "bin/tray");
+        keg(temp.path(), "Cellar", "1.0.4", "bin/tray");
+        link(
+            "../Cellar/tray/1.0.4/bin/tray",
+            &temp.path().join("bin/tray"),
+        );
+
+        assert_eq!(stable_path(&exe), exe);
+    }
+
+    #[test]
+    fn a_binary_outside_homebrew_is_left_alone() {
+        let temp = TempDir::new("stable-plain");
+        let exe = temp.path().join("tray");
+        install(&exe, b"v1");
+
+        assert_eq!(stable_path(&exe), exe);
     }
 
     #[test]

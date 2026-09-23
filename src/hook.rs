@@ -572,6 +572,34 @@ impl UninstallReport {
     }
 }
 
+/// Points an installed hook at `exe` when it records some other binary: a
+/// Homebrew version directory that an upgrade has since removed, or a binary
+/// the user has moved. Returns the path it replaced, or `None` when there was
+/// nothing to do.
+///
+/// Unlike [`install_in`] this never adds the hook. A `statusLine.command` that
+/// is not ours, or no settings file at all, is left exactly as it is.
+pub fn repair_in(config_dir: &Path, exe: &Path) -> io::Result<Option<String>> {
+    let settings_path = config_dir.join(SETTINGS_FILE_NAME);
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+    let mut settings = read_settings(&settings_path)?;
+    let Some(ours) = command_of(&settings).as_deref().and_then(parse_our_command) else {
+        return Ok(None);
+    };
+    let exe = exe.to_string_lossy();
+    if ours.exe == exe {
+        return Ok(None);
+    }
+    set_command(
+        &mut settings,
+        &build_command(&exe, ours.original.as_deref()),
+    );
+    write_settings(&settings_path, &settings)?;
+    Ok(Some(ours.exe))
+}
+
 /// What `hook status` found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusReport {
@@ -990,6 +1018,58 @@ mod tests {
             report.command,
             "/new/path/tray statusline --exec '~/.claude/line.sh'"
         );
+    }
+
+    #[test]
+    fn repair_points_a_stale_versioned_path_at_the_running_binary() {
+        let temp = TempDir::new("hook-repair-stale");
+        write_settings_file(
+            temp.path(),
+            r#"{"model":"opus","statusLine":{"type":"command","command":"/brew/Cellar/tray/1.0.3/bin/tray statusline --exec '~/.claude/line.sh'"}}"#,
+        );
+        let replaced = repair_in(temp.path(), Path::new("/brew/bin/tray")).expect("repair");
+        assert_eq!(
+            replaced.as_deref(),
+            Some("/brew/Cellar/tray/1.0.3/bin/tray")
+        );
+
+        let settings = settings_json(temp.path());
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "/brew/bin/tray statusline --exec '~/.claude/line.sh'"
+        );
+        assert_eq!(settings["model"], "opus", "other keys must survive");
+    }
+
+    #[test]
+    fn repair_leaves_a_current_hook_untouched() {
+        let temp = TempDir::new("hook-repair-current");
+        let body = r#"{"statusLine":{"type":"command","command":"/home/me/bin/claude-usage-tray statusline"}}"#;
+        write_settings_file(temp.path(), body);
+
+        assert_eq!(repair_in(temp.path(), &exe()).expect("repair"), None);
+        assert_eq!(
+            read(&temp.path().join(SETTINGS_FILE_NAME)),
+            body,
+            "not rewritten"
+        );
+    }
+
+    #[test]
+    fn repair_never_installs_the_hook() {
+        let temp = TempDir::new("hook-repair-foreign");
+        let body = r#"{"statusLine":{"type":"command","command":"~/.claude/line.sh"}}"#;
+        write_settings_file(temp.path(), body);
+
+        assert_eq!(repair_in(temp.path(), &exe()).expect("repair"), None);
+        assert_eq!(read(&temp.path().join(SETTINGS_FILE_NAME)), body);
+    }
+
+    #[test]
+    fn repair_without_a_settings_file_does_not_create_one() {
+        let temp = TempDir::new("hook-repair-missing");
+        assert_eq!(repair_in(temp.path(), &exe()).expect("repair"), None);
+        assert!(!temp.path().join(SETTINGS_FILE_NAME).exists());
     }
 
     #[test]

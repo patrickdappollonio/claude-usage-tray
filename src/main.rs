@@ -768,7 +768,7 @@ fn run_hook(args: &[String]) -> i32 {
     let config_dir = source::claude_config_dir();
     match args.first().map(String::as_str) {
         Some("install") if args.len() == 1 => {
-            let exe = match std::env::current_exe() {
+            let exe = match binary::current() {
                 Ok(exe) => exe,
                 Err(err) => {
                     eprintln!("claude-usage-tray: cannot determine my own path: {err}");
@@ -798,7 +798,7 @@ fn run_hook(args: &[String]) -> i32 {
         },
         Some("status") if args.len() == 1 => {
             let report = hook::status_in(&config_dir, Timestamp::now());
-            let exe = std::env::current_exe().ok();
+            let exe = binary::current().ok();
             println!("{}", report.render(exe.as_deref(), Timestamp::now()));
             0
         }
@@ -809,12 +809,36 @@ fn run_hook(args: &[String]) -> i32 {
     }
 }
 
+/// Points the statusline hook and the autostart entry at the running binary
+/// when they name another one, most often a Homebrew version directory that an
+/// upgrade removed. Runs once at tray startup, so the first launch after an
+/// upgrade fixes what the upgrade broke. Neither is ever created here, and
+/// failures are only logged: the tray works without either.
+fn repair_recorded_paths(exe: &Path) {
+    match hook::repair_in(&source::claude_config_dir(), exe) {
+        Ok(Some(old)) => eprintln!(
+            "claude-usage-tray: statusline hook pointed at {old}, now {}",
+            exe.display()
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!("claude-usage-tray: could not check the statusline hook: {err}"),
+    }
+    match platform::autostart::refresh(exe) {
+        Ok(true) => eprintln!(
+            "claude-usage-tray: autostart entry now starts {}",
+            exe.display()
+        ),
+        Ok(false) => {}
+        Err(err) => eprintln!("claude-usage-tray: could not check the autostart entry: {err}"),
+    }
+}
+
 /// Runs the hook installer from the tray's menu item and returns the toast to
 /// show. Deliberately called from the poll loop rather than from the D-Bus
 /// callback, so the filesystem work never blocks the menu.
 fn install_hook_now() -> String {
-    let result = std::env::current_exe()
-        .and_then(|exe| hook::install_in(&source::claude_config_dir(), &exe));
+    let result =
+        binary::current().and_then(|exe| hook::install_in(&source::claude_config_dir(), &exe));
     hook::install_toast(&result)
 }
 
@@ -918,7 +942,15 @@ fn run_tray() {
     // else can chdir or otherwise disturb the answer. If the path cannot be
     // determined at all there is nothing to watch and nothing to restart into,
     // so the feature simply stays quiet.
-    let mut binary_watch = std::env::current_exe().ok().map(binary::BinaryWatch::new);
+    //
+    // For a Homebrew install this is the stable `bin/` link rather than the
+    // versioned file behind it: after an upgrade the link points at a new
+    // file, which is the swap worth reporting, and it is what a restart runs.
+    let exe = binary::current().ok();
+    let mut binary_watch = exe.clone().map(binary::BinaryWatch::new);
+    if let Some(exe) = &exe {
+        repair_recorded_paths(exe);
+    }
 
     let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
 

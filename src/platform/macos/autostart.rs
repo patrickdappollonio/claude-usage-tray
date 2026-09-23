@@ -41,7 +41,7 @@ pub fn entry_path(dir: &Path) -> PathBuf {
 /// Builds the LaunchAgent plist for a given executable path.
 ///
 /// Pure, so the exact keys are unit-tested without writing anything. The
-/// executable path is XML-escaped: it comes from `std::env::current_exe`, so
+/// executable path is XML-escaped: it comes from `crate::binary::current`, so
 /// it is whatever the user named the directory they put the binary in, and an
 /// `&` in it must not produce a plist `launchd` refuses to parse.
 ///
@@ -109,6 +109,23 @@ pub fn enable_in(dir: &Path, exec: &Path) -> io::Result<()> {
     }
 }
 
+/// Rewrites an existing entry in `dir` whose contents are not what `exec`
+/// would produce, most often because it names a Homebrew version directory
+/// that an upgrade removed. Never creates an entry, since that is the user's
+/// choice. Returns whether it rewrote anything.
+pub fn refresh_in(dir: &Path, exec: &Path) -> io::Result<bool> {
+    let current = match std::fs::read_to_string(entry_path(dir)) {
+        Ok(current) => current,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if current == launch_agent_plist(exec) {
+        return Ok(false);
+    }
+    enable_in(dir, exec)?;
+    Ok(true)
+}
+
 /// Removes the LaunchAgent from `dir`. Removing an entry that isn't there
 /// succeeds: the requested end state ("not autostarting") already holds.
 pub fn disable_in(dir: &Path) -> io::Result<()> {
@@ -144,7 +161,7 @@ pub fn is_enabled() -> bool {
 pub fn set_enabled(enabled: bool) -> bool {
     let dir = default_autostart_dir();
     let result = if enabled {
-        match std::env::current_exe() {
+        match crate::binary::current() {
             Ok(exe) => enable_in(&dir, &exe),
             Err(err) => Err(err),
         }
@@ -161,6 +178,12 @@ pub fn set_enabled(enabled: bool) -> bool {
             false
         }
     }
+}
+
+/// Points an enabled entry in the real directory at `exec`. See
+/// [`refresh_in`].
+pub fn refresh(exec: &Path) -> io::Result<bool> {
+    refresh_in(&default_autostart_dir(), exec)
 }
 
 #[cfg(test)]
@@ -357,5 +380,35 @@ mod tests {
             dir.display()
         );
         assert!(!dir.starts_with("/Library"), "must not be system-wide");
+    }
+
+    #[test]
+    fn refresh_rewrites_an_entry_naming_another_binary() {
+        let temp = TempDir::new("autostart-refresh-macos-stale");
+        let dir = temp.path().join("autostart");
+        enable_in(&dir, Path::new("/brew/Cellar/tray/1.0.3/bin/tray")).expect("enable");
+
+        assert!(refresh_in(&dir, Path::new("/brew/bin/tray")).expect("refresh"));
+        let body = std::fs::read_to_string(entry_path(&dir)).expect("read entry");
+        assert_eq!(body, launch_agent_plist(Path::new("/brew/bin/tray")));
+    }
+
+    #[test]
+    fn refresh_leaves_a_current_entry_alone() {
+        let temp = TempDir::new("autostart-refresh-macos-current");
+        let dir = temp.path().join("autostart");
+        enable_in(&dir, Path::new("/brew/bin/tray")).expect("enable");
+
+        assert!(!refresh_in(&dir, Path::new("/brew/bin/tray")).expect("refresh"));
+    }
+
+    /// Autostart is the user's choice: a refresh never turns it on.
+    #[test]
+    fn refresh_never_creates_an_entry() {
+        let temp = TempDir::new("autostart-refresh-macos-absent");
+        let dir = temp.path().join("autostart");
+
+        assert!(!refresh_in(&dir, Path::new("/brew/bin/tray")).expect("refresh"));
+        assert!(!is_enabled_in(&dir));
     }
 }
