@@ -3,4 +3,6 @@
 # `cargo fmt --check`, clippy and the tests still pass on the new version.
 [toolchain]
 channel = "1.98.1"
+# No offline documentation: nothing here reads it, and CI installs faster.
+profile = "minimal"
 components = ["clippy", "rustfmt"]
