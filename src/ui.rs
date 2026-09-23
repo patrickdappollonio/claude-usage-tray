@@ -117,7 +117,11 @@ pub fn scoped_line(
     fetched_at: Option<Timestamp>,
     now: Timestamp,
 ) -> String {
-    let line = metric_line(&format!("{} weekly", scoped.name), Some(&scoped.metric), now);
+    let line = metric_line(
+        &format!("{} weekly", scoped.name),
+        Some(&scoped.metric),
+        now,
+    );
     match fetched_at {
         Some(at) if age_secs(at, now) > SCOPED_AGE_SUFFIX_SECS => {
             format!("{line} · as of {} ago", humanize_age(age_secs(at, now)))
@@ -231,7 +235,11 @@ fn short_metric(label: &str, metric: Option<&Metric>) -> String {
 /// Pure so the three outcomes are unit-testable: the cache moved forward, it
 /// didn't, or there is no cache at all. Timer-driven polls never call this —
 /// see the poll loop in `main.rs`.
-pub fn refresh_message(previous: &UsageSnapshot, current: &UsageSnapshot, now: Timestamp) -> String {
+pub fn refresh_message(
+    previous: &UsageSnapshot,
+    current: &UsageSnapshot,
+    now: Timestamp,
+) -> String {
     if current.state == SnapshotState::Missing {
         return "No data — install the statusline hook".to_string();
     }
@@ -250,7 +258,10 @@ pub fn refresh_message(previous: &UsageSnapshot, current: &UsageSnapshot, now: T
             "No new data — Claude Code last reported {} ago",
             humanize_age(age_secs(at, now))
         ),
-        None => "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update".to_string(),
+        None => {
+            "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update"
+                .to_string()
+        }
     }
 }
 
@@ -286,7 +297,10 @@ pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp) -> String {
         (Some(session), Some(weekly)) => format!("You've used {session} and {weekly}."),
         (Some(session), None) => format!("You've used {session}; weekly usage is unknown."),
         (None, Some(weekly)) => format!("You've used {weekly}; session usage is unknown."),
-        (None, None) => "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update.".to_string(),
+        (None, None) => {
+            "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update."
+                .to_string()
+        }
     };
 
     for scoped in &snapshot.scoped {
@@ -352,8 +366,7 @@ impl UsageAlert {
     /// Notification body.
     pub fn body(&self) -> String {
         if self.threshold >= 100 {
-            "The 5-hour window is fully used. Further requests will wait for the reset."
-                .to_string()
+            "The 5-hour window is fully used. Further requests will wait for the reset.".to_string()
         } else if self.critical {
             format!(
                 "The 5-hour window is above {}%. You are close to the limit.",
@@ -468,7 +481,10 @@ impl Notifier {
         // by a second at a time never accumulates its way into a false
         // rollover; a reading with no reset time leaves the window as it was.
         if let Some(resets_at) = metric.resets_at {
-            if self.window.is_some_and(|previous| !same_window(previous, resets_at)) {
+            if self
+                .window
+                .is_some_and(|previous| !same_window(previous, resets_at))
+            {
                 self.fired.clear();
             }
             self.window = Some(resets_at);
@@ -488,7 +504,9 @@ impl Notifier {
             .enabled
             .iter()
             .copied()
-            .filter(|&threshold| percent >= f64::from(threshold) && !self.fired.contains(&threshold))
+            .filter(|&threshold| {
+                percent >= f64::from(threshold) && !self.fired.contains(&threshold)
+            })
             .max()
             .map(|threshold| UsageAlert {
                 threshold,
@@ -1170,7 +1188,9 @@ impl TrayCore {
         let enabled = !self.settings.config.check_updates;
         self.settings.config.check_updates = enabled;
         config::save(&self.settings.config);
-        self.settings.check_updates.store(enabled, Ordering::Relaxed);
+        self.settings
+            .check_updates
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Runs the action behind a menu row. Called by the backend from whatever
@@ -1407,7 +1427,9 @@ fn watch_restart(child: std::process::Child, report: impl FnOnce(String) + Send 
     match child.wait_with_output() {
         Ok(output) if output.status.success() => {}
         Ok(output) if output.status.code() == Some(crate::EXIT_RESTART_REPORTED) => {}
-        Ok(output) => report(restart_failure_body(&String::from_utf8_lossy(&output.stderr))),
+        Ok(output) => report(restart_failure_body(&String::from_utf8_lossy(
+            &output.stderr,
+        ))),
         Err(err) => report(format!("could not observe the restart: {err}")),
     }
 }
@@ -1560,10 +1582,7 @@ mod tests {
     #[test]
     fn status_line_missing_says_the_hook_is_not_installed() {
         let s = snapshot(SnapshotState::Missing, None);
-        assert_eq!(
-            status_line(&s, ts(BASE)),
-            "⚠ Hook not installed — no data"
-        );
+        assert_eq!(status_line(&s, ts(BASE)), "⚠ Hook not installed — no data");
     }
 
     #[test]
@@ -1691,30 +1710,51 @@ mod tests {
     #[test]
     fn status_line_stale_switches_to_hours_at_one_hour() {
         let s = snapshot(SnapshotState::Stale, Some(BASE - 3600));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 1 h ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 1 h ago"
+        );
         let s = snapshot(SnapshotState::Stale, Some(BASE - 12 * 3600));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 12 h ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 12 h ago"
+        );
     }
 
     #[test]
     fn status_line_stale_rounds_hours_to_the_nearest() {
         // 1 h 45 min is "2 h", not "1 h".
         let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 45 * 60)));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 2 h ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 2 h ago"
+        );
         // ...and 1 h 10 min still rounds down.
         let s = snapshot(SnapshotState::Stale, Some(BASE - (3600 + 10 * 60)));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 1 h ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 1 h ago"
+        );
     }
 
     #[test]
     fn status_line_stale_switches_to_days_at_forty_eight_hours() {
         // 47 h stays in hours; 48 h is the first "2 d".
         let s = snapshot(SnapshotState::Stale, Some(BASE - 47 * 3600));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 47 h ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 47 h ago"
+        );
         let s = snapshot(SnapshotState::Stale, Some(BASE - 48 * 3600));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 2 d ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 2 d ago"
+        );
         let s = snapshot(SnapshotState::Stale, Some(BASE - 9 * 86_400));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 9 d ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 9 d ago"
+        );
     }
 
     #[test]
@@ -1727,31 +1767,46 @@ mod tests {
     fn status_line_stale_with_clock_skew_does_not_go_negative() {
         // A cache "written in the future" is a skewed clock, not time travel.
         let s = snapshot(SnapshotState::Stale, Some(BASE + 300));
-        assert_eq!(status_line(&s, ts(BASE)), "⚠ Claude Code CLI last reported 0 min ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "⚠ Claude Code CLI last reported 0 min ago"
+        );
     }
 
     #[test]
     fn status_line_fresh_under_a_minute_is_just_now() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
-        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI just now");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "Updated by Claude Code CLI just now"
+        );
     }
 
     #[test]
     fn status_line_fresh_one_minute_is_singular() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 60));
-        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI 1 min ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "Updated by Claude Code CLI 1 min ago"
+        );
     }
 
     #[test]
     fn status_line_fresh_minutes_ago() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE - 185));
-        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI 3 min ago");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "Updated by Claude Code CLI 3 min ago"
+        );
     }
 
     #[test]
     fn status_line_fresh_with_clock_skew_is_just_now() {
         let s = snapshot(SnapshotState::Fresh, Some(BASE + 30));
-        assert_eq!(status_line(&s, ts(BASE)), "Updated by Claude Code CLI just now");
+        assert_eq!(
+            status_line(&s, ts(BASE)),
+            "Updated by Claude Code CLI just now"
+        );
     }
 
     #[test]
@@ -2153,7 +2208,10 @@ mod tests {
         assert_eq!(n.evaluate(Some(&metric(Some(82.0), None))), None);
         assert_eq!(n.evaluate(Some(&metric(Some(82.0), Some(BASE)))), None);
         // A genuinely new window seen after the gap still re-arms.
-        assert!(n.evaluate(Some(&metric(Some(82.0), Some(BASE + 18_000)))).is_some());
+        assert!(
+            n.evaluate(Some(&metric(Some(82.0), Some(BASE + 18_000))))
+                .is_some()
+        );
     }
 
     #[test]
@@ -2431,7 +2489,10 @@ mod tests {
     #[test]
     fn reset_notifiers_deadline_is_the_earliest_pending_window() {
         let mut r = ResetNotifiers::new();
-        assert!(r.evaluate(&all_windows_snapshot(), ts(BASE), true).is_empty());
+        assert!(
+            r.evaluate(&all_windows_snapshot(), ts(BASE), true)
+                .is_empty()
+        );
         assert_eq!(r.deadline(), Some(ts(BASE + 600)));
     }
 
@@ -2639,7 +2700,10 @@ mod tests {
         for (style, expected) in [
             (IconStyle::Color, IconAppearance::Color),
             (IconStyle::MonoDark, IconAppearance::Mono { dark_ui: true }),
-            (IconStyle::MonoLight, IconAppearance::Mono { dark_ui: false }),
+            (
+                IconStyle::MonoLight,
+                IconAppearance::Mono { dark_ui: false },
+            ),
         ] {
             let (core, _rx) = core_for(
                 timeless(SnapshotState::Fresh),
@@ -2955,7 +3019,9 @@ mod tests {
         let labels = labels(&rows);
         assert!(labels.contains(&RESTART_TO_UPDATE_LABEL.to_string()));
         assert!(
-            !labels.iter().any(|label| label.contains("Update available")),
+            !labels
+                .iter()
+                .any(|label| label.contains("Update available")),
             "both rows at once: {labels:?}"
         );
         assert_eq!(
@@ -3145,9 +3211,12 @@ mod tests {
     fn the_env_override_note_appears_only_while_the_environment_wins() {
         let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
         assert!(
-            !labels(submenu(&core.menu_with(ts(BASE), all_available()), "Settings"))
-                .iter()
-                .any(|label| label.contains("CLAUDE_TRAY_POLL_SECS"))
+            !labels(submenu(
+                &core.menu_with(ts(BASE), all_available()),
+                "Settings"
+            ))
+            .iter()
+            .any(|label| label.contains("CLAUDE_TRAY_POLL_SECS"))
         );
 
         let (core, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), Some(7));
@@ -3180,14 +3249,17 @@ mod tests {
     fn watching_a_failing_child_reports_its_last_stderr_line() {
         let temp = crate::testutil::TempDir::new("watch-restart");
         let script = temp.path().join("fail.sh");
-        std::fs::write(&script, "#!/bin/sh\necho 'claude-usage-tray: boom' >&2\nexit 1\n")
-            .expect("write script");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'claude-usage-tray: boom' >&2\nexit 1\n",
+        )
+        .expect("write script");
         crate::testutil::set_mode(&script, 0o755);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let Some(child) = crate::testutil::spawn_script(|| {
-            crate::instance::spawn_watched(&script, "unused")
-        }) else {
+        let Some(child) =
+            crate::testutil::spawn_script(|| crate::instance::spawn_watched(&script, "unused"))
+        else {
             return;
         };
         watch_restart(child, move |body| tx.send(body).expect("send"));
@@ -3203,14 +3275,17 @@ mod tests {
         let script = temp.path().join("reported.sh");
         // Exit code 3 is EXIT_RESTART_REPORTED: the child says it has already
         // toasted the failure itself, so a second toast here would duplicate it.
-        std::fs::write(&script, "#!/bin/sh\necho 'claude-usage-tray: boom' >&2\nexit 3\n")
-            .expect("write script");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'claude-usage-tray: boom' >&2\nexit 3\n",
+        )
+        .expect("write script");
         crate::testutil::set_mode(&script, 0o755);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let Some(child) = crate::testutil::spawn_script(|| {
-            crate::instance::spawn_watched(&script, "unused")
-        }) else {
+        let Some(child) =
+            crate::testutil::spawn_script(|| crate::instance::spawn_watched(&script, "unused"))
+        else {
             return;
         };
         watch_restart(child, move |body| tx.send(body).expect("send"));
@@ -3228,9 +3303,9 @@ mod tests {
         crate::testutil::set_mode(&script, 0o755);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let Some(child) = crate::testutil::spawn_script(|| {
-            crate::instance::spawn_watched(&script, "unused")
-        }) else {
+        let Some(child) =
+            crate::testutil::spawn_script(|| crate::instance::spawn_watched(&script, "unused"))
+        else {
             return;
         };
         watch_restart(child, move |body| tx.send(body).expect("send"));

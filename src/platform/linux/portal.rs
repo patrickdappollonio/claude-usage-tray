@@ -170,10 +170,7 @@ mod tests {
 
     #[test]
     fn reads_the_double_wrapped_variant_read_returns() {
-        assert_eq!(
-            scheme_from_value(&variant(variant(Value::U32(2)))),
-            Some(2)
-        );
+        assert_eq!(scheme_from_value(&variant(variant(Value::U32(2)))), Some(2));
     }
 
     #[test]
