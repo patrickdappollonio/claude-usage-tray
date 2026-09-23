@@ -16,6 +16,20 @@ use crate::source::UsageSnapshot;
 use crate::ui::TrayCore;
 use ksni::blocking::TrayMethods;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Well-known D-Bus name of the StatusNotifierItem host the tray registers
+/// with.
+const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
+
+/// How long startup waits for [`WATCHER_NAME`] to appear before giving up.
+/// Plasma owns the name before it runs autostart entries, but on GNOME it
+/// comes from the AppIndicator shell extension, which loads alongside the
+/// autostart apps: a tray launched at login can get there first.
+const WATCHER_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How often the wait re-checks for [`WATCHER_NAME`].
+const WATCHER_POLL: Duration = Duration::from_millis(250);
 
 /// The poll loop's remote control over the running tray, wrapping the `ksni`
 /// handle. Every method is a property push: `ksni` re-reads the tray's
@@ -47,6 +61,7 @@ pub fn run<F>(core: TrayCore, poll: F) -> Result<(), BackendError>
 where
     F: FnOnce(TrayHandle) + Send + 'static,
 {
+    wait_for_watcher(WATCHER_PATIENCE);
     let handle = tray::LinuxTray::new(core).spawn().map_err(|err| {
         BackendError::new(format!(
             "could not start the tray service: {err}\n\
@@ -57,6 +72,33 @@ where
     poll(TrayHandle(handle.clone()));
     handle.shutdown().wait();
     Ok(())
+}
+
+/// Blocks until [`WATCHER_NAME`] has an owner on the session bus, or until
+/// `patience` runs out. Returns without complaint either way: the spawn that
+/// follows is what reports a missing host, with the same message whether or
+/// not this wait could reach the bus at all.
+fn wait_for_watcher(patience: Duration) {
+    let Ok(connection) = zbus::blocking::Connection::session() else {
+        return;
+    };
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&connection) else {
+        return;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(WATCHER_NAME) else {
+        return;
+    };
+    let deadline = Instant::now() + patience;
+    loop {
+        match dbus.name_has_owner(name.clone()) {
+            Ok(true) | Err(_) => return,
+            Ok(false) => {}
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(WATCHER_POLL);
+    }
 }
 
 /// The threshold-alert notification currently on screen, if any.
