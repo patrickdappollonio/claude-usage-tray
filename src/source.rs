@@ -437,13 +437,20 @@ pub fn parse_statusline_json(body: &str, now: jiff::Timestamp) -> Option<RateLim
 
 /// Parses a single rate-limit window object (`{"used_percentage": .., "resets_at": ..}`).
 /// A `resets_at` in the past forces `percent` to `0.0` (the window rolled over
-/// while no session was running).
+/// while no session was running). `resets_at` is read as epoch seconds, or as
+/// epoch milliseconds when it is too large to be seconds: any millisecond
+/// value after early 1973 is past jiff's year-9999 limit for seconds, so the
+/// two ranges don't overlap in practice.
 fn parse_metric(value: &serde_json::Value, now: jiff::Timestamp) -> Metric {
     let percent = value.get("used_percentage").and_then(|v| v.as_f64());
     let resets_at = value
         .get("resets_at")
         .and_then(|v| v.as_i64())
-        .and_then(|secs| jiff::Timestamp::from_second(secs).ok());
+        .and_then(|n| {
+            jiff::Timestamp::from_second(n)
+                .or_else(|_| jiff::Timestamp::from_millisecond(n))
+                .ok()
+        });
 
     let percent = match (percent, resets_at) {
         (Some(p), Some(r)) if r < now && p != 0.0 => Some(0.0),
@@ -772,6 +779,24 @@ mod tests {
         let snap = snapshot_from(&body, Some(ts(1700000000)), ts(1700000000 + 5));
         let session = snap.session.expect("session metric present");
         assert_eq!(session.percent, Some(0.0));
+    }
+
+    #[test]
+    fn past_resets_at_in_milliseconds_forces_percent_to_zero() {
+        let body = r#"{"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": 1600000000000}}}"#;
+        let limits = parse_statusline_json(body, ts(1700000000)).expect("valid JSON");
+        let session = limits.session.expect("session metric present");
+        assert_eq!(session.resets_at, Some(ts(1600000000)));
+        assert_eq!(session.percent, Some(0.0));
+    }
+
+    #[test]
+    fn future_resets_at_in_milliseconds_keeps_percent() {
+        let body = r#"{"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": 1700018000000}}}"#;
+        let limits = parse_statusline_json(body, ts(1700000000)).expect("valid JSON");
+        let session = limits.session.expect("session metric present");
+        assert_eq!(session.resets_at, Some(ts(1700018000)));
+        assert_eq!(session.percent, Some(42.0));
     }
 
     #[test]
