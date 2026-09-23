@@ -290,7 +290,10 @@ fn read_settings(path: &Path) -> io::Result<serde_json::Value> {
         )),
         Err(err) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} is not valid JSON ({err}); refusing to modify it", path.display()),
+            format!(
+                "{} is not valid JSON ({err}); refusing to modify it",
+                path.display()
+            ),
         )),
     }
 }
@@ -358,7 +361,9 @@ fn set_command(settings: &mut serde_json::Value, command: &str) {
         // read_settings guarantees an object; this is belt and braces.
         None => {
             *settings = serde_json::Value::Object(serde_json::Map::new());
-            settings.as_object_mut().expect("just replaced with an object")
+            settings
+                .as_object_mut()
+                .expect("just replaced with an object")
         }
     };
     let entry = root
@@ -427,17 +432,13 @@ pub fn install_in(config_dir: &Path, exe: &Path) -> io::Result<InstallReport> {
         None => None,
     };
 
-    let created_backup = backup_once(
-        &settings_path,
-        &config_dir.join(SETTINGS_BACKUP_FILE_NAME),
-    )?;
+    let created_backup = backup_once(&settings_path, &config_dir.join(SETTINGS_BACKUP_FILE_NAME))?;
 
     let command = build_command(&exe.to_string_lossy(), wrapped.as_deref());
     set_command(&mut settings, &command);
     write_settings(&settings_path, &settings)?;
 
-    let removed_legacy_cache =
-        remove_if_present(&config_dir.join(source::LEGACY_CACHE_FILE_NAME))?;
+    let removed_legacy_cache = remove_if_present(&config_dir.join(source::LEGACY_CACHE_FILE_NAME))?;
 
     Ok(InstallReport {
         settings_path,
@@ -455,7 +456,11 @@ impl InstallReport {
     pub fn render(&self) -> String {
         let mut lines = vec![format!(
             "{} statusline hook in {}",
-            if self.refreshed { "Refreshed" } else { "Installed" },
+            if self.refreshed {
+                "Refreshed"
+            } else {
+                "Installed"
+            },
             self.settings_path.display()
         )];
         lines.push(format!("  statusLine.command = {}", self.command));
@@ -508,9 +513,7 @@ pub fn uninstall_in(config_dir: &Path) -> io::Result<UninstallReport> {
     let settings_path = config_dir.join(SETTINGS_FILE_NAME);
     let mut settings = read_settings(&settings_path)?;
 
-    let ours = command_of(&settings)
-        .as_deref()
-        .and_then(parse_our_command);
+    let ours = command_of(&settings).as_deref().and_then(parse_our_command);
     let mut restored = None;
     let mut removed_statusline = false;
 
@@ -545,7 +548,10 @@ impl UninstallReport {
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
         if self.was_installed {
-            lines.push(format!("Removed the statusline hook from {}", self.settings_path.display()));
+            lines.push(format!(
+                "Removed the statusline hook from {}",
+                self.settings_path.display()
+            ));
             match &self.restored {
                 Some(original) => lines.push(format!("  restored your command: {original}")),
                 None if self.removed_statusline => {
@@ -587,7 +593,9 @@ pub struct StatusReport {
 /// cache file is.
 pub fn status_in(config_dir: &Path, now: jiff::Timestamp) -> StatusReport {
     let settings_path = config_dir.join(SETTINGS_FILE_NAME);
-    let command = read_settings(&settings_path).ok().and_then(|s| command_of(&s));
+    let command = read_settings(&settings_path)
+        .ok()
+        .and_then(|s| command_of(&s));
     let ours = command.as_deref().and_then(parse_our_command);
     let cache_path = source::cache_path_in(config_dir);
     let snapshot = source::read_snapshot(&cache_path, now);
@@ -762,7 +770,10 @@ mod tests {
         let first = install_in(temp.path(), &exe).expect("install");
         assert!(!first.refreshed);
         let second = install_in(temp.path(), &exe).expect("re-install");
-        assert!(second.refreshed, "the spacey path must be recognized as ours");
+        assert!(
+            second.refreshed,
+            "the spacey path must be recognized as ours"
+        );
         assert_eq!(first.command, second.command);
         assert_eq!(second.wrapped.as_deref(), Some("~/.claude/line.sh"));
 
@@ -776,13 +787,19 @@ mod tests {
         );
 
         uninstall_in(temp.path()).expect("uninstall");
-        assert_eq!(settings_json(temp.path())["statusLine"]["command"], "~/.claude/line.sh");
+        assert_eq!(
+            settings_json(temp.path())["statusLine"]["command"],
+            "~/.claude/line.sh"
+        );
     }
 
     #[test]
     fn build_command_escapes_single_quotes_in_the_original() {
         let command = build_command("/opt/tray", Some("echo 'hi there'"));
-        assert_eq!(command, r"/opt/tray statusline --exec 'echo '\''hi there'\'''");
+        assert_eq!(
+            command,
+            r"/opt/tray statusline --exec 'echo '\''hi there'\'''"
+        );
         // And it round-trips through the parser.
         let parsed = parse_our_command(&command).expect("ours");
         assert_eq!(parsed.original.as_deref(), Some("echo 'hi there'"));
@@ -845,7 +862,10 @@ mod tests {
     #[test]
     fn strip_legacy_blocks_removes_the_v1_block() {
         let cleaned = strip_legacy_blocks(V1_SCRIPT).expect("something was stripped");
-        assert_eq!(cleaned, "#!/bin/bash\ninput=$(cat)\necho \"my statusline\"\n");
+        assert_eq!(
+            cleaned,
+            "#!/bin/bash\ninput=$(cat)\necho \"my statusline\"\n"
+        );
     }
 
     #[test]
@@ -1167,7 +1187,10 @@ mod tests {
 
         let report = status_in(temp.path(), jiff::Timestamp::now());
         assert!(report.installed);
-        assert_eq!(report.recorded_exe.as_deref(), Some(exe().to_str().unwrap()));
+        assert_eq!(
+            report.recorded_exe.as_deref(),
+            Some(exe().to_str().unwrap())
+        );
         assert_eq!(report.wrapped.as_deref(), Some("~/.claude/line.sh"));
         assert_eq!(report.cache_state, SnapshotState::Missing);
 
@@ -1183,7 +1206,10 @@ mod tests {
         let temp = TempDir::new("hook-status-moved");
         install_in(temp.path(), &exe()).expect("install");
         let report = status_in(temp.path(), jiff::Timestamp::now());
-        let rendered = report.render(Some(Path::new("/somewhere/else/tray")), jiff::Timestamp::now());
+        let rendered = report.render(
+            Some(Path::new("/somewhere/else/tray")),
+            jiff::Timestamp::now(),
+        );
         assert!(rendered.contains("differs from the running"));
     }
 
@@ -1221,7 +1247,11 @@ mod tests {
         let report = status_in(temp.path(), jiff::Timestamp::now());
         assert_eq!(report.cache_state, SnapshotState::Fresh);
         let at = report.cache_written_at.expect("mtime known");
-        assert!(report.cache_freshness(at).starts_with("fresh, last written"));
+        assert!(
+            report
+                .cache_freshness(at)
+                .starts_with("fresh, last written")
+        );
 
         let mut stale = report.clone();
         stale.cache_state = SnapshotState::Stale;

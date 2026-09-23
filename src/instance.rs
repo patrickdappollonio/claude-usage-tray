@@ -50,8 +50,12 @@ impl InstanceLock {
     /// see, and a second instance would sail right past it.
     pub fn matches(&self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
-        let Ok(held) = self._file.metadata() else { return false };
-        let Ok(on_disk) = std::fs::metadata(path) else { return false };
+        let Ok(held) = self._file.metadata() else {
+            return false;
+        };
+        let Ok(on_disk) = std::fs::metadata(path) else {
+            return false;
+        };
         held.dev() == on_disk.dev() && held.ino() == on_disk.ino()
     }
 }
@@ -241,7 +245,11 @@ fn choose_lock_dir(
 /// "Restart to update" would start a second instance during the one upgrade
 /// that crosses the move.
 fn choose_legacy_lock_dirs(macos: bool, cache: Option<PathBuf>) -> Vec<PathBuf> {
-    if macos { cache.into_iter().collect() } else { Vec::new() }
+    if macos {
+        cache.into_iter().collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Where the lock file lives. See [`choose_lock_dir`] for the reasoning.
@@ -359,7 +367,9 @@ mod tests {
         let path = temp.path().join("tray.lock");
         std::fs::write(&path, b"leftover").expect("write stale file");
 
-        let lock = try_acquire(&path).expect("acquire").expect("stale file is free");
+        let lock = try_acquire(&path)
+            .expect("acquire")
+            .expect("stale file is free");
         drop(lock);
     }
 
@@ -420,7 +430,10 @@ mod tests {
         let temp = TempDir::new("instance-probe");
         let path = temp.path().join("nested").join("tray.lock");
         assert_eq!(probe_held(&path), Probe::Free);
-        assert!(!path.parent().unwrap().exists(), "a probe must not create directories");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "a probe must not create directories"
+        );
 
         let held = try_acquire(&path).expect("acquire").expect("free");
         assert_eq!(probe_held(&path), Probe::Held);
@@ -470,7 +483,10 @@ mod tests {
         assert!(lock.is_none());
         // Discriminates "no sleep" from "one 100ms sleep" with room for a loaded
         // machine; the filesystem work itself is microseconds on a local disk.
-        assert!(started.elapsed() < std::time::Duration::from_millis(90), "must not sleep");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(90),
+            "must not sleep"
+        );
         drop(held);
     }
 
@@ -493,7 +509,10 @@ mod tests {
         std::fs::remove_file(&path).expect("delete out from under the holder");
 
         let renewed = revalidate(&path, held);
-        assert!(renewed.matches(&path), "the returned lock must be on the current file");
+        assert!(
+            renewed.matches(&path),
+            "the returned lock must be on the current file"
+        );
         assert_eq!(read_pid(&path), Some(std::process::id() as i32));
         // The fresh lock must actually be held.
         assert!(try_acquire(&path).expect("probe").is_none());
@@ -577,7 +596,13 @@ mod tests {
         let cache = Some(PathBuf::from("/u/.cache"));
         let data = Some(PathBuf::from("/u/.local/share"));
         assert_eq!(
-            choose_lock_dir(false, runtime, data.clone(), cache.clone(), PathBuf::from("/tmp")),
+            choose_lock_dir(
+                false,
+                runtime,
+                data.clone(),
+                cache.clone(),
+                PathBuf::from("/tmp")
+            ),
             PathBuf::from("/run/user/1000")
         );
         assert_eq!(
@@ -604,11 +629,19 @@ mod tests {
     fn legacy_lock_paths_join_the_lock_name_onto_each_legacy_dir() {
         // Exercised through the pure chooser so the assertion runs on Linux too,
         // where legacy_lock_paths() itself is empty.
-        let paths: Vec<PathBuf> = choose_legacy_lock_dirs(true, Some(PathBuf::from("/u/Library/Caches")))
-            .into_iter()
-            .map(|dir| dir.join(LOCK_NAME))
-            .collect();
-        assert_eq!(paths, vec![PathBuf::from("/u/Library/Caches").join(LOCK_NAME)]);
-        assert!(legacy_lock_paths().iter().all(|p| p.file_name().unwrap() == LOCK_NAME));
+        let paths: Vec<PathBuf> =
+            choose_legacy_lock_dirs(true, Some(PathBuf::from("/u/Library/Caches")))
+                .into_iter()
+                .map(|dir| dir.join(LOCK_NAME))
+                .collect();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/u/Library/Caches").join(LOCK_NAME)]
+        );
+        assert!(
+            legacy_lock_paths()
+                .iter()
+                .all(|p| p.file_name().unwrap() == LOCK_NAME)
+        );
     }
 }

@@ -59,8 +59,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
+use tray_icon::menu::MenuEvent;
 
 /// Everything the event loop can be asked to do, from wherever it is asked.
 ///

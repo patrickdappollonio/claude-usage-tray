@@ -94,9 +94,7 @@ pub fn parse_app_cache(body: &str, now: jiff::Timestamp) -> Option<AppUsage> {
         .map(|entries| {
             entries
                 .iter()
-                .filter(|entry| {
-                    entry.get("kind").and_then(|k| k.as_str()) == Some("weekly_scoped")
-                })
+                .filter(|entry| entry.get("kind").and_then(|k| k.as_str()) == Some("weekly_scoped"))
                 .filter_map(|entry| {
                     let name = entry
                         .get("scope")?
@@ -217,7 +215,8 @@ mod tests {
 
     #[test]
     fn empty_utilization_is_a_valid_but_empty_reading() {
-        let body = r#"{"cachedUsageUtilization": {"fetchedAtMs": 1786841753450, "utilization": {}}}"#;
+        let body =
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1786841753450, "utilization": {}}}"#;
         let usage = parse_app_cache(body, ts(NOW)).expect("the key exists, so this parses");
         assert_eq!(usage.session, None);
         assert_eq!(usage.weekly, None);

@@ -192,7 +192,6 @@ fn notify_binary_swapped() {
     platform::notify(&toast, channel);
 }
 
-
 const USAGE: &str = "\
 claude-usage-tray — Claude Code usage in the system tray
 
@@ -321,7 +320,10 @@ fn claim_instance(primary: &Path, legacy: &[PathBuf], patience: Duration) -> Cla
                 if instance::read_pid(path).is_some() {
                     return Claim::Busy;
                 }
-                say(&format!("could not check the old lock at {}", path.display()));
+                say(&format!(
+                    "could not check the old lock at {}",
+                    path.display()
+                ));
             }
         }
     }
@@ -355,7 +357,10 @@ fn clear_legacy(path: &Path, deadline: Instant) -> Result<bool, ClearFailure> {
                     path.display()
                 ))),
                 None => {
-                    say(&format!("could not check the old lock at {}", path.display()));
+                    say(&format!(
+                        "could not check the old lock at {}",
+                        path.display()
+                    ));
                     Ok(false)
                 }
             };
@@ -451,7 +456,9 @@ enum Mode {
     /// detaching parent uses). `spawned` distinguishes the two: a child that
     /// was just spawned waits out its parent's hold on the lock, while a
     /// user's own `--foreground` beside a running tray is answered promptly.
-    Foreground { spawned: bool },
+    Foreground {
+        spawned: bool,
+    },
     /// Replace whichever instance is running.
     Restart,
     Statusline,
@@ -539,8 +546,8 @@ fn detach() -> i32 {
 /// for a few seconds. Failures come back as text: the caller knows whether a
 /// human, a pipe, or a toast is listening.
 fn spawn_background(held: Option<instance::InstanceLock>) -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|err| format!("cannot determine my own path: {err}"))?;
+    let exe =
+        std::env::current_exe().map_err(|err| format!("cannot determine my own path: {err}"))?;
     // Detached in its own process group, so closing the terminal (or a Ctrl-C
     // meant for whatever the user runs next) does not take the tray with it.
     match instance::spawn_detached(&exe, RUN_FOREGROUND_FLAG) {
@@ -683,8 +690,16 @@ fn guard_lock(path: PathBuf, lock: instance::InstanceLock, interval: Duration) {
 /// process. The lock is held by a warden thread that never returns: the
 /// kernel releases it when this process ends, however it ends.
 fn run_tray_locked(spawned: bool) -> i32 {
-    let patience = if spawned { CHILD_LOCK_TIMEOUT } else { DIRECT_LAUNCH_PATIENCE };
-    match claim_instance(&instance::lock_path(), &instance::legacy_lock_paths(), patience) {
+    let patience = if spawned {
+        CHILD_LOCK_TIMEOUT
+    } else {
+        DIRECT_LAUNCH_PATIENCE
+    };
+    match claim_instance(
+        &instance::lock_path(),
+        &instance::legacy_lock_paths(),
+        patience,
+    ) {
         Claim::Held(lock) => guard_lock(instance::lock_path(), lock, WARDEN_INTERVAL),
         Claim::Busy => {
             eprintln!("{ALREADY_RUNNING}");
@@ -825,7 +840,8 @@ const GREETING_DELAY: Duration = Duration::from_secs(2);
 fn spawn_greeting() {
     std::thread::spawn(|| {
         std::thread::sleep(GREETING_DELAY);
-        let greeting = greeting::check_and_record(&greeting::state_path(), update::current_version());
+        let greeting =
+            greeting::check_and_record(&greeting::state_path(), update::current_version());
         notify_greeting(&greeting);
     });
 }
@@ -1239,8 +1255,13 @@ mod instance_claims {
         let temp = crate::testutil::TempDir::new("claim-pid");
         let primary = temp.path().join("tray.lock");
         let claim = claim_instance(&primary, &[], Duration::ZERO);
-        let Claim::Held(lock) = claim else { panic!("expected Held") };
-        assert_eq!(crate::instance::read_pid(&primary), Some(std::process::id() as i32));
+        let Claim::Held(lock) = claim else {
+            panic!("expected Held")
+        };
+        assert_eq!(
+            crate::instance::read_pid(&primary),
+            Some(std::process::id() as i32)
+        );
         drop(lock);
     }
 
@@ -1248,8 +1269,13 @@ mod instance_claims {
     fn claiming_refuses_when_the_primary_lock_is_held() {
         let temp = crate::testutil::TempDir::new("claim-primary-busy");
         let primary = temp.path().join("tray.lock");
-        let held = crate::instance::try_acquire(&primary).expect("acquire").expect("free");
-        assert!(matches!(claim_instance(&primary, &[], Duration::ZERO), Claim::Busy));
+        let held = crate::instance::try_acquire(&primary)
+            .expect("acquire")
+            .expect("free");
+        assert!(matches!(
+            claim_instance(&primary, &[], Duration::ZERO),
+            Claim::Busy
+        ));
         drop(held);
     }
 
@@ -1258,13 +1284,19 @@ mod instance_claims {
         let temp = crate::testutil::TempDir::new("claim-legacy-busy");
         let primary = temp.path().join("tray.lock");
         let legacy = temp.path().join("legacy.lock");
-        let old_tray = crate::instance::try_acquire(&legacy).expect("acquire").expect("free");
+        let old_tray = crate::instance::try_acquire(&legacy)
+            .expect("acquire")
+            .expect("free");
         assert!(matches!(
             claim_instance(&primary, std::slice::from_ref(&legacy), Duration::ZERO),
             Claim::Busy
         ));
         // The primary taken during the refused claim must have been released.
-        assert!(crate::instance::try_acquire(&primary).expect("probe").is_some());
+        assert!(
+            crate::instance::try_acquire(&primary)
+                .expect("probe")
+                .is_some()
+        );
         drop(old_tray);
     }
 
@@ -1275,7 +1307,10 @@ mod instance_claims {
         let legacy = temp.path().join("caches").join("legacy.lock");
         let claim = claim_instance(&primary, std::slice::from_ref(&legacy), Duration::ZERO);
         assert!(matches!(claim, Claim::Held(_)));
-        assert!(!legacy.exists(), "probing must not resurrect the legacy file");
+        assert!(
+            !legacy.exists(),
+            "probing must not resurrect the legacy file"
+        );
     }
 
     #[test]
@@ -1291,13 +1326,18 @@ mod instance_claims {
     fn clearing_a_legacy_holder_that_ignores_the_signal_times_out_after_the_kill() {
         let temp = crate::testutil::TempDir::new("clear-legacy-deaf");
         let legacy = temp.path().join("legacy.lock");
-        let held = crate::instance::try_acquire(&legacy).expect("acquire").expect("free");
+        let held = crate::instance::try_acquire(&legacy)
+            .expect("acquire")
+            .expect("free");
         // A PID that does not exist: terminate() reports success (ESRCH), but the
         // lock stays held by this test, so waiting must time out. Writing the file
         // does not release the flock — the lock lives on `held`'s descriptor.
         std::fs::write(&legacy, b"2147483632\n").expect("write pid");
         let deadline = Instant::now() + Duration::from_millis(200);
-        assert!(matches!(clear_legacy(&legacy, deadline), Err(ClearFailure::AfterKill(_))));
+        assert!(matches!(
+            clear_legacy(&legacy, deadline),
+            Err(ClearFailure::AfterKill(_))
+        ));
         drop(held);
     }
 
@@ -1305,9 +1345,14 @@ mod instance_claims {
     fn clearing_a_legacy_holder_with_no_recorded_pid_fails_before_any_kill() {
         let temp = crate::testutil::TempDir::new("clear-legacy-no-pid");
         let legacy = temp.path().join("legacy.lock");
-        let held = crate::instance::try_acquire(&legacy).expect("acquire").expect("free");
+        let held = crate::instance::try_acquire(&legacy)
+            .expect("acquire")
+            .expect("free");
         let deadline = Instant::now() + Duration::from_millis(100);
-        assert!(matches!(clear_legacy(&legacy, deadline), Err(ClearFailure::BeforeKill(_))));
+        assert!(matches!(
+            clear_legacy(&legacy, deadline),
+            Err(ClearFailure::BeforeKill(_))
+        ));
         drop(held);
     }
 
@@ -1319,8 +1364,16 @@ mod instance_claims {
         let (held, signalled) = clear_and_hold_primary(&primary, deadline).expect("no error");
         assert!(!signalled);
         let held = held.expect("a lock");
-        assert_eq!(crate::instance::read_pid(&primary), Some(std::process::id() as i32));
-        assert!(crate::instance::try_acquire(&primary).expect("probe").is_none(), "still held");
+        assert_eq!(
+            crate::instance::read_pid(&primary),
+            Some(std::process::id() as i32)
+        );
+        assert!(
+            crate::instance::try_acquire(&primary)
+                .expect("probe")
+                .is_none(),
+            "still held"
+        );
         drop(held);
     }
 
@@ -1328,7 +1381,9 @@ mod instance_claims {
     fn holding_the_primary_against_a_deaf_holder_times_out_after_the_kill() {
         let temp = crate::testutil::TempDir::new("hold-primary-deaf");
         let primary = temp.path().join("tray.lock");
-        let held = crate::instance::try_acquire(&primary).expect("acquire").expect("free");
+        let held = crate::instance::try_acquire(&primary)
+            .expect("acquire")
+            .expect("free");
         std::fs::write(&primary, b"2147483632\n").expect("write pid");
         let deadline = Instant::now() + Duration::from_millis(600);
         assert!(matches!(
@@ -1342,7 +1397,9 @@ mod instance_claims {
     fn holding_the_primary_against_a_holder_with_no_pid_fails_before_any_kill() {
         let temp = crate::testutil::TempDir::new("hold-primary-no-pid");
         let primary = temp.path().join("tray.lock");
-        let held = crate::instance::try_acquire(&primary).expect("acquire").expect("free");
+        let held = crate::instance::try_acquire(&primary)
+            .expect("acquire")
+            .expect("free");
         let deadline = Instant::now() + Duration::from_millis(600);
         assert!(matches!(
             clear_and_hold_primary(&primary, deadline),
@@ -1382,12 +1439,18 @@ mod instance_claims {
     fn a_guarded_lock_stays_held() {
         let temp = crate::testutil::TempDir::new("warden-holds");
         let path = temp.path().join("tray.lock");
-        let lock = crate::instance::try_acquire(&path).expect("acquire").expect("free");
+        let lock = crate::instance::try_acquire(&path)
+            .expect("acquire")
+            .expect("free");
         // An hour-long interval: the leaked warden thread must never tick during
         // the test run (it would recreate files under the deleted temp dir).
         guard_lock(path.clone(), lock, Duration::from_secs(3600));
         std::thread::sleep(Duration::from_millis(100));
-        assert!(crate::instance::try_acquire(&path).expect("probe").is_none());
+        assert!(
+            crate::instance::try_acquire(&path)
+                .expect("probe")
+                .is_none()
+        );
     }
 }
 

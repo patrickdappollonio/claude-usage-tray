@@ -482,8 +482,7 @@ mod tests {
     #[test]
     fn threshold_list_drops_unknown_and_out_of_range_values() {
         assert_eq!(
-            parse_config("notify_thresholds = [50, 80, 101, -3, 999999, 100]\n")
-                .notify_thresholds,
+            parse_config("notify_thresholds = [50, 80, 101, -3, 999999, 100]\n").notify_thresholds,
             vec![50, 100]
         );
     }

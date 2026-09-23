@@ -1085,8 +1085,18 @@ mod tests {
             1_700_000_000,
         );
 
-        let first = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_005));
-        let later = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_305));
+        let first = read_merged_or_kayfabe(
+            &cache_path,
+            &cache_path.with_extension("no-app-cache"),
+            &kayfabe_path,
+            ts(1_700_000_005),
+        );
+        let later = read_merged_or_kayfabe(
+            &cache_path,
+            &cache_path.with_extension("no-app-cache"),
+            &kayfabe_path,
+            ts(1_700_000_305),
+        );
         assert_eq!(
             first.session.expect("session").resets_at,
             Some(ts(1_700_000_000 + 30 * 60))
@@ -1114,7 +1124,12 @@ mod tests {
         let cache_path = write_with_mtime(temp.path(), CACHE_FILE_NAME, &body, 1_700_000_000);
         let kayfabe_path = temp.path().join("kayfabe.json"); // never created
 
-        let snap = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_000 + 5));
+        let snap = read_merged_or_kayfabe(
+            &cache_path,
+            &cache_path.with_extension("no-app-cache"),
+            &kayfabe_path,
+            ts(1_700_000_000 + 5),
+        );
         assert_eq!(snap.state, SnapshotState::Fresh);
         assert_eq!(snap.session.expect("session").percent, Some(42.0));
     }
@@ -1128,7 +1143,12 @@ mod tests {
         std::fs::write(&kayfabe_path, r#"{"session": 82}"#).expect("write kayfabe");
 
         let now = ts(1_700_000_000 + 5);
-        let snap = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, now);
+        let snap = read_merged_or_kayfabe(
+            &cache_path,
+            &cache_path.with_extension("no-app-cache"),
+            &kayfabe_path,
+            now,
+        );
         // The real cache says 42%; the kayfabe file wins.
         assert_eq!(snap.session.expect("session").percent, Some(82.0));
     }
@@ -1141,7 +1161,12 @@ mod tests {
         let kayfabe_path = temp.path().join("kayfabe.json");
         std::fs::write(&kayfabe_path, "not json").expect("write kayfabe");
 
-        let snap = read_merged_or_kayfabe(&cache_path, &cache_path.with_extension("no-app-cache"), &kayfabe_path, ts(1_700_000_000 + 5));
+        let snap = read_merged_or_kayfabe(
+            &cache_path,
+            &cache_path.with_extension("no-app-cache"),
+            &kayfabe_path,
+            ts(1_700_000_000 + 5),
+        );
         assert_eq!(snap.state, SnapshotState::Missing);
     }
 

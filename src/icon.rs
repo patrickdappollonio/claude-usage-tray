@@ -280,10 +280,23 @@ fn draw_gauge(
             let weekly_color = weekly_percent
                 .map(|percent| appearance.dot(percent))
                 .unwrap_or(GRAY);
-            fill_dot(pixmap, center, center, stroke_width * 0.55, weekly_color, 255);
+            fill_dot(
+                pixmap,
+                center,
+                center,
+                stroke_width * 0.55,
+                weekly_color,
+                255,
+            );
         }
         CenterMark::QuestionMark => {
-            draw_question_mark(pixmap, center, center, size as f32 * GLYPH_HEIGHT_RATIO, appearance.glyph());
+            draw_question_mark(
+                pixmap,
+                center,
+                center,
+                size as f32 * GLYPH_HEIGHT_RATIO,
+                appearance.glyph(),
+            );
         }
     }
 }
@@ -391,14 +404,26 @@ fn fill_dot(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: (u8, u8, 
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.0, color.1, color.2, alpha);
     paint.anti_alias = true;
-    pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Builds an open polyline approximating a circular arc, stroked afterwards.
 /// `start_deg`/`sweep_deg` are in degrees, 0 = pointing right (+x), positive
 /// = clockwise in screen (y-down) coordinates, so `start_deg = -90` starts at
 /// the top of the circle.
-fn arc_path(cx: f32, cy: f32, radius: f32, start_deg: f32, sweep_deg: f32) -> Option<tiny_skia::Path> {
+fn arc_path(
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_deg: f32,
+    sweep_deg: f32,
+) -> Option<tiny_skia::Path> {
     if radius <= 0.0 || sweep_deg <= 0.0 {
         return None;
     }
@@ -429,9 +454,8 @@ fn premultiplied_rgba_to_argb_be(data: &[u8]) -> Vec<u8> {
         let (r, g, b) = if a == 0 {
             (0, 0, 0)
         } else {
-            let unpremultiply = |c: u8| -> u8 {
-                ((c as u32 * 255 + (a as u32 / 2)) / a as u32).min(255) as u8
-            };
+            let unpremultiply =
+                |c: u8| -> u8 { ((c as u32 * 255 + (a as u32 / 2)) / a as u32).min(255) as u8 };
             (unpremultiply(r), unpremultiply(g), unpremultiply(b))
         };
         out.push(a);
@@ -447,7 +471,11 @@ mod tests {
     use super::*;
     use crate::source::Metric;
 
-    fn snapshot(state: SnapshotState, session_pct: Option<f64>, weekly_pct: Option<f64>) -> UsageSnapshot {
+    fn snapshot(
+        state: SnapshotState,
+        session_pct: Option<f64>,
+        weekly_pct: Option<f64>,
+    ) -> UsageSnapshot {
         UsageSnapshot {
             session: Some(Metric {
                 percent: session_pct,
@@ -562,7 +590,10 @@ mod tests {
                 green_like += 1;
             }
         }
-        assert!(visible > 0, "unknown-percent icon should still draw something");
+        assert!(
+            visible > 0,
+            "unknown-percent icon should still draw something"
+        );
         assert_eq!(
             green_like, 0,
             "expected no green pixels when percent is unknown, got {green_like}/{visible}"
@@ -601,14 +632,19 @@ mod tests {
                 );
             }
         }
-        assert!(saw_center_pixel, "expected the weekly dot to draw something at the center");
+        assert!(
+            saw_center_pixel,
+            "expected the weekly dot to draw something at the center"
+        );
     }
 
     /// Visible (alpha != 0) pixels of an icon as `(r, g, b)` triples, with the
     /// premultiplication already undone by the ARGB conversion.
     fn visible_pixels(icon: &IconImage) -> Vec<(u8, u8, u8)> {
         icon.data
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] != 0)
             .map(|px| (px[1], px[2], px[3]))
             .collect()
@@ -721,7 +757,6 @@ mod tests {
         }
     }
 
-
     /// Pixels of `icon` at `distance >= min_r` from the center, i.e. the ring
     /// and arc annulus, with the small central area the weekly dot / question
     /// mark occupies excluded.
@@ -815,8 +850,15 @@ mod tests {
         ] {
             let fresh = snapshot(SnapshotState::Fresh, Some(70.0), Some(30.0));
             let stale = snapshot(SnapshotState::Stale, Some(70.0), Some(30.0));
-            let max_alpha =
-                |icon: &IconImage| icon.data.as_chunks::<4>().0.iter().map(|px| px[0]).max().unwrap_or(0);
+            let max_alpha = |icon: &IconImage| {
+                icon.data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|px| px[0])
+                    .max()
+                    .unwrap_or(0)
+            };
             for (f, s) in render_icons(&fresh, appearance)
                 .iter()
                 .zip(render_icons(&stale, appearance).iter())
@@ -960,8 +1002,7 @@ mod tests {
             // 22 px: ring inner edge is at 5.7, the glyph reaches ~4.8.
             let split = 5.2;
             assert!(
-                center_pixels(stale_icon, split).len()
-                    > center_pixels(fresh_icon, split).len() + 4,
+                center_pixels(stale_icon, split).len() > center_pixels(fresh_icon, split).len() + 4,
                 "the 22 px glyph must not collapse into a dot ({appearance:?})"
             );
         }
