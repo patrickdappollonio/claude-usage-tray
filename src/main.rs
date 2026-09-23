@@ -729,14 +729,16 @@ fn run_statusline(args: &[String]) -> i32 {
         }
     };
 
-    let mut input = Vec::new();
-    // A read error leaves whatever arrived before it; there is nothing better
-    // to do with it than carry on.
-    let _ = std::io::stdin().read_to_end(&mut input);
-    let cache_path = source::default_cache_path();
-    let existing = std::fs::read(&cache_path).ok();
-    if source::should_write_cache(&input, existing.as_deref()) {
-        let _ = source::write_cache(&cache_path, &input);
+    let mut stdin = std::io::stdin().lock();
+    let (input, complete) = read_capped(&mut stdin, STATUSLINE_INPUT_LIMIT);
+    // An oversized payload was cut off at the cap, so it is not a whole JSON
+    // document and there is nothing worth caching.
+    if complete {
+        let cache_path = source::default_cache_path();
+        let existing = std::fs::read(&cache_path).ok();
+        if source::should_write_cache(&input, existing.as_deref()) {
+            let _ = source::write_cache(&cache_path, &input);
+        }
     }
 
     if let Some(command) = exec {
@@ -751,15 +753,49 @@ fn run_statusline(args: &[String]) -> i32 {
             .stderr(std::process::Stdio::inherit())
             .spawn();
         if let Ok(mut child) = child {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(&input);
+            if let Some(mut pipe) = child.stdin.take() {
+                let _ = forward(&input, complete, &mut stdin, &mut pipe);
                 // Dropping closes the pipe, so a child reading to EOF finishes.
-                drop(stdin);
+                drop(pipe);
             }
             let _ = child.wait();
         }
     }
     0
+}
+
+/// Upper bound on the statusline payload held in memory. Claude Code sends a
+/// few KB per render; this leaves ample room while keeping a runaway payload
+/// from growing a process that runs on every prompt render.
+const STATUSLINE_INPUT_LIMIT: u64 = 1024 * 1024;
+
+/// Reads from `reader` until it ends or passes `limit` bytes. The flag is
+/// `true` when the stream ended within the limit; when it is `false`, the
+/// buffer holds one byte over the limit and more may remain unread.
+///
+/// A read error leaves whatever arrived before it and counts as the end of
+/// the stream; there is nothing better to do with it than carry on.
+fn read_capped(reader: &mut impl Read, limit: u64) -> (Vec<u8>, bool) {
+    let mut input = Vec::new();
+    let _ = reader.take(limit + 1).read_to_end(&mut input);
+    let complete = input.len() as u64 <= limit;
+    (input, complete)
+}
+
+/// Writes the bytes already read to `sink`, then, when the stream was cut
+/// off at the cap, copies the rest of `reader` through without buffering it
+/// all, so the `--exec` command still sees the whole payload.
+fn forward(
+    head: &[u8],
+    complete: bool,
+    reader: &mut impl Read,
+    sink: &mut impl Write,
+) -> std::io::Result<()> {
+    sink.write_all(head)?;
+    if !complete {
+        std::io::copy(reader, sink)?;
+    }
+    Ok(())
 }
 
 /// The `hook` subcommand family. Prints a human-readable report; a nonzero
@@ -1200,6 +1236,53 @@ fn poll_loop(
 /// `NotificationHandle`) lives in `platform::linux` and talks to a live
 /// notification daemon, so it is not unit-testable here — that verification
 /// is left to the orchestrator running this on a real desktop.
+#[cfg(test)]
+mod statusline_input {
+    use super::*;
+
+    #[test]
+    fn a_payload_within_the_limit_is_read_whole() {
+        let (input, complete) = read_capped(&mut &b"{\"a\":1}"[..], 16);
+        assert_eq!(input, b"{\"a\":1}");
+        assert!(complete);
+    }
+
+    #[test]
+    fn a_payload_exactly_at_the_limit_is_complete() {
+        let (input, complete) = read_capped(&mut &b"12345678"[..], 8);
+        assert_eq!(input, b"12345678");
+        assert!(complete);
+    }
+
+    #[test]
+    fn a_payload_over_the_limit_stops_one_byte_past_it() {
+        let mut reader = &b"0123456789abcdef"[..];
+        let (input, complete) = read_capped(&mut reader, 8);
+        assert_eq!(input, b"012345678");
+        assert!(!complete);
+        assert_eq!(reader, b"9abcdef");
+    }
+
+    #[test]
+    fn an_oversized_payload_reaches_the_command_whole() {
+        let payload: Vec<u8> = (0..=255).cycle().take(10_000).collect();
+        let mut reader = &payload[..];
+        let (head, complete) = read_capped(&mut reader, 100);
+        let mut sink = Vec::new();
+        forward(&head, complete, &mut reader, &mut sink).unwrap();
+        assert_eq!(sink, payload);
+    }
+
+    #[test]
+    fn a_complete_payload_is_forwarded_once() {
+        let mut reader = &b"{}"[..];
+        let (head, complete) = read_capped(&mut reader, 100);
+        let mut sink = Vec::new();
+        forward(&head, complete, &mut reader, &mut sink).unwrap();
+        assert_eq!(sink, b"{}");
+    }
+}
+
 #[cfg(test)]
 mod command_line {
     use super::*;
