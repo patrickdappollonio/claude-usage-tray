@@ -50,6 +50,9 @@ pub enum RadioGroup {
     RefreshInterval,
     /// The icon style, indexing [`crate::config::IconStyle::ALL`].
     IconStyle,
+    /// Which profile the icon follows: "Most recent", "Highest usage", then
+    /// one option per profile. Shown only with more than one profile.
+    IconFollows,
 }
 
 /// One option inside a [`MenuRow::Radio`].

@@ -69,6 +69,22 @@ pub struct UsageSnapshot {
     /// `Fresh` while the hook is still not installed — the "Install hook"
     /// menu item keys off this, not off `state`.
     pub hook_missing: bool,
+    /// One reading per Claude Code profile, filled only when there is more
+    /// than one. The fields above are then the profile the icon follows (see
+    /// [`combine_profiles`]), except `hook_missing`, which is true when *any*
+    /// profile lacks the hook. Empty for everyone with a single profile, which
+    /// is what keeps their tray exactly as it was.
+    pub profiles: Vec<ProfileUsage>,
+}
+
+/// One profile's reading, for the multi-profile menu and notifications.
+#[derive(Clone, Debug, Default)]
+pub struct ProfileUsage {
+    pub name: String,
+    pub snapshot: UsageSnapshot,
+    /// Whether this is the profile the icon shows. Set by
+    /// [`combine_profiles`]; at most one profile has it.
+    pub on_icon: bool,
 }
 
 impl UsageSnapshot {
@@ -105,12 +121,6 @@ pub fn claude_config_dir() -> PathBuf {
 /// never touch the real `~/.claude`.
 pub fn cache_path_in(config_dir: &Path) -> PathBuf {
     config_dir.join(CACHE_FILE_NAME)
-}
-
-/// Default cache file location:
-/// `${CLAUDE_CONFIG_DIR:-~/.claude}/usage-tray-statusline.json`.
-pub fn default_cache_path() -> PathBuf {
-    cache_path_in(&claude_config_dir())
 }
 
 /// Writes the raw statusline bytes to `path` atomically: temp file in the same
@@ -307,28 +317,116 @@ pub fn fake_snapshot(
 /// stat + read on every poll tick, so no state to go stale across the process
 /// lifetime):
 ///
-/// * kayfabe file absent → the real path: the statusline hook cache
-///   ([`read_snapshot`]) merged with Claude Code's `.claude.json` usage blob
-///   via [`merge_snapshot`].
+/// * kayfabe file absent → the real path: for each profile, the statusline
+///   hook cache ([`read_snapshot`]) merged with Claude Code's `.claude.json`
+///   usage blob via [`merge_snapshot`], then combined via
+///   [`combine_profiles`].
 /// * kayfabe file present and readable → its contents go through
 ///   [`fake_snapshot`] and *become* the snapshot, both real sources ignored.
 /// * kayfabe file present but unreadable (permissions, race, etc.) →
 ///   `Missing`, same as a missing real cache would be.
 pub fn read_merged_or_kayfabe(
-    cache_path: &Path,
-    app_cache_path: &Path,
+    profiles: &[crate::profiles::Profile],
+    follows: &crate::config::IconFollows,
     kayfabe_path: &Path,
     now: jiff::Timestamp,
 ) -> UsageSnapshot {
     match std::fs::read_to_string(kayfabe_path) {
         Ok(body) => fake_snapshot(&body, cache_mtime(kayfabe_path), now),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => merge_snapshot(
-            read_snapshot(cache_path, now),
-            crate::appcache::read_app_usage(app_cache_path, now),
-            now,
-        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let readings = profiles
+                .iter()
+                .map(|profile| ProfileUsage {
+                    name: profile.name.clone(),
+                    on_icon: false,
+                    snapshot: merge_snapshot(
+                        read_snapshot(&profile.cache_path, now),
+                        crate::appcache::read_app_usage(&profile.app_cache_path, now),
+                        now,
+                    ),
+                })
+                .collect();
+            combine_profiles(readings, follows)
+        }
         Err(_) => UsageSnapshot::missing(),
     }
+}
+
+/// Turns one reading per profile into the snapshot the tray shows.
+///
+/// A single profile is returned as is, with no `profiles` list, so a
+/// single-profile tray is exactly what it was before profiles existed.
+///
+/// With several, the top-level fields come from the profile `follows` picks:
+///
+/// * [`IconFollows::Recent`](crate::config::IconFollows::Recent): the one that
+///   reported most recently. Data of known age beats data of unknown age; on
+///   a tie the earlier profile wins, which puts the primary first.
+/// * [`IconFollows::Highest`](crate::config::IconFollows::Highest): the one
+///   with the highest session or weekly percentage.
+/// * [`IconFollows::Profile`](crate::config::IconFollows::Profile): that one,
+///   or `Recent` when no profile has that name any more.
+///
+/// Profiles with no data at all never win while another has some.
+pub fn combine_profiles(
+    mut readings: Vec<ProfileUsage>,
+    follows: &crate::config::IconFollows,
+) -> UsageSnapshot {
+    use crate::config::IconFollows;
+
+    if readings.len() <= 1 {
+        return readings
+            .pop()
+            .map(|reading| reading.snapshot)
+            .unwrap_or_else(UsageSnapshot::missing);
+    }
+
+    let with_data = || {
+        readings
+            .iter()
+            .filter(|reading| reading.snapshot.state != SnapshotState::Missing)
+    };
+    let most_recent = || {
+        // `max_by_key` keeps the *last* of equal keys; reversing first makes
+        // it keep the earliest profile instead.
+        with_data()
+            .rev()
+            .max_by_key(|reading| reading.snapshot.written_at)
+    };
+    let chosen = match follows {
+        IconFollows::Recent => most_recent(),
+        IconFollows::Highest => with_data()
+            .rev()
+            .max_by(|a, b| peak_percent(&a.snapshot).total_cmp(&peak_percent(&b.snapshot))),
+        IconFollows::Profile(name) => readings
+            .iter()
+            .find(|reading| &reading.name == name)
+            .or_else(most_recent),
+    };
+
+    let chosen = chosen.map(|reading| (reading.name.clone(), reading.snapshot.clone()));
+    let mut top = match chosen {
+        Some((name, snapshot)) => {
+            for reading in &mut readings {
+                reading.on_icon = reading.name == name;
+            }
+            snapshot
+        }
+        None => UsageSnapshot::missing(),
+    };
+    top.hook_missing = readings.iter().any(|reading| reading.snapshot.hook_missing);
+    top.profiles = readings;
+    top
+}
+
+/// The highest of a snapshot's session and weekly percentages, for
+/// [`IconFollows::Highest`](crate::config::IconFollows::Highest). A snapshot
+/// with neither ranks below any real reading.
+fn peak_percent(snapshot: &UsageSnapshot) -> f64 {
+    [&snapshot.session, &snapshot.weekly]
+        .into_iter()
+        .filter_map(|metric| metric.as_ref()?.percent)
+        .fold(f64::NEG_INFINITY, f64::max)
 }
 
 /// Merges the statusline-hook snapshot with Claude Code's own app-cache
@@ -392,6 +490,7 @@ pub fn merge_snapshot(
         written_at,
         state,
         hook_missing,
+        profiles: Vec::new(),
     }
 }
 
@@ -488,6 +587,21 @@ mod tests {
 
     fn ts(secs: i64) -> jiff::Timestamp {
         jiff::Timestamp::from_second(secs).expect("valid timestamp")
+    }
+
+    fn profile(cache_path: &Path, app_cache_path: &Path) -> crate::profiles::Profile {
+        let config_dir = cache_path.parent().expect("parent");
+        crate::profiles::Profile {
+            name: config_dir
+                .file_name()
+                .expect("named dir")
+                .to_string_lossy()
+                .into_owned(),
+            primary: false,
+            config_dir: config_dir.to_path_buf(),
+            cache_path: cache_path.to_path_buf(),
+            app_cache_path: app_cache_path.to_path_buf(),
+        }
     }
 
     /// Writes `body` to a file inside `dir` and stamps its mtime, so the
@@ -731,8 +845,8 @@ mod tests {
         )
         .expect("write app cache");
         let snap = read_merged_or_kayfabe(
-            &hook_path,
-            &app_path,
+            &[profile(&hook_path, &app_path)],
+            &crate::config::IconFollows::Recent,
             &temp.path().join("kayfabe.json"),
             jiff::Timestamp::now(),
         );
@@ -742,13 +856,155 @@ mod tests {
     }
 
     #[test]
+    fn read_merged_or_kayfabe_follows_the_profile_that_reported_last() {
+        let temp = TempDir::new("merged-profiles");
+        let default_dir = temp.path().join(".claude");
+        let custom_dir = temp.path().join("custom");
+        std::fs::create_dir_all(&default_dir).expect("create default dir");
+        std::fs::create_dir_all(&custom_dir).expect("create custom dir");
+        let old = write_with_mtime(
+            &default_dir,
+            CACHE_FILE_NAME,
+            r#"{"rate_limits":{"five_hour":{"used_percentage":10}}}"#,
+            1_700_000_000,
+        );
+        let new = write_with_mtime(
+            &custom_dir,
+            CACHE_FILE_NAME,
+            r#"{"rate_limits":{"five_hour":{"used_percentage":64}}}"#,
+            1_700_000_300,
+        );
+        let snap = read_merged_or_kayfabe(
+            &[
+                profile(&old, &old.with_extension("no-app-cache")),
+                profile(&new, &new.with_extension("no-app-cache")),
+            ],
+            &crate::config::IconFollows::Recent,
+            &temp.path().join("kayfabe.json"),
+            ts(1_700_000_305),
+        );
+        assert_eq!(snap.session.as_ref().and_then(|m| m.percent), Some(64.0));
+        assert_eq!(snap.written_at, Some(ts(1_700_000_300)));
+        let names: Vec<&str> = snap.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec![".claude", "custom"]);
+    }
+
+    fn reading(name: &str, snapshot: UsageSnapshot) -> ProfileUsage {
+        ProfileUsage {
+            name: name.to_string(),
+            on_icon: false,
+            snapshot,
+        }
+    }
+
+    fn session_of(snapshot: &UsageSnapshot) -> Option<f64> {
+        snapshot.session.as_ref().and_then(|m| m.percent)
+    }
+
+    #[test]
+    fn combine_leaves_a_single_profile_exactly_as_read() {
+        let hook = hook_snapshot(MERGE_NOW - 60, 10.0, 40.0);
+        let snap = combine_profiles(
+            vec![reading("default", hook)],
+            &crate::config::IconFollows::Highest,
+        );
+        assert_eq!(session_of(&snap), Some(10.0));
+        assert!(snap.profiles.is_empty());
+        assert_eq!(
+            combine_profiles(Vec::new(), &crate::config::IconFollows::Recent).state,
+            SnapshotState::Missing
+        );
+    }
+
+    #[test]
+    fn combine_recent_skips_profiles_with_no_data_and_keeps_the_first_on_a_tie() {
+        use crate::config::IconFollows;
+        let snap = combine_profiles(
+            vec![
+                reading("a", UsageSnapshot::missing()),
+                reading("b", hook_snapshot(MERGE_NOW - 60, 10.0, 40.0)),
+                reading("c", hook_snapshot(MERGE_NOW - 60, 20.0, 40.0)),
+                reading("d", hook_snapshot(MERGE_NOW - 600, 30.0, 40.0)),
+            ],
+            &IconFollows::Recent,
+        );
+        assert_eq!(session_of(&snap), Some(10.0));
+        assert_eq!(snap.profiles.len(), 4);
+    }
+
+    #[test]
+    fn combine_highest_takes_the_peak_of_session_and_weekly() {
+        use crate::config::IconFollows;
+        let snap = combine_profiles(
+            vec![
+                reading("recent", hook_snapshot(MERGE_NOW - 10, 30.0, 40.0)),
+                reading("weekly-heavy", hook_snapshot(MERGE_NOW - 900, 5.0, 95.0)),
+                reading("empty", UsageSnapshot::missing()),
+            ],
+            &IconFollows::Highest,
+        );
+        assert_eq!(session_of(&snap), Some(5.0));
+    }
+
+    #[test]
+    fn combine_follows_a_named_profile_and_falls_back_to_recent_without_it() {
+        use crate::config::IconFollows;
+        let readings = || {
+            vec![
+                reading("default", hook_snapshot(MERGE_NOW - 10, 30.0, 40.0)),
+                reading("work", hook_snapshot(MERGE_NOW - 900, 70.0, 40.0)),
+            ]
+        };
+        let work = combine_profiles(readings(), &IconFollows::Profile("work".into()));
+        assert_eq!(session_of(&work), Some(70.0));
+        let marked: Vec<bool> = work.profiles.iter().map(|p| p.on_icon).collect();
+        assert_eq!(marked, [false, true]);
+        let gone = combine_profiles(readings(), &IconFollows::Profile("gone".into()));
+        assert_eq!(session_of(&gone), Some(30.0));
+    }
+
+    #[test]
+    fn combine_reports_the_hook_missing_when_any_profile_lacks_it() {
+        use crate::config::IconFollows;
+        let mut app_only = hook_snapshot(MERGE_NOW - 600, 10.0, 40.0);
+        app_only.hook_missing = true;
+        let snap = combine_profiles(
+            vec![
+                reading("a", hook_snapshot(MERGE_NOW - 30, 20.0, 40.0)),
+                reading("b", app_only),
+            ],
+            &IconFollows::Recent,
+        );
+        assert_eq!(session_of(&snap), Some(20.0));
+        assert!(snap.hook_missing);
+    }
+
+    #[test]
+    fn combine_of_profiles_with_no_data_is_missing_but_keeps_the_list() {
+        let snap = combine_profiles(
+            vec![
+                reading("a", UsageSnapshot::missing()),
+                reading("b", UsageSnapshot::missing()),
+            ],
+            &crate::config::IconFollows::Recent,
+        );
+        assert_eq!(snap.state, SnapshotState::Missing);
+        assert!(snap.hook_missing);
+        assert_eq!(snap.profiles.len(), 2);
+        assert!(snap.profiles.iter().all(|p| !p.on_icon));
+    }
+
+    #[test]
     fn read_merged_or_kayfabe_still_prefers_the_kayfabe_file() {
         let temp = TempDir::new("merged-kayfabe");
         let kayfabe = temp.path().join("kayfabe.json");
         std::fs::write(&kayfabe, r#"{"session": 55, "fable": 71}"#).expect("write kayfabe");
         let snap = read_merged_or_kayfabe(
-            &cache_path_in(temp.path()),
-            &temp.path().join(".claude.json"),
+            &[profile(
+                &cache_path_in(temp.path()),
+                &temp.path().join(".claude.json"),
+            )],
+            &crate::config::IconFollows::Recent,
             &kayfabe,
             jiff::Timestamp::now(),
         );
@@ -900,13 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_path_respects_claude_config_dir_env_var() {
+    fn cache_path_respects_claude_config_dir_env_var() {
         // SAFETY: test-only env mutation, single-threaded within this process
         // for this variable's usage (no other test reads/writes it).
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/custom-claude-dir");
         }
-        let path = default_cache_path();
+        let path = cache_path_in(&claude_config_dir());
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
@@ -982,11 +1238,11 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_path_falls_back_to_home_dot_claude() {
+    fn cache_path_falls_back_to_home_dot_claude() {
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
-        let path = default_cache_path();
+        let path = cache_path_in(&claude_config_dir());
         assert!(path.ends_with(CACHE_FILE_NAME));
         assert!(path.to_string_lossy().contains(".claude"));
     }
@@ -1138,14 +1394,20 @@ mod tests {
         );
 
         let first = read_merged_or_kayfabe(
-            &cache_path,
-            &cache_path.with_extension("no-app-cache"),
+            &[profile(
+                &cache_path,
+                &cache_path.with_extension("no-app-cache"),
+            )],
+            &crate::config::IconFollows::Recent,
             &kayfabe_path,
             ts(1_700_000_005),
         );
         let later = read_merged_or_kayfabe(
-            &cache_path,
-            &cache_path.with_extension("no-app-cache"),
+            &[profile(
+                &cache_path,
+                &cache_path.with_extension("no-app-cache"),
+            )],
+            &crate::config::IconFollows::Recent,
             &kayfabe_path,
             ts(1_700_000_305),
         );
@@ -1177,8 +1439,11 @@ mod tests {
         let kayfabe_path = temp.path().join("kayfabe.json"); // never created
 
         let snap = read_merged_or_kayfabe(
-            &cache_path,
-            &cache_path.with_extension("no-app-cache"),
+            &[profile(
+                &cache_path,
+                &cache_path.with_extension("no-app-cache"),
+            )],
+            &crate::config::IconFollows::Recent,
             &kayfabe_path,
             ts(1_700_000_000 + 5),
         );
@@ -1196,8 +1461,11 @@ mod tests {
 
         let now = ts(1_700_000_000 + 5);
         let snap = read_merged_or_kayfabe(
-            &cache_path,
-            &cache_path.with_extension("no-app-cache"),
+            &[profile(
+                &cache_path,
+                &cache_path.with_extension("no-app-cache"),
+            )],
+            &crate::config::IconFollows::Recent,
             &kayfabe_path,
             now,
         );
@@ -1214,8 +1482,11 @@ mod tests {
         std::fs::write(&kayfabe_path, "not json").expect("write kayfabe");
 
         let snap = read_merged_or_kayfabe(
-            &cache_path,
-            &cache_path.with_extension("no-app-cache"),
+            &[profile(
+                &cache_path,
+                &cache_path.with_extension("no-app-cache"),
+            )],
+            &crate::config::IconFollows::Recent,
             &kayfabe_path,
             ts(1_700_000_000 + 5),
         );

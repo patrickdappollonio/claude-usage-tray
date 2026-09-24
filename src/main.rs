@@ -36,6 +36,7 @@ mod icon;
 mod instance;
 mod menu;
 mod platform;
+mod profiles;
 mod source;
 #[cfg(test)]
 mod testutil;
@@ -199,13 +200,18 @@ claude-usage-tray — Claude Code usage in the system tray
   claude-usage-tray                      run the tray in the background
   claude-usage-tray --foreground         run the tray in this terminal
   claude-usage-tray restart              stop the running tray and start again
-  claude-usage-tray statusline [--exec CMD]
+  claude-usage-tray statusline [--config-dir DIR] [--exec CMD]
                                          Claude Code statusline command: caches
-                                         the stdin JSON, optionally running CMD
-                                         and passing its output through
-  claude-usage-tray hook install         point statusLine.command at this binary
+                                         the stdin JSON in DIR (default: the
+                                         Claude config directory), optionally
+                                         running CMD and passing its output
+                                         through
+  claude-usage-tray hook install         point statusLine.command at this binary,
+                                         in every Claude Code profile
   claude-usage-tray hook uninstall       undo that
   claude-usage-tray hook status          report what is currently wired up
+  claude-usage-tray profiles             list the Claude Code profiles the tray
+                                         reads, and why any others are skipped
 ";
 
 /// The subcommand that replaces a running instance. Named here because the
@@ -464,6 +470,7 @@ enum Mode {
     Restart,
     Statusline,
     Hook,
+    Profiles,
     Usage,
 }
 
@@ -479,6 +486,7 @@ fn parse_mode(args: &[String]) -> Mode {
         Some(command) if command == RESTART_COMMAND && args.len() == 1 => Mode::Restart,
         Some("statusline") => Mode::Statusline,
         Some("hook") => Mode::Hook,
+        Some("profiles") if args.len() == 1 => Mode::Profiles,
         _ => Mode::Usage,
     }
 }
@@ -495,6 +503,7 @@ fn main() {
         // design.
         Mode::Statusline => run_statusline(&args[1..]),
         Mode::Hook => run_hook(&args[1..]),
+        Mode::Profiles => run_profiles(),
         Mode::Usage => {
             eprint!("{USAGE}");
             2
@@ -721,13 +730,9 @@ fn run_tray_locked(spawned: bool) -> i32 {
 /// a failing child must never make somebody's statusline worse, and this
 /// command never prints anything of its own.
 fn run_statusline(args: &[String]) -> i32 {
-    let exec = match args {
-        [] => None,
-        [flag, command] if flag == "--exec" => Some(command.clone()),
-        _ => {
-            eprint!("{USAGE}");
-            return 2;
-        }
+    let Some(args) = hook::parse_statusline_args(args) else {
+        eprint!("{USAGE}");
+        return 2;
     };
 
     let mut stdin = std::io::stdin().lock();
@@ -737,12 +742,24 @@ fn run_statusline(args: &[String]) -> i32 {
     // neither is a whole JSON document, and a partial one must not replace
     // the last good cache.
     if end == InputEnd::Complete {
-        let cache_path = source::default_cache_path();
+        let config_dir = args
+            .config_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(source::claude_config_dir);
+        let cache_path = source::cache_path_in(&config_dir);
         let existing = std::fs::read(&cache_path).ok();
-        if source::should_write_cache(&input, existing.as_deref()) {
-            let _ = source::write_cache(&cache_path, &input);
+        if source::should_write_cache(&input, existing.as_deref())
+            && source::write_cache(&cache_path, &input).is_ok()
+            && existing.is_none()
+        {
+            // The tray may have started with a different `CLAUDE_CONFIG_DIR`,
+            // or none, so the first cache written into a directory leaves it
+            // a note of where that is. Only the first: every later render
+            // costs no extra I/O.
+            profiles::remember(&config_dir);
         }
     }
+    let exec = args.exec;
 
     if let Some(command) = exec {
         // The feed runs on another thread, and the rest of an oversized
@@ -800,10 +817,12 @@ fn forward(
     Ok(())
 }
 
-/// The `hook` subcommand family. Prints a human-readable report; a nonzero
-/// exit means the settings file could not be read or written.
+/// The `hook` subcommand family, run against every discovered profile. With
+/// one profile, which is almost everyone, the output is exactly what it
+/// always was. Prints a human-readable report; a nonzero exit means some
+/// profile's settings file could not be read or written.
 fn run_hook(args: &[String]) -> i32 {
-    let config_dir = source::claude_config_dir();
+    let found = profiles::discover().profiles;
     match args.first().map(String::as_str) {
         Some("install") if args.len() == 1 => {
             let exe = match binary::current() {
@@ -813,32 +832,21 @@ fn run_hook(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            match hook::install_in(&config_dir, &exe) {
-                Ok(report) => {
-                    println!("{}", report.render());
-                    0
-                }
-                Err(err) => {
-                    eprintln!("claude-usage-tray: hook install failed: {err}");
-                    1
-                }
-            }
+            report_each(&found, |profile| {
+                let report = hook::install_in(&profile.config_dir, &exe)?;
+                profiles::remember(&profile.config_dir);
+                Ok(report.render())
+            })
         }
-        Some("uninstall") if args.len() == 1 => match hook::uninstall_in(&config_dir) {
-            Ok(report) => {
-                println!("{}", report.render());
-                0
-            }
-            Err(err) => {
-                eprintln!("claude-usage-tray: hook uninstall failed: {err}");
-                1
-            }
-        },
+        Some("uninstall") if args.len() == 1 => report_each(&found, |profile| {
+            hook::uninstall_in(&profile.config_dir).map(|report| report.render())
+        }),
         Some("status") if args.len() == 1 => {
-            let report = hook::status_in(&config_dir, Timestamp::now());
             let exe = binary::current().ok();
-            println!("{}", report.render(exe.as_deref(), Timestamp::now()));
-            0
+            report_each(&found, |profile| {
+                let report = hook::status_in(&profile.config_dir, Timestamp::now());
+                Ok(report.render(exe.as_deref(), Timestamp::now()))
+            })
         }
         _ => {
             eprint!("{USAGE}");
@@ -847,19 +855,60 @@ fn run_hook(args: &[String]) -> i32 {
     }
 }
 
-/// Points the statusline hook and the autostart entry at the running binary
-/// when they name another one, most often a Homebrew version directory that an
-/// upgrade removed. Runs once at tray startup, so the first launch after an
-/// upgrade fixes what the upgrade broke. Neither is ever created here, and
-/// failures are only logged: the tray works without either.
+/// Runs `action` for every profile, printing each report (a blank line
+/// between them) and each failure. Returns 1 if any failed.
+fn report_each(
+    found: &[profiles::Profile],
+    mut action: impl FnMut(&profiles::Profile) -> std::io::Result<String>,
+) -> i32 {
+    let mut code = 0;
+    for (index, profile) in found.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        match action(profile) {
+            Ok(report) => println!("{report}"),
+            Err(err) => {
+                eprintln!(
+                    "claude-usage-tray: {} failed: {err}",
+                    profile.config_dir.display()
+                );
+                code = 1;
+            }
+        }
+    }
+    code
+}
+
+/// The `profiles` command: which Claude Code profiles the tray reads, what
+/// state each one's hook and data are in, and which folders were skipped and
+/// why. The first thing to run when the tray says "no data".
+fn run_profiles() -> i32 {
+    println!(
+        "{}",
+        profiles::render(&profiles::discover(), Timestamp::now())
+    );
+    0
+}
+
+/// Brings the statusline hook in every profile, and the autostart entry, up
+/// to date: pointed at the running binary when they name another one (most
+/// often a Homebrew version directory that an upgrade removed), and, for the
+/// hook, naming its own config directory. Runs once at tray startup, so the
+/// first launch after an upgrade fixes what the upgrade broke. Nothing is ever
+/// created here, and failures are only logged: the tray works without either.
 fn repair_recorded_paths(exe: &Path) {
-    match hook::repair_in(&source::claude_config_dir(), exe) {
-        Ok(Some(old)) => eprintln!(
-            "claude-usage-tray: statusline hook pointed at {old}, now {}",
-            exe.display()
-        ),
-        Ok(None) => {}
-        Err(err) => eprintln!("claude-usage-tray: could not check the statusline hook: {err}"),
+    for profile in profiles::discover().profiles {
+        let settings = profile.config_dir.display();
+        match hook::repair_in(&profile.config_dir, exe) {
+            Ok(Some(old)) => eprintln!(
+                "claude-usage-tray: updated the statusline hook in {settings} (it was: {old})"
+            ),
+            Ok(None) => {}
+            Err(err) => eprintln!(
+                "claude-usage-tray: could not check the statusline hook in {settings}: {err}"
+            ),
+        }
     }
     match platform::autostart::refresh(exe) {
         Ok(true) => eprintln!(
@@ -871,13 +920,26 @@ fn repair_recorded_paths(exe: &Path) {
     }
 }
 
-/// Runs the hook installer from the tray's menu item and returns the toast to
-/// show. Deliberately called from the poll loop rather than from the D-Bus
-/// callback, so the filesystem work never blocks the menu.
+/// Runs the hook installer for every profile from the tray's menu item and
+/// returns the toast to show. Deliberately called from the poll loop rather
+/// than from the D-Bus callback, so the filesystem work never blocks the menu.
 fn install_hook_now() -> String {
-    let result =
-        binary::current().and_then(|exe| hook::install_in(&source::claude_config_dir(), &exe));
-    hook::install_toast(&result)
+    let exe = match binary::current() {
+        Ok(exe) => exe,
+        Err(err) => return hook::install_toast(&Err(err)),
+    };
+    let results: Vec<_> = profiles::discover()
+        .profiles
+        .into_iter()
+        .map(|profile| {
+            let result = hook::install_in(&profile.config_dir, &exe);
+            if result.is_ok() {
+                profiles::remember(&profile.config_dir);
+            }
+            (profile.name, result)
+        })
+        .collect();
+    hook::install_toast_all(&results)
 }
 
 /// How long after startup the first update check runs. Late enough that a
@@ -961,14 +1023,13 @@ enum PostRead {
 }
 
 fn run_tray() {
-    let cache_path = source::default_cache_path();
-    let app_cache_path = appcache::app_cache_path();
     let kayfabe_path = source::default_kayfabe_path();
     let stored = config::load();
     let env_secs = config::env_override(std::env::var("CLAUDE_TRAY_POLL_SECS").ok().as_deref());
     let settings = ui::Settings::new(stored, env_secs);
     let interval = settings.interval_handle();
     let notify_prefs = settings.notify_handle();
+    let follows = settings.follows_handle();
     let appearance = settings.appearance_handle();
     let check_updates = settings.check_updates_handle();
     let cli_refresh = settings.cli_refresh_handle();
@@ -1016,12 +1077,7 @@ fn run_tray() {
         });
     }
 
-    let snapshot = source::read_merged_or_kayfabe(
-        &cache_path,
-        &app_cache_path,
-        &kayfabe_path,
-        Timestamp::now(),
-    );
+    let snapshot = read_usage(&kayfabe_path, &follows);
 
     let core = ui::TrayCore::new(snapshot.clone(), settings, wake_tx);
     // Blocks for the rest of the program: on Linux the closure below runs on
@@ -1031,9 +1087,8 @@ fn run_tray() {
         poll_loop(
             handle,
             snapshot,
-            &cache_path,
-            &app_cache_path,
             &kayfabe_path,
+            &follows,
             &wake_rx,
             &cli_refresh,
             &interval,
@@ -1048,6 +1103,18 @@ fn run_tray() {
     }
 }
 
+/// One read of everything the tray shows. The profiles are looked up again
+/// every time, so one that appears while the tray runs shows up on the next
+/// poll.
+fn read_usage(kayfabe_path: &Path, follows: &ui::FollowsHandle) -> source::UsageSnapshot {
+    source::read_merged_or_kayfabe(
+        &profiles::discover().profiles,
+        &follows.get(),
+        kayfabe_path,
+        Timestamp::now(),
+    )
+}
+
 /// The poll loop: re-reads the cache on a timer, on demand, and whenever a
 /// pending quota reset comes due, pushing anything that changed to the tray and
 /// emitting the notifications the pure state machines in [`ui`] ask for.
@@ -1058,9 +1125,8 @@ fn run_tray() {
 fn poll_loop(
     handle: platform::TrayHandle,
     mut snapshot: source::UsageSnapshot,
-    cache_path: &std::path::Path,
-    app_cache_path: &std::path::Path,
     kayfabe_path: &std::path::Path,
+    follows: &ui::FollowsHandle,
     wake_rx: &mpsc::Receiver<Wake>,
     cli_refresh: &std::sync::atomic::AtomicBool,
     interval: &std::sync::atomic::AtomicU64,
@@ -1068,11 +1134,10 @@ fn poll_loop(
     mut binary_watch: Option<&mut binary::BinaryWatch>,
     restart: &ui::RestartHandle,
 ) {
-    // The first cycle's reading becomes the notifier's baseline rather than a
+    // The first cycle's reading becomes each profile's baseline rather than a
     // volley of alerts for crossings that happened before this process
     // existed; see `Notifier`.
-    let mut notifier = ui::Notifier::new(&notify_prefs.get().thresholds);
-    let mut reset_notifiers = ui::ResetNotifiers::new();
+    let mut notifiers = ui::ProfileNotifiers::new();
     // What the info rows last said, verbatim. Relative countdowns drift out of
     // truth as the wall clock advances even when the data does not, so every
     // cycle re-renders this and pushes a refresh on any difference — the
@@ -1086,8 +1151,7 @@ fn poll_loop(
     loop {
         // Re-read the preferences every cycle so a menu toggle applies live.
         let prefs = notify_prefs.get();
-        notifier.set_enabled(&prefs.thresholds);
-        if let Some(alert) = notifier.evaluate(snapshot.session.as_ref()) {
+        for alert in notifiers.usage_alerts(&snapshot, &prefs.thresholds) {
             notify(&alert);
         }
 
@@ -1121,8 +1185,8 @@ fn poll_loop(
         let now = Timestamp::now();
         // Whether any window we were waiting on has now come due — recorded
         // before `evaluate` consumes it.
-        let window_rolled_over = reset_notifiers.deadline().is_some_and(|at| at <= now);
-        for alert in reset_notifiers.evaluate(&snapshot, now, prefs.on_reset) {
+        let window_rolled_over = notifiers.deadline().is_some_and(|at| at <= now);
+        for alert in notifiers.reset_alerts(&snapshot, now, prefs.on_reset) {
             notify_reset(&alert);
         }
         if window_rolled_over {
@@ -1130,12 +1194,7 @@ fn poll_loop(
             // re-read reports the fresh one (the reader zeroes a percentage
             // whose `resets_at` has passed), so the icon follows the
             // notification instead of lagging a whole interval behind it.
-            let next = source::read_merged_or_kayfabe(
-                cache_path,
-                app_cache_path,
-                kayfabe_path,
-                Timestamp::now(),
-            );
+            let next = read_usage(kayfabe_path, follows);
             if ui::snapshot_changed(&snapshot, &next) {
                 handle.set_snapshot(next.clone());
                 last_rendered = ui::tooltip_text(&next, Timestamp::now());
@@ -1148,7 +1207,7 @@ fn poll_loop(
         // and never sleep past a pending quota reset.
         let wait = ui::poll_wait(
             interval.load(Ordering::Relaxed),
-            reset_notifiers.deadline(),
+            notifiers.deadline(),
             Timestamp::now(),
         );
         let post_read = match wake_rx.recv_timeout(wait) {
@@ -1188,6 +1247,9 @@ fn poll_loop(
                 notify_refresh(&install_hook_now());
                 PostRead::Silent
             }
+            // The icon now follows another profile: re-read silently so it
+            // switches right away.
+            Ok(Wake::IconFollowsChanged) => PostRead::Silent,
             Ok(Wake::Quit) => break,
             // Every sender is gone, which can only mean the tray service died.
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1197,12 +1259,7 @@ fn poll_loop(
             break;
         }
 
-        let next = source::read_merged_or_kayfabe(
-            cache_path,
-            app_cache_path,
-            kayfabe_path,
-            Timestamp::now(),
-        );
+        let next = read_usage(kayfabe_path, follows);
         let pushed = ui::snapshot_changed(&snapshot, &next);
         if pushed {
             handle.set_snapshot(next.clone());
@@ -1357,6 +1414,7 @@ mod command_line {
         assert_eq!(mode(&["statusline", "--exec", "prompt"]), Mode::Statusline);
         assert_eq!(mode(&["hook", "install"]), Mode::Hook);
         assert_eq!(mode(&["hook", "status"]), Mode::Hook);
+        assert_eq!(mode(&["profiles"]), Mode::Profiles);
     }
 
     #[test]
@@ -1366,6 +1424,7 @@ mod command_line {
             vec!["-f"],
             vec!["--foreground", "extra"],
             vec!["restart", "now"],
+            vec!["profiles", "--all"],
             vec![""],
         ] {
             assert_eq!(mode(&args), Mode::Usage, "unexpected mode for {args:?}");
@@ -1614,6 +1673,7 @@ mod notify_channel_routing {
             threshold: 75,
             percent: 75.0,
             critical: false,
+            profile: None,
         };
         let (toast, channel) = threshold_toast(&alert);
         assert_eq!(channel, Channel::ThresholdAlert);
@@ -1630,6 +1690,7 @@ mod notify_channel_routing {
             threshold: 90,
             percent: 90.0,
             critical: true,
+            profile: None,
         };
         let (toast, channel) = threshold_toast(&alert);
         assert_eq!(channel, Channel::ThresholdAlert);
@@ -1642,6 +1703,7 @@ mod notify_channel_routing {
         let alert = ResetAlert {
             window: ui::ResetWindow::Session,
             at: Timestamp::now(),
+            profile: None,
         };
         let (_, channel) = reset_toast(&alert);
         assert_eq!(channel, Channel::Ephemeral);

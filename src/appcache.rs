@@ -13,7 +13,7 @@
 //! contract, so every field is optional and any surprise degrades to "this
 //! metric is absent", never to an error the tray would surface.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::source::Metric;
 
@@ -35,27 +35,6 @@ pub struct AppUsage {
     pub scoped: Vec<ScopedMetric>,
     /// When Claude Code fetched this from the API (`fetchedAtMs`).
     pub fetched_at: Option<jiff::Timestamp>,
-}
-
-/// Where `.claude.json` lives: `$CLAUDE_CONFIG_DIR/.claude.json` when the
-/// override is set, else `~/.claude.json` (note: the home directory itself,
-/// *not* inside `~/.claude/`).
-pub fn app_cache_path() -> PathBuf {
-    app_cache_path_from(
-        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        dirs::home_dir(),
-    )
-}
-
-/// Pure resolution behind [`app_cache_path`], parameterized so tests never
-/// race other tests over the real environment.
-fn app_cache_path_from(config_dir: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
-    match config_dir {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(".claude.json"),
-        _ => home
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".claude.json"),
-    }
 }
 
 /// Reads and parses `.claude.json` at `path`. Any failure — missing file,
@@ -280,23 +259,5 @@ mod tests {
         std::fs::write(&path, read_fixture("valid_full.json")).expect("write");
         let usage = read_app_usage(&path, ts(NOW)).expect("parses");
         assert_eq!(usage.scoped[0].name, "Fable");
-    }
-
-    #[test]
-    fn app_cache_path_respects_claude_config_dir() {
-        assert_eq!(
-            app_cache_path_from(Some(PathBuf::from("/tmp/custom-claude-dir")), None),
-            PathBuf::from("/tmp/custom-claude-dir/.claude.json")
-        );
-    }
-
-    #[test]
-    fn app_cache_path_defaults_to_home_not_dot_claude() {
-        let path = app_cache_path_from(None, Some(PathBuf::from("/home/someone")));
-        assert_eq!(path, PathBuf::from("/home/someone/.claude.json"));
-        assert!(
-            !path.starts_with("/home/someone/.claude/"),
-            "must be ~/.claude.json, not inside ~/.claude/"
-        );
     }
 }

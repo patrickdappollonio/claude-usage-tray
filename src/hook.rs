@@ -2,8 +2,8 @@
 //!
 //! There is no shell snippet to install any more. `hook install` is a
 //! `settings.json` read-modify-write that points `statusLine.command` at
-//! `<this binary> statusline`, optionally wrapping whatever command was there
-//! before with `--exec '<original>'`. `hook uninstall` puts the original back
+//! `<this binary> statusline --config-dir <dir>`, optionally wrapping whatever
+//! command was there before with `--exec '<original>'`. `hook uninstall` puts the original back
 //! (or removes the key), `hook status` reports what is currently wired up.
 //!
 //! Everything here is parameterized by a config-directory path, so the tests
@@ -34,6 +34,16 @@ pub const SCRIPT_BACKUP_SUFFIX: &str = ".bak-usage-tray";
 /// recognized (and refreshed) rather than wrapped a second time.
 const MARKER_ARG: &str = "statusline";
 
+/// Names the config directory the hook writes its cache into. Written into
+/// every command this module builds, so where the data goes is declared in the
+/// settings file itself rather than left to whatever `CLAUDE_CONFIG_DIR` the
+/// launching process happens to have. A command without it (every install
+/// made before it existed) falls back to the environment.
+pub const CONFIG_DIR_FLAG: &str = "--config-dir";
+
+/// Wraps the user's own statusline command.
+pub const EXEC_FLAG: &str = "--exec";
+
 // ---------------------------------------------------------------------------
 // Command strings
 // ---------------------------------------------------------------------------
@@ -43,8 +53,37 @@ const MARKER_ARG: &str = "statusline";
 pub struct OurCommand {
     /// The binary path recorded in settings.json.
     pub exe: String,
+    /// The config directory the command names, if it names one.
+    pub config_dir: Option<String>,
     /// The user's own statusline command, if we are wrapping one.
     pub original: Option<String>,
+}
+
+/// The arguments of the `statusline` subcommand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatuslineArgs {
+    pub config_dir: Option<String>,
+    pub exec: Option<String>,
+}
+
+/// Parses the `statusline` subcommand's arguments: `--config-dir DIR` and
+/// `--exec CMD`, each at most once, in either order. `None` for anything else,
+/// which the command reports as a usage error.
+pub fn parse_statusline_args(args: &[String]) -> Option<StatuslineArgs> {
+    let mut parsed = StatuslineArgs::default();
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let slot = match flag.as_str() {
+            CONFIG_DIR_FLAG => &mut parsed.config_dir,
+            EXEC_FLAG => &mut parsed.exec,
+            _ => return None,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(rest.next()?.clone());
+    }
+    Some(parsed)
 }
 
 /// Splits a command string the way `sh` would, for the small subset that can
@@ -134,34 +173,57 @@ fn quote_if_needed(word: &str) -> String {
     }
 }
 
-/// Builds the `statusLine.command` value for this binary, optionally wrapping
-/// the user's existing command.
-pub fn build_command(exe: &str, original: Option<&str>) -> String {
-    match original {
-        Some(original) if !original.trim().is_empty() => format!(
-            "{} {MARKER_ARG} --exec {}",
-            quote_if_needed(exe),
-            shell_quote(original)
-        ),
-        _ => format!("{} {MARKER_ARG}", quote_if_needed(exe)),
+/// Builds the `statusLine.command` value for this binary, optionally naming
+/// the config directory and wrapping the user's existing command.
+pub fn build_command(exe: &str, config_dir: Option<&str>, original: Option<&str>) -> String {
+    let mut command = format!("{} {MARKER_ARG}", quote_if_needed(exe));
+    if let Some(dir) = config_dir {
+        command.push_str(&format!(" {CONFIG_DIR_FLAG} {}", quote_if_needed(dir)));
     }
+    if let Some(original) = original.filter(|original| !original.trim().is_empty()) {
+        command.push_str(&format!(" {EXEC_FLAG} {}", shell_quote(original)));
+    }
+    command
 }
 
-/// Recognizes one of our own commands and recovers the wrapped original.
+/// Recognizes one of our own commands and recovers what it records.
 /// Recognition is by the `statusline` argument, not by the binary's name.
+/// Lenient past that: a flag this version does not know is skipped, so a
+/// command is never mistaken for someone else's and wrapped a second time.
 pub fn parse_our_command(command: &str) -> Option<OurCommand> {
     let tokens = shell_split(command)?;
     if tokens.len() < 2 || tokens[1] != MARKER_ARG {
         return None;
     }
-    let original = match tokens.get(2).map(String::as_str) {
-        Some("--exec") => tokens.get(3).cloned().filter(|o| !o.trim().is_empty()),
-        _ => None,
-    };
-    Some(OurCommand {
+    let mut ours = OurCommand {
         exe: tokens[0].clone(),
+        config_dir: None,
+        original: None,
+    };
+    let mut rest = tokens[2..].iter();
+    while let Some(flag) = rest.next() {
+        let slot = match flag.as_str() {
+            CONFIG_DIR_FLAG => &mut ours.config_dir,
+            EXEC_FLAG => &mut ours.original,
+            _ => continue,
+        };
+        *slot = rest
+            .next()
+            .cloned()
+            .filter(|value| !value.trim().is_empty());
+    }
+    Some(ours)
+}
+
+/// The command this binary should record for `config_dir`, keeping whatever
+/// `ours` was wrapping.
+fn wanted_command(exe: &Path, config_dir: &Path, original: Option<&str>) -> io::Result<String> {
+    let config_dir = std::path::absolute(config_dir)?;
+    Ok(build_command(
+        &exe.to_string_lossy(),
+        Some(&config_dir.to_string_lossy()),
         original,
-    })
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -410,9 +472,10 @@ pub struct InstallReport {
     pub refreshed: bool,
 }
 
-/// Points `statusLine.command` at `exe statusline`, wrapping whatever was
-/// there before. Idempotent: re-running against an already-installed settings
-/// file refreshes the recorded binary path instead of wrapping ourselves.
+/// Points `statusLine.command` at `exe statusline --config-dir <config_dir>`,
+/// wrapping whatever was there before. Idempotent: re-running against an
+/// already-installed settings file refreshes the recorded binary path and
+/// directory instead of wrapping ourselves.
 pub fn install_in(config_dir: &Path, exe: &Path) -> io::Result<InstallReport> {
     let settings_path = config_dir.join(SETTINGS_FILE_NAME);
     let mut settings = read_settings(&settings_path)?;
@@ -434,7 +497,7 @@ pub fn install_in(config_dir: &Path, exe: &Path) -> io::Result<InstallReport> {
 
     let created_backup = backup_once(&settings_path, &config_dir.join(SETTINGS_BACKUP_FILE_NAME))?;
 
-    let command = build_command(&exe.to_string_lossy(), wrapped.as_deref());
+    let command = wanted_command(exe, config_dir, wrapped.as_deref())?;
     set_command(&mut settings, &command);
     write_settings(&settings_path, &settings)?;
 
@@ -572,10 +635,11 @@ impl UninstallReport {
     }
 }
 
-/// Points an installed hook at `exe` when it records some other binary: a
-/// Homebrew version directory that an upgrade has since removed, or a binary
-/// the user has moved. Returns the path it replaced, or `None` when there was
-/// nothing to do.
+/// Brings an installed hook up to date: points it at `exe` when it records
+/// some other binary (a Homebrew version directory that an upgrade has since
+/// removed, or a binary the user has moved), and writes `config_dir` into a
+/// command that does not name it yet. Returns the command it replaced, or
+/// `None` when there was nothing to do.
 ///
 /// Unlike [`install_in`] this never adds the hook. A `statusLine.command` that
 /// is not ours, or no settings file at all, is left exactly as it is.
@@ -585,19 +649,19 @@ pub fn repair_in(config_dir: &Path, exe: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
     let mut settings = read_settings(&settings_path)?;
-    let Some(ours) = command_of(&settings).as_deref().and_then(parse_our_command) else {
+    let Some(current) = command_of(&settings) else {
         return Ok(None);
     };
-    let exe = exe.to_string_lossy();
-    if ours.exe == exe {
+    let Some(ours) = parse_our_command(&current) else {
+        return Ok(None);
+    };
+    let wanted = wanted_command(exe, config_dir, ours.original.as_deref())?;
+    if wanted == current {
         return Ok(None);
     }
-    set_command(
-        &mut settings,
-        &build_command(&exe, ours.original.as_deref()),
-    );
+    set_command(&mut settings, &wanted);
     write_settings(&settings_path, &settings)?;
-    Ok(Some(ours.exe))
+    Ok(Some(current))
 }
 
 /// What `hook status` found.
@@ -610,6 +674,9 @@ pub struct StatusReport {
     pub installed: bool,
     /// The binary path recorded in settings.json (ours only).
     pub recorded_exe: Option<String>,
+    /// The config directory the command names (ours only, and only once it
+    /// names one).
+    pub recorded_config_dir: Option<String>,
     /// The wrapped original (ours only).
     pub wrapped: Option<String>,
     pub cache_path: PathBuf,
@@ -632,6 +699,7 @@ pub fn status_in(config_dir: &Path, now: jiff::Timestamp) -> StatusReport {
         command,
         installed: ours.is_some(),
         recorded_exe: ours.as_ref().map(|ours| ours.exe.clone()),
+        recorded_config_dir: ours.as_ref().and_then(|ours| ours.config_dir.clone()),
         wrapped: ours.and_then(|ours| ours.original),
         cache_path,
         cache_state: snapshot.state,
@@ -709,6 +777,35 @@ pub fn install_toast(result: &io::Result<InstallReport>) -> String {
     }
 }
 
+/// The same toast after installing into every profile. One profile reads
+/// exactly like [`install_toast`]; several get one summary, naming any profile
+/// that failed.
+pub fn install_toast_all(results: &[(String, io::Result<InstallReport>)]) -> String {
+    if let [(_, result)] = results {
+        return install_toast(result);
+    }
+    let failed: Vec<String> = results
+        .iter()
+        .filter_map(|(name, result)| result.as_ref().err().map(|err| format!("{name} ({err})")))
+        .collect();
+    if !failed.is_empty() {
+        return format!("Hook install failed in {}", failed.join(", "));
+    }
+    let fresh = results
+        .iter()
+        .filter(|(_, result)| matches!(result, Ok(report) if !report.refreshed))
+        .count();
+    match fresh {
+        0 => "Hook already installed in every profile — entries refreshed".to_string(),
+        1 => {
+            "Hook installed in 1 profile — data appears next time Claude Code refreshes".to_string()
+        }
+        n => {
+            format!("Hook installed in {n} profiles — data appears next time Claude Code refreshes")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,16 +828,24 @@ mod tests {
         PathBuf::from("/home/me/bin/claude-usage-tray")
     }
 
+    /// The ` --config-dir <dir>` part of a command built for `dir`.
+    fn dir_arg(dir: &Path) -> String {
+        format!(
+            " {CONFIG_DIR_FLAG} {}",
+            quote_if_needed(&dir.to_string_lossy())
+        )
+    }
+
     // -- command strings ---------------------------------------------------
 
     #[test]
     fn build_command_without_an_original_is_just_the_subcommand() {
         assert_eq!(
-            build_command("/home/me/bin/claude-usage-tray", None),
+            build_command("/home/me/bin/claude-usage-tray", None, None),
             "/home/me/bin/claude-usage-tray statusline"
         );
         assert_eq!(
-            build_command("/home/me/bin/claude-usage-tray", Some("   ")),
+            build_command("/home/me/bin/claude-usage-tray", None, Some("   ")),
             "/home/me/bin/claude-usage-tray statusline"
         );
     }
@@ -748,7 +853,7 @@ mod tests {
     #[test]
     fn build_command_wraps_the_original_in_single_quotes() {
         assert_eq!(
-            build_command("/opt/tray", Some("~/.claude/statusline.sh")),
+            build_command("/opt/tray", None, Some("~/.claude/statusline.sh")),
             "/opt/tray statusline --exec '~/.claude/statusline.sh'"
         );
     }
@@ -756,7 +861,7 @@ mod tests {
     #[test]
     fn build_command_quotes_an_exe_path_with_spaces() {
         assert_eq!(
-            build_command("/home/my name/tray", None),
+            build_command("/home/my name/tray", None, None),
             "'/home/my name/tray' statusline"
         );
     }
@@ -770,7 +875,7 @@ mod tests {
     #[test]
     fn build_command_quotes_a_bundled_macos_exe_path() {
         let exe = "/Applications/Claude Usage Tray.app/Contents/MacOS/claude-usage-tray";
-        let command = build_command(exe, Some("~/.claude/line.sh"));
+        let command = build_command(exe, None, Some("~/.claude/line.sh"));
         assert_eq!(
             command,
             concat!(
@@ -823,7 +928,7 @@ mod tests {
 
     #[test]
     fn build_command_escapes_single_quotes_in_the_original() {
-        let command = build_command("/opt/tray", Some("echo 'hi there'"));
+        let command = build_command("/opt/tray", None, Some("echo 'hi there'"));
         assert_eq!(
             command,
             r"/opt/tray statusline --exec 'echo '\''hi there'\'''"
@@ -859,6 +964,72 @@ mod tests {
         // A script that merely has "statusline" in its *name* is not ours: the
         // marker has to be the second word.
         assert_eq!(parse_our_command("/usr/bin/statusline-thing --fancy"), None);
+    }
+
+    #[test]
+    fn build_command_names_the_config_dir_before_the_wrapped_command() {
+        let command = build_command("/opt/tray", Some("/home/my name/.claude"), Some("line.sh"));
+        assert_eq!(
+            command,
+            "/opt/tray statusline --config-dir '/home/my name/.claude' --exec 'line.sh'"
+        );
+        let parsed = parse_our_command(&command).expect("ours");
+        assert_eq!(parsed.config_dir.as_deref(), Some("/home/my name/.claude"));
+        assert_eq!(parsed.original.as_deref(), Some("line.sh"));
+    }
+
+    #[test]
+    fn parse_our_command_takes_the_flags_in_any_order_and_skips_unknown_ones() {
+        let parsed =
+            parse_our_command("/opt/tray statusline --exec 'line.sh' --future x --config-dir /d")
+                .expect("ours");
+        assert_eq!(parsed.config_dir.as_deref(), Some("/d"));
+        assert_eq!(parsed.original.as_deref(), Some("line.sh"));
+    }
+
+    #[test]
+    fn parse_statusline_args_accepts_both_flags_once_each() {
+        let args = |raw: &[&str]| {
+            parse_statusline_args(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(args(&[]), Some(StatuslineArgs::default()));
+        assert_eq!(
+            args(&["--exec", "x", "--config-dir", "/d"]),
+            Some(StatuslineArgs {
+                config_dir: Some("/d".into()),
+                exec: Some("x".into()),
+            })
+        );
+        assert_eq!(args(&["--config-dir"]), None);
+        assert_eq!(args(&["--exec", "a", "--exec", "b"]), None);
+        assert_eq!(args(&["--other", "x"]), None);
+        assert_eq!(args(&["x"]), None);
+    }
+
+    #[test]
+    fn install_toast_all_reads_like_the_single_toast_for_one_profile() {
+        let temp = TempDir::new("hook-toast-all");
+        let one = vec![("default".to_string(), install_in(temp.path(), &exe()))];
+        assert_eq!(install_toast_all(&one), install_toast(&one[0].1));
+    }
+
+    #[test]
+    fn install_toast_all_summarizes_several_profiles() {
+        let a = TempDir::new("hook-toast-a");
+        let b = TempDir::new("hook-toast-b");
+        let fresh = vec![
+            ("a".to_string(), install_in(a.path(), &exe())),
+            ("b".to_string(), install_in(b.path(), &exe())),
+        ];
+        assert!(install_toast_all(&fresh).starts_with("Hook installed in 2 profiles"));
+        let again = vec![
+            ("a".to_string(), install_in(a.path(), &exe())),
+            ("b".to_string(), Err(io::Error::other("disk full"))),
+        ];
+        assert_eq!(
+            install_toast_all(&again),
+            "Hook install failed in b (disk full)"
+        );
     }
 
     #[test]
@@ -936,17 +1107,20 @@ mod tests {
         let temp = TempDir::new("hook-install-fresh");
         let report = install_in(temp.path(), &exe()).expect("install succeeds");
 
-        assert_eq!(report.command, "/home/me/bin/claude-usage-tray statusline");
+        assert_eq!(
+            report.command,
+            format!(
+                "/home/me/bin/claude-usage-tray statusline{}",
+                dir_arg(temp.path())
+            )
+        );
         assert_eq!(report.wrapped, None);
         assert!(!report.refreshed);
         assert!(!report.created_backup, "nothing existed to back up");
 
         let settings = settings_json(temp.path());
         assert_eq!(settings["statusLine"]["type"], "command");
-        assert_eq!(
-            settings["statusLine"]["command"],
-            "/home/me/bin/claude-usage-tray statusline"
-        );
+        assert_eq!(settings["statusLine"]["command"], report.command);
     }
 
     #[test]
@@ -980,7 +1154,10 @@ mod tests {
         );
         assert_eq!(
             report.command,
-            "/home/me/bin/claude-usage-tray statusline --exec '~/.claude/statusline-command.sh'"
+            format!(
+                "/home/me/bin/claude-usage-tray statusline{} --exec '~/.claude/statusline-command.sh'",
+                dir_arg(temp.path())
+            )
         );
         let settings = settings_json(temp.path());
         assert_eq!(settings["statusLine"]["command"], report.command);
@@ -1016,7 +1193,10 @@ mod tests {
         assert!(report.refreshed);
         assert_eq!(
             report.command,
-            "/new/path/tray statusline --exec '~/.claude/line.sh'"
+            format!(
+                "/new/path/tray statusline{} --exec '~/.claude/line.sh'",
+                dir_arg(temp.path())
+            )
         );
     }
 
@@ -1030,13 +1210,16 @@ mod tests {
         let replaced = repair_in(temp.path(), Path::new("/brew/bin/tray")).expect("repair");
         assert_eq!(
             replaced.as_deref(),
-            Some("/brew/Cellar/tray/1.0.3/bin/tray")
+            Some("/brew/Cellar/tray/1.0.3/bin/tray statusline --exec '~/.claude/line.sh'")
         );
 
         let settings = settings_json(temp.path());
         assert_eq!(
             settings["statusLine"]["command"],
-            "/brew/bin/tray statusline --exec '~/.claude/line.sh'"
+            format!(
+                "/brew/bin/tray statusline{} --exec '~/.claude/line.sh'",
+                dir_arg(temp.path())
+            )
         );
         assert_eq!(settings["model"], "opus", "other keys must survive");
     }
@@ -1044,7 +1227,13 @@ mod tests {
     #[test]
     fn repair_leaves_a_current_hook_untouched() {
         let temp = TempDir::new("hook-repair-current");
-        let body = r#"{"statusLine":{"type":"command","command":"/home/me/bin/claude-usage-tray statusline"}}"#;
+        let command = format!(
+            "/home/me/bin/claude-usage-tray statusline{}",
+            dir_arg(temp.path())
+        );
+        let body =
+            serde_json::json!({"statusLine": {"type": "command", "command": command}}).to_string();
+        let body = body.as_str();
         write_settings_file(temp.path(), body);
 
         assert_eq!(repair_in(temp.path(), &exe()).expect("repair"), None);
@@ -1052,6 +1241,42 @@ mod tests {
             read(&temp.path().join(SETTINGS_FILE_NAME)),
             body,
             "not rewritten"
+        );
+    }
+
+    #[test]
+    fn repair_writes_the_config_dir_into_an_older_command() {
+        let temp = TempDir::new("hook-repair-no-dir");
+        write_settings_file(
+            temp.path(),
+            r#"{"statusLine":{"type":"command","command":"/home/me/bin/claude-usage-tray statusline --exec 'line.sh'"}}"#,
+        );
+        let replaced = repair_in(temp.path(), &exe()).expect("repair");
+        assert!(replaced.is_some());
+        assert_eq!(
+            settings_json(temp.path())["statusLine"]["command"],
+            format!(
+                "/home/me/bin/claude-usage-tray statusline{} --exec 'line.sh'",
+                dir_arg(temp.path())
+            )
+        );
+    }
+
+    #[test]
+    fn repair_points_a_copied_command_at_its_own_directory() {
+        // A settings.json synced from another profile names that profile.
+        let temp = TempDir::new("hook-repair-other-dir");
+        write_settings_file(
+            temp.path(),
+            r#"{"statusLine":{"type":"command","command":"/home/me/bin/claude-usage-tray statusline --config-dir /home/me/.claude"}}"#,
+        );
+        repair_in(temp.path(), &exe()).expect("repair");
+        let command = settings_json(temp.path())["statusLine"]["command"].clone();
+        assert_eq!(
+            parse_our_command(command.as_str().expect("string"))
+                .expect("ours")
+                .config_dir,
+            Some(temp.path().to_string_lossy().into_owned())
         );
     }
 
