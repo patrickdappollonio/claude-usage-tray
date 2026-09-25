@@ -11,7 +11,13 @@
 //! notify_on_reset = true
 //! icon_style = "color"
 //! check_updates = true
+//! cli_refresh = true
+//! icon_follows = "recent"
 //! ```
+//!
+//! `icon_follows` only matters with more than one Claude Code profile, and is
+//! only written once it differs from its default, so a single-profile file
+//! looks exactly as it always did.
 //!
 //! Like every other read path in this crate, nothing here panics on bad input:
 //! a missing, unreadable, or corrupt file loads as [`Config::default`]. Every
@@ -125,6 +131,45 @@ impl IconStyle {
     }
 }
 
+/// Which profile drives the icon (and the top-level readings) when the tray
+/// finds more than one Claude Code config directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum IconFollows {
+    /// Whichever profile reported most recently: the one in use right now.
+    #[default]
+    Recent,
+    /// Whichever profile is closest to a limit.
+    Highest,
+    /// One profile, by its name. A name that no longer matches any profile
+    /// behaves like [`IconFollows::Recent`].
+    Profile(String),
+}
+
+impl IconFollows {
+    /// The value written to (and read from) `config.toml`. The prefix keeps a
+    /// profile that happens to be named `recent` from reading as the mode.
+    pub fn as_config(&self) -> String {
+        match self {
+            IconFollows::Recent => "recent".to_string(),
+            IconFollows::Highest => "highest".to_string(),
+            IconFollows::Profile(name) => format!("profile:{name}"),
+        }
+    }
+
+    /// Parses a stored value. Anything unrecognized is `None`, which callers
+    /// turn into the default.
+    pub fn parse(raw: &str) -> Option<IconFollows> {
+        match raw {
+            "recent" => Some(IconFollows::Recent),
+            "highest" => Some(IconFollows::Highest),
+            _ => raw
+                .strip_prefix("profile:")
+                .filter(|name| !name.is_empty())
+                .map(|name| IconFollows::Profile(name.to_string())),
+        }
+    }
+}
+
 /// User settings as stored in `config.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -148,6 +193,8 @@ pub struct Config {
     /// to refresh Claude Code's own usage blob once it is more than an hour
     /// old — that blob is the only source of the per-model weekly rows.
     pub cli_refresh: bool,
+    /// Which profile drives the icon when there is more than one.
+    pub icon_follows: IconFollows,
 }
 
 impl Default for Config {
@@ -160,6 +207,7 @@ impl Default for Config {
             icon_style: IconStyle::default(),
             check_updates: true,
             cli_refresh: true,
+            icon_follows: IconFollows::default(),
         }
     }
 }
@@ -284,6 +332,11 @@ pub fn parse_config(body: &str) -> Config {
             .get("cli_refresh")
             .and_then(|value| value.as_bool())
             .unwrap_or(defaults.cli_refresh),
+        icon_follows: table
+            .get("icon_follows")
+            .and_then(|value| value.as_str())
+            .and_then(IconFollows::parse)
+            .unwrap_or(defaults.icon_follows),
     }
 }
 
@@ -297,7 +350,7 @@ pub fn render_config(config: &Config) -> String {
         .map(|threshold| threshold.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
+    let mut body = format!(
         "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\n\
          notify_on_reset = {}\nicon_style = \"{}\"\ncheck_updates = {}\n\
          cli_refresh = {}\n",
@@ -308,7 +361,14 @@ pub fn render_config(config: &Config) -> String {
         config.icon_style.as_str(),
         config.check_updates,
         config.cli_refresh
-    )
+    );
+    if config.icon_follows != IconFollows::default() {
+        // A JSON string literal is also a valid TOML basic string, and a
+        // profile name can hold anything a directory name can.
+        let value = serde_json::Value::String(config.icon_follows.as_config());
+        body.push_str(&format!("icon_follows = {value}\n"));
+    }
+    body
 }
 
 /// Loads the config at `path`. Any failure — file absent, unreadable, or not
@@ -416,6 +476,7 @@ mod tests {
                 icon_style: IconStyle::default(),
                 check_updates: true,
                 cli_refresh: true,
+                icon_follows: IconFollows::Recent,
             }
         );
     }
@@ -670,6 +731,7 @@ mod tests {
             icon_style: IconStyle::MonoAuto,
             check_updates: false,
             cli_refresh: false,
+            icon_follows: IconFollows::Profile("work \"quoted\"".into()),
         };
         assert_eq!(parse_config(&render_config(&config)), config);
 
@@ -680,6 +742,30 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(parse_config(&render_config(&none)), none);
+    }
+
+    #[test]
+    fn icon_follows_is_left_out_of_the_file_while_it_is_the_default() {
+        assert!(!render_config(&Config::default()).contains("icon_follows"));
+        let highest = Config {
+            icon_follows: IconFollows::Highest,
+            ..Config::default()
+        };
+        assert!(render_config(&highest).contains("icon_follows = \"highest\""));
+    }
+
+    #[test]
+    fn icon_follows_parses_every_form_and_ignores_nonsense() {
+        let parse = |raw: &str| parse_config(&format!("icon_follows = \"{raw}\"")).icon_follows;
+        assert_eq!(parse("recent"), IconFollows::Recent);
+        assert_eq!(parse("highest"), IconFollows::Highest);
+        assert_eq!(parse("profile:work"), IconFollows::Profile("work".into()));
+        assert_eq!(
+            parse("profile:recent"),
+            IconFollows::Profile("recent".into())
+        );
+        assert_eq!(parse("profile:"), IconFollows::Recent);
+        assert_eq!(parse("loudest"), IconFollows::Recent);
     }
 
     #[test]
@@ -703,6 +789,7 @@ mod tests {
             icon_style: IconStyle::MonoLight,
             check_updates: false,
             cli_refresh: false,
+            icon_follows: IconFollows::Highest,
         };
         save_to(&path, &config).expect("save succeeds");
         assert!(path.exists());

@@ -155,6 +155,7 @@ Two more commands, for when you need them:
 ```bash
 claude-usage-tray hook status      # what's wired up, and how fresh the data is
 claude-usage-tray hook uninstall   # put things back exactly as they were
+claude-usage-tray profiles         # which Claude Code profiles the tray reads
 claude-usage-tray restart          # swap the running tray for the one on disk
 ```
 
@@ -163,6 +164,15 @@ claude-usage-tray restart          # swap the running tray for the one on disk
 If you skip the install step, the tray notices. It shows a gray icon and offers an **Install hook** button right in the menu, which does the same thing as the command above.
 
 One small note: the hook records the full path of the binary you ran it from. If you move the binary, run `hook install` again. `hook status` will tell you when the paths no longer match.
+
+#### More than one Claude Code profile
+
+If you run Claude Code with more than one config folder, whether through `CLAUDE_CONFIG_DIR` or folders like `~/.claude-work`, the tray reads all of them. With a single profile, nothing about the tray changes.
+
+- **Finding them.** The tray finds `~/.claude`, any `~/.claude-*` folder, and the folder `CLAUDE_CONFIG_DIR` points at. Any other folder is remembered the first time the hook writes to it. A folder only counts once Claude Code has used it, meaning it has both `sessions/` and `projects/` inside.
+- **The hook.** `hook install`, `hook uninstall` and `hook status` act on every profile. Each profile's hook names its own folder (`statusline --config-dir <folder>`), so it always writes to the right place however Claude Code was started.
+- **The menu.** It shows one section per profile, and the `Settings` submenu gains an **Icon follows** choice: the most recently used profile (the default), whichever is closest to a limit, or one profile by name. Notifications are tracked per profile and name the profile they are about.
+- **When something looks wrong,** run `claude-usage-tray profiles`. It lists every profile with its hook and data state, and every folder it skipped and why.
 
 ### ⚙️ Settings
 

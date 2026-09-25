@@ -16,10 +16,10 @@
 //!
 //! See `docs/superpowers/specs/2026-08-13-claude-usage-tray-design.md`.
 
-use crate::config::{self, Config, IconStyle, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
+use crate::config::{self, Config, IconFollows, IconStyle, NOTIFY_THRESHOLDS, REFRESH_CHOICES};
 use crate::icon::IconAppearance;
 use crate::menu::{MenuAction, MenuRow, RadioGroup, RadioOption};
-use crate::source::{Metric, SnapshotState, UsageSnapshot};
+use crate::source::{Metric, ProfileUsage, SnapshotState, UsageSnapshot};
 use crate::update::Update;
 use jiff::Timestamp;
 use std::path::PathBuf;
@@ -64,6 +64,9 @@ pub enum Wake {
     /// neither re-reads the cache nor notifies — an update is worth a menu
     /// row, not a toast.
     UpdateAvailable,
+    /// The user picked which profile the icon follows. The poll loop re-reads
+    /// right away, without a toast, so the icon switches immediately.
+    IconFollowsChanged,
     /// Shut the tray down and exit the process (menu "Quit").
     Quit,
 }
@@ -208,9 +211,9 @@ pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp) -> String {
     }
 }
 
-/// All the info rows joined with newlines, for the tooltip body: session,
-/// weekly, any per-model scoped rows, then the freshness line.
-pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp) -> String {
+/// One snapshot's info rows: session, weekly, any per-model scoped rows, then
+/// the freshness line.
+pub fn info_lines(snapshot: &UsageSnapshot, now: Timestamp) -> Vec<String> {
     let mut lines = vec![
         session_line(snapshot.session.as_ref(), now),
         weekly_line(snapshot.weekly.as_ref(), now),
@@ -219,7 +222,32 @@ pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp) -> String {
         lines.push(scoped_line(scoped, snapshot.scoped_fetched_at, now));
     }
     lines.push(status_line(snapshot, now));
-    lines.join("\n")
+    lines
+}
+
+/// The heading above one profile's rows when there is more than one: a
+/// filled dot for the profile the icon shows, a hollow one for the rest.
+pub fn profile_heading(profile: &ProfileUsage) -> String {
+    let dot = if profile.on_icon { '●' } else { '○' };
+    format!("{dot} Profile: {}", profile.name)
+}
+
+/// All the info rows joined with newlines, for the tooltip body. With more
+/// than one profile, each gets its heading and its own rows.
+pub fn tooltip_text(snapshot: &UsageSnapshot, now: Timestamp) -> String {
+    if snapshot.profiles.is_empty() {
+        return info_lines(snapshot, now).join("\n");
+    }
+    snapshot
+        .profiles
+        .iter()
+        .map(|profile| {
+            let mut lines = vec![profile_heading(profile)];
+            lines.extend(info_lines(&profile.snapshot, now));
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// `Session 7%` / `Session —` — the compact form used in the refresh toast.
@@ -240,6 +268,9 @@ pub fn refresh_message(
     current: &UsageSnapshot,
     now: Timestamp,
 ) -> String {
+    if !current.profiles.is_empty() {
+        return profiles_refresh_message(previous, current, now);
+    }
     if current.state == SnapshotState::Missing {
         return "No data — install the statusline hook".to_string();
     }
@@ -254,6 +285,55 @@ pub fn refresh_message(
         );
     }
     match current.written_at {
+        Some(at) => format!(
+            "No new data — Claude Code last reported {} ago",
+            humanize_age(age_secs(at, now))
+        ),
+        None => {
+            "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update"
+                .to_string()
+        }
+    }
+}
+
+/// [`refresh_message`] with more than one profile: names every profile that
+/// reported something new, or else says when the latest report was.
+fn profiles_refresh_message(
+    previous: &UsageSnapshot,
+    current: &UsageSnapshot,
+    now: Timestamp,
+) -> String {
+    let readings = || current.profiles.iter().map(|profile| &profile.snapshot);
+    if readings().all(|snapshot| snapshot.state == SnapshotState::Missing) {
+        return "No data — install the statusline hook".to_string();
+    }
+    let before = |name: &str| {
+        previous
+            .profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .and_then(|profile| profile.snapshot.written_at)
+    };
+    let updated: Vec<String> = current
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile.snapshot.written_at.is_some()
+                && profile.snapshot.written_at != before(&profile.name)
+        })
+        .map(|profile| {
+            format!(
+                "{}: {}, {}",
+                profile.name,
+                short_metric("Session", profile.snapshot.session.as_ref()),
+                short_metric("Weekly", profile.snapshot.weekly.as_ref())
+            )
+        })
+        .collect();
+    if !updated.is_empty() {
+        return format!("Updated — {}", updated.join("; "));
+    }
+    match readings().filter_map(|snapshot| snapshot.written_at).max() {
         Some(at) => format!(
             "No new data — Claude Code last reported {} ago",
             humanize_age(age_secs(at, now))
@@ -286,6 +366,21 @@ fn status_clause(noun: &str, metric: Option<&Metric>, now: Timestamp) -> Option<
 /// [`refresh_message`], this never compares against a previous snapshot — a
 /// left-click re-reads the cache but does not care whether it moved.
 pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp) -> String {
+    if !snapshot.profiles.is_empty() {
+        // One sentence per profile, each introduced by its name.
+        return snapshot
+            .profiles
+            .iter()
+            .map(|profile| {
+                format!(
+                    "{}: {}",
+                    profile.name,
+                    status_message(&profile.snapshot, now)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     if snapshot.state == SnapshotState::Missing {
         return "No usage data — install the statusline hook.".to_string();
     }
@@ -344,6 +439,10 @@ pub fn snapshot_changed(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
         || a.scoped != b.scoped
         || a.scoped_fetched_at != b.scoped_fetched_at
         || a.hook_missing != b.hook_missing
+        || a.profiles.len() != b.profiles.len()
+        || a.profiles.iter().zip(&b.profiles).any(|(a, b)| {
+            a.name != b.name || a.on_icon != b.on_icon || snapshot_changed(&a.snapshot, &b.snapshot)
+        })
 }
 
 /// A threshold crossing the poll loop should turn into a desktop notification.
@@ -355,12 +454,18 @@ pub struct UsageAlert {
     pub percent: f64,
     /// Whether the notification should use critical urgency.
     pub critical: bool,
+    /// The profile it is about, when there is more than one.
+    pub profile: Option<String>,
 }
 
 impl UsageAlert {
     /// Notification title.
     pub fn summary(&self) -> String {
-        format!("Claude session usage {}%", self.percent.round())
+        let summary = format!("Claude session usage {}%", self.percent.round());
+        match &self.profile {
+            Some(profile) => format!("{summary} ({profile})"),
+            None => summary,
+        }
     }
 
     /// Notification body.
@@ -512,6 +617,7 @@ impl Notifier {
                 threshold,
                 percent,
                 critical: config::is_critical(threshold),
+                profile: None,
             });
 
         // Every threshold usage has passed counts as delivered — the lower
@@ -545,6 +651,8 @@ pub struct ResetAlert {
     pub window: ResetWindow,
     /// The `resets_at` that came due.
     pub at: Timestamp,
+    /// The profile it is about, when there is more than one.
+    pub profile: Option<String>,
 }
 
 impl ResetAlert {
@@ -553,10 +661,14 @@ impl ResetAlert {
     }
 
     pub fn body(&self) -> String {
-        match &self.window {
+        let body = match &self.window {
             ResetWindow::Session => "Session quota reset — fresh 5-hour window".to_string(),
             ResetWindow::Weekly => "Weekly quota reset — fresh week".to_string(),
             ResetWindow::Scoped(name) => format!("{name} weekly quota reset — fresh week"),
+        };
+        match &self.profile {
+            Some(profile) => format!("{profile}: {body}"),
+            None => body,
         }
     }
 }
@@ -660,6 +772,7 @@ impl ResetNotifiers {
             alerts.push(ResetAlert {
                 window: ResetWindow::Session,
                 at,
+                profile: None,
             });
         }
         let weekly = snapshot.weekly.as_ref().and_then(|m| m.resets_at);
@@ -667,6 +780,7 @@ impl ResetNotifiers {
             alerts.push(ResetAlert {
                 window: ResetWindow::Weekly,
                 at,
+                profile: None,
             });
         }
         // First the buckets present in this snapshot (arming as needed) …
@@ -676,6 +790,7 @@ impl ResetNotifiers {
                 alerts.push(ResetAlert {
                     window: ResetWindow::Scoped(scoped.name.clone()),
                     at,
+                    profile: None,
                 });
             }
         }
@@ -689,6 +804,7 @@ impl ResetNotifiers {
                 alerts.push(ResetAlert {
                     window: ResetWindow::Scoped(name.clone()),
                     at,
+                    profile: None,
                 });
             }
         }
@@ -703,6 +819,100 @@ impl ResetNotifiers {
             .collect();
         deadlines.extend(self.scoped.values().filter_map(ResetNotifier::deadline));
         deadlines.into_iter().min()
+    }
+}
+
+/// The usage and reset notifiers for every profile the tray watches.
+///
+/// With one profile there is one pair, keyed by the empty name, and alerts
+/// carry no profile: exactly the single-profile behaviour. With several, each
+/// profile gets its own pair, so switching between profiles never looks like
+/// usage dropping and rising again, and never re-fires an alert the profile
+/// has already had. A profile that appears starts from its own baseline, as
+/// the tray does at startup; one that disappears takes its state with it.
+#[derive(Debug, Default)]
+pub struct ProfileNotifiers {
+    watches: std::collections::HashMap<String, (Notifier, ResetNotifiers)>,
+}
+
+impl ProfileNotifiers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The readings to watch in `snapshot`: the snapshot itself with one
+    /// profile, or each profile's own with several.
+    fn readings(snapshot: &UsageSnapshot) -> Vec<(Option<&str>, &UsageSnapshot)> {
+        if snapshot.profiles.is_empty() {
+            vec![(None, snapshot)]
+        } else {
+            snapshot
+                .profiles
+                .iter()
+                .map(|profile: &ProfileUsage| (Some(profile.name.as_str()), &profile.snapshot))
+                .collect()
+        }
+    }
+
+    /// Matches the watched set to `snapshot`'s profiles: adds a pair for a new
+    /// profile and drops the pairs of profiles that are gone.
+    fn sync(&mut self, snapshot: &UsageSnapshot, thresholds: &[u8]) {
+        let readings = Self::readings(snapshot);
+        self.watches.retain(|key, _| {
+            readings
+                .iter()
+                .any(|(name, _)| name.unwrap_or_default() == key)
+        });
+        for (name, _) in readings {
+            self.watches
+                .entry(name.unwrap_or_default().to_string())
+                .or_insert_with(|| (Notifier::new(thresholds), ResetNotifiers::new()));
+        }
+    }
+
+    /// Feeds every profile's session reading through its [`Notifier`].
+    pub fn usage_alerts(&mut self, snapshot: &UsageSnapshot, thresholds: &[u8]) -> Vec<UsageAlert> {
+        self.sync(snapshot, thresholds);
+        let mut alerts = Vec::new();
+        for (name, reading) in Self::readings(snapshot) {
+            let Some((notifier, _)) = self.watches.get_mut(name.unwrap_or_default()) else {
+                continue;
+            };
+            notifier.set_enabled(thresholds);
+            if let Some(mut alert) = notifier.evaluate(reading.session.as_ref()) {
+                alert.profile = name.map(str::to_string);
+                alerts.push(alert);
+            }
+        }
+        alerts
+    }
+
+    /// Feeds every profile's windows through its [`ResetNotifiers`].
+    pub fn reset_alerts(
+        &mut self,
+        snapshot: &UsageSnapshot,
+        now: Timestamp,
+        enabled: bool,
+    ) -> Vec<ResetAlert> {
+        let mut alerts = Vec::new();
+        for (name, reading) in Self::readings(snapshot) {
+            let Some((_, resets)) = self.watches.get_mut(name.unwrap_or_default()) else {
+                continue;
+            };
+            for mut alert in resets.evaluate(reading, now, enabled) {
+                alert.profile = name.map(str::to_string);
+                alerts.push(alert);
+            }
+        }
+        alerts
+    }
+
+    /// The earliest pending reset across every profile, for [`poll_wait`].
+    pub fn deadline(&self) -> Option<Timestamp> {
+        self.watches
+            .values()
+            .filter_map(|(_, resets)| resets.deadline())
+            .min()
     }
 }
 
@@ -837,6 +1047,32 @@ impl RestartHandle {
     }
 }
 
+/// Shared handle to the `Icon follows` choice: written by the menu, read by
+/// the poll loop on every read. Poison-tolerant for the same reason as
+/// [`NotifyHandle`].
+#[derive(Clone)]
+pub struct FollowsHandle(Arc<Mutex<IconFollows>>);
+
+impl FollowsHandle {
+    fn new(follows: IconFollows) -> Self {
+        FollowsHandle(Arc::new(Mutex::new(follows)))
+    }
+
+    pub fn get(&self) -> IconFollows {
+        match self.0.lock() {
+            Ok(follows) => follows.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set(&self, follows: IconFollows) {
+        match self.0.lock() {
+            Ok(mut slot) => *slot = follows,
+            Err(poisoned) => *poisoned.into_inner() = follows,
+        }
+    }
+}
+
 /// Resolves the configured style plus the desktop's reported scheme into the
 /// appearance the renderer takes.
 ///
@@ -926,6 +1162,8 @@ pub struct Settings {
     interval: Arc<AtomicU64>,
     /// Notification preferences, shared the same way.
     notify: NotifyHandle,
+    /// Which profile the icon follows, shared the same way.
+    follows: FollowsHandle,
     /// Icon appearance, shared with the portal watcher thread too.
     appearance: AppearanceHandle,
     /// Whether the update checker may run, shared with its thread so that
@@ -950,6 +1188,7 @@ impl Settings {
     pub fn new(config: Config, env_secs: Option<u64>) -> Self {
         let effective = env_secs.unwrap_or(config.refresh_secs);
         let notify = NotifyHandle::new(NotifyPrefs::from_config(&config));
+        let follows = FollowsHandle::new(config.icon_follows.clone());
         let appearance = AppearanceHandle::new(config.icon_style);
         let check_updates = Arc::new(AtomicBool::new(config.check_updates));
         let cli_refresh = Arc::new(AtomicBool::new(config.cli_refresh));
@@ -957,6 +1196,7 @@ impl Settings {
             config,
             interval: Arc::new(AtomicU64::new(effective)),
             notify,
+            follows,
             appearance,
             check_updates,
             cli_refresh,
@@ -974,6 +1214,11 @@ impl Settings {
     /// Handle for the poll loop; `get` it once per cycle.
     pub fn notify_handle(&self) -> NotifyHandle {
         self.notify.clone()
+    }
+
+    /// Handle for the poll loop; `get` it on every read.
+    pub fn follows_handle(&self) -> FollowsHandle {
+        self.follows.clone()
     }
 
     /// Handle for the portal watcher thread (and for the poll loop, which
@@ -1137,6 +1382,43 @@ impl TrayCore {
         }
     }
 
+    /// Radio-group handler for `Icon follows`. The options are the two modes
+    /// followed by the profiles in the order the menu listed them, which is
+    /// the order of the current snapshot's profiles.
+    fn select_icon_follows(&mut self, index: usize) {
+        let follows = match index {
+            0 => IconFollows::Recent,
+            1 => IconFollows::Highest,
+            _ => match self.snapshot.profiles.get(index - 2) {
+                Some(profile) => IconFollows::Profile(profile.name.clone()),
+                // The profile list changed under an open menu: ignore.
+                None => return,
+            },
+        };
+        if self.settings.config.icon_follows == follows {
+            return;
+        }
+        self.settings.config.icon_follows = follows.clone();
+        config::save(&self.settings.config);
+        self.settings.follows.set(follows);
+        self.send(Wake::IconFollowsChanged);
+    }
+
+    /// The `Icon follows` option that is selected. A profile name that no
+    /// longer exists shows as "Most recent", which is what it behaves as.
+    fn icon_follows_choice(&self) -> usize {
+        match &self.settings.config.icon_follows {
+            IconFollows::Recent => 0,
+            IconFollows::Highest => 1,
+            IconFollows::Profile(name) => self
+                .snapshot
+                .profiles
+                .iter()
+                .position(|profile| &profile.name == name)
+                .map_or(0, |index| index + 2),
+        }
+    }
+
     /// Checkbox handler: flip the platform's autostart entry, then mirror the
     /// new state into the config file. If writing the entry failed, nothing is
     /// recorded and the checkbox stays where it was.
@@ -1269,6 +1551,7 @@ impl TrayCore {
         match group {
             RadioGroup::RefreshInterval => self.select_refresh(index),
             RadioGroup::IconStyle => self.select_icon_style(index),
+            RadioGroup::IconFollows => self.select_icon_follows(index),
         }
     }
 
@@ -1280,18 +1563,27 @@ impl TrayCore {
     /// The menu for an explicit clock and host capability set, so every row can
     /// be pinned by a test.
     pub fn menu_with(&self, now: Timestamp, env: MenuEnv) -> Vec<MenuRow> {
-        let mut rows = vec![
-            MenuRow::info(session_line(self.snapshot.session.as_ref(), now)),
-            MenuRow::info(weekly_line(self.snapshot.weekly.as_ref(), now)),
-        ];
-        for scoped in &self.snapshot.scoped {
-            rows.push(MenuRow::info(scoped_line(
-                scoped,
-                self.snapshot.scoped_fetched_at,
-                now,
-            )));
+        let mut rows = Vec::new();
+        if self.snapshot.profiles.is_empty() {
+            rows.extend(
+                info_lines(&self.snapshot, now)
+                    .into_iter()
+                    .map(MenuRow::info),
+            );
+        } else {
+            // One section per profile, each under its own heading.
+            for (index, profile) in self.snapshot.profiles.iter().enumerate() {
+                if index > 0 {
+                    rows.push(MenuRow::Separator);
+                }
+                rows.push(MenuRow::info(profile_heading(profile)));
+                rows.extend(
+                    info_lines(&profile.snapshot, now)
+                        .into_iter()
+                        .map(MenuRow::info),
+                );
+            }
         }
-        rows.push(MenuRow::info(status_line(&self.snapshot, now)));
         if shows_install_item(&self.snapshot) {
             // The one enabled row in the no-data state: everything else here
             // is a label, and a first-run user needs exactly one thing to do.
@@ -1395,6 +1687,31 @@ impl TrayCore {
                 "(CLAUDE_TRAY_POLL_SECS={} is in effect)",
                 self.settings.interval.load(Ordering::Relaxed)
             )));
+        }
+        if self.snapshot.profiles.len() > 1 {
+            // Only meaningful, and only shown, with more than one profile.
+            let mut options = vec!["Most recent".to_string(), "Highest usage".to_string()];
+            options.extend(
+                self.snapshot
+                    .profiles
+                    .iter()
+                    .map(|profile| format!("\"{}\" profile", profile.name)),
+            );
+            rows.extend([
+                MenuRow::Separator,
+                MenuRow::info("Icon follows"),
+                MenuRow::Radio {
+                    group: RadioGroup::IconFollows,
+                    selected: self.icon_follows_choice(),
+                    options: options
+                        .into_iter()
+                        .map(|label| RadioOption {
+                            label,
+                            enabled: can_persist,
+                        })
+                        .collect(),
+                },
+            ]);
         }
         rows.push(MenuRow::Separator);
         rows.push(MenuRow::Check {
@@ -2353,6 +2670,7 @@ mod tests {
             threshold: 50,
             percent: 51.0,
             critical: false,
+            profile: None,
         };
         assert_eq!(warn.summary(), "Claude session usage 51%");
         assert!(warn.body().contains("50%"));
@@ -2361,6 +2679,7 @@ mod tests {
             threshold: 90,
             percent: 91.0,
             critical: true,
+            profile: None,
         };
         assert_eq!(crit.summary(), "Claude session usage 91%");
         assert!(crit.body().contains("90%"));
@@ -2370,9 +2689,27 @@ mod tests {
             threshold: 100,
             percent: 100.0,
             critical: true,
+            profile: None,
         };
         assert_eq!(full.summary(), "Claude session usage 100%");
         assert!(full.body().contains("fully used"));
+    }
+
+    #[test]
+    fn alerts_name_their_profile_when_they_have_one() {
+        let alert = UsageAlert {
+            threshold: 75,
+            percent: 76.0,
+            critical: false,
+            profile: Some("work".into()),
+        };
+        assert_eq!(alert.summary(), "Claude session usage 76% (work)");
+        let reset = ResetAlert {
+            window: ResetWindow::Weekly,
+            at: ts(0),
+            profile: Some("work".into()),
+        };
+        assert_eq!(reset.body(), "work: Weekly quota reset — fresh week");
     }
 
     #[test]
@@ -2465,7 +2802,14 @@ mod tests {
     #[test]
     fn reset_alert_bodies_name_their_window() {
         let at = ts(BASE);
-        let body = |window| ResetAlert { window, at }.body();
+        let body = |window| {
+            ResetAlert {
+                window,
+                at,
+                profile: None,
+            }
+            .body()
+        };
         assert_eq!(
             body(ResetWindow::Session),
             "Session quota reset — fresh 5-hour window"
@@ -2884,6 +3228,210 @@ mod tests {
             state,
             ..UsageSnapshot::default()
         }
+    }
+
+    /// Two profiles, `default` at 42% and `work` at 80%, as the reader would
+    /// combine them with the icon following `default`.
+    fn two_profiles() -> UsageSnapshot {
+        let mut work = timeless(SnapshotState::Fresh);
+        work.session = Some(metric(Some(80.0), None));
+        let mut top = timeless(SnapshotState::Fresh);
+        top.profiles = vec![
+            ProfileUsage {
+                name: "default".into(),
+                snapshot: timeless(SnapshotState::Fresh),
+                on_icon: true,
+            },
+            ProfileUsage {
+                name: "work".into(),
+                snapshot: work,
+                on_icon: false,
+            },
+        ];
+        top
+    }
+
+    #[test]
+    fn with_two_profiles_the_menu_shows_a_section_for_each() {
+        let (core, _rx) = core_for(two_profiles(), Config::default(), None);
+        let rows = core.menu_with(ts(BASE), all_available());
+        assert_eq!(
+            &labels(&rows)[..9],
+            &[
+                "● Profile: default",
+                "Session: 42%",
+                "Weekly: 61%",
+                "Updated by Claude Code CLI 1 min ago",
+                "---",
+                "○ Profile: work",
+                "Session: 80%",
+                "Weekly: 61%",
+                "Updated by Claude Code CLI 1 min ago",
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_the_icon_to_another_profile_counts_as_a_change() {
+        let before = two_profiles();
+        let mut after = two_profiles();
+        after.profiles[0].on_icon = false;
+        after.profiles[1].on_icon = true;
+        assert!(snapshot_changed(&before, &after));
+    }
+
+    #[test]
+    fn icon_follows_is_offered_only_with_more_than_one_profile() {
+        let (single, _rx) = core_for(timeless(SnapshotState::Fresh), Config::default(), None);
+        let rows = single.menu_with(ts(BASE), all_available());
+        assert!(!labels(submenu(&rows, "Settings")).contains(&"Icon follows".to_string()));
+
+        let config = Config {
+            icon_follows: IconFollows::Profile("work".into()),
+            ..Config::default()
+        };
+        let (multi, _rx) = core_for(two_profiles(), config, None);
+        let rows = multi.menu_with(ts(BASE), all_available());
+        let settings = submenu(&rows, "Settings");
+        let heading = labels(settings)
+            .iter()
+            .position(|label| label == "Icon follows")
+            .expect("Icon follows heading");
+        let MenuRow::Radio {
+            group,
+            selected,
+            options,
+        } = &settings[heading + 1]
+        else {
+            panic!("expected the radio group after its heading");
+        };
+        assert_eq!(*group, RadioGroup::IconFollows);
+        let names: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Most recent",
+                "Highest usage",
+                "\"default\" profile",
+                "\"work\" profile"
+            ]
+        );
+        assert_eq!(*selected, 3);
+    }
+
+    #[test]
+    fn a_follows_setting_naming_a_gone_profile_shows_as_most_recent() {
+        let config = Config {
+            icon_follows: IconFollows::Profile("gone".into()),
+            ..Config::default()
+        };
+        let (core, _rx) = core_for(two_profiles(), config, None);
+        assert_eq!(core.icon_follows_choice(), 0);
+    }
+
+    #[test]
+    fn picking_icon_follows_updates_the_shared_choice_and_wakes_the_poll_loop() {
+        let (mut core, rx) = core_for(two_profiles(), Config::default(), None);
+        let handle = core.settings.follows_handle();
+        core.select_icon_follows(3);
+        assert_eq!(handle.get(), IconFollows::Profile("work".into()));
+        assert_eq!(rx.try_recv(), Ok(Wake::IconFollowsChanged));
+        core.select_icon_follows(1);
+        assert_eq!(handle.get(), IconFollows::Highest);
+        // An index past the list (the profiles changed under an open menu)
+        // changes nothing.
+        core.select_icon_follows(9);
+        assert_eq!(handle.get(), IconFollows::Highest);
+    }
+
+    #[test]
+    fn with_two_profiles_the_tooltip_and_status_toast_cover_each() {
+        let tooltip = tooltip_text(&two_profiles(), ts(BASE));
+        assert!(
+            tooltip.starts_with("● Profile: default\nSession: 42%"),
+            "{tooltip}"
+        );
+        assert!(
+            tooltip.contains("\n\n○ Profile: work\nSession: 80%"),
+            "{tooltip}"
+        );
+        let status = status_message(&two_profiles(), ts(BASE));
+        assert!(status.starts_with("default: You've used 42%"), "{status}");
+        assert!(status.contains("\nwork: You've used 80%"), "{status}");
+    }
+
+    #[test]
+    fn with_two_profiles_the_refresh_toast_names_the_profiles_that_moved() {
+        let before = two_profiles();
+        let mut after = two_profiles();
+        after.profiles[1].snapshot.written_at = Some(ts(BASE));
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE)),
+            "Updated — work: Session 80%, Weekly 61%"
+        );
+        assert_eq!(
+            refresh_message(&after, &after, ts(BASE + 600)),
+            "No new data — Claude Code last reported 10 min ago"
+        );
+    }
+
+    #[test]
+    fn profile_notifiers_track_each_profile_separately() {
+        let mut notifiers = ProfileNotifiers::new();
+        let thresholds = [50, 75, 90];
+        let reading = |default: f64, work: f64| {
+            let mut snapshot = two_profiles();
+            snapshot.profiles[0].snapshot.session = Some(metric(Some(default), None));
+            snapshot.profiles[1].snapshot.session = Some(metric(Some(work), None));
+            snapshot
+        };
+        // The first reading is each profile's baseline.
+        assert!(
+            notifiers
+                .usage_alerts(&reading(42.0, 80.0), &thresholds)
+                .is_empty()
+        );
+        // `work` crossing 90% alerts for `work` only, named.
+        let alerts = notifiers.usage_alerts(&reading(42.0, 91.0), &thresholds);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].threshold, 90);
+        assert_eq!(alerts[0].profile.as_deref(), Some("work"));
+        // `default` crossing 50% is its own crossing; `work` stays quiet.
+        let alerts = notifiers.usage_alerts(&reading(55.0, 91.0), &thresholds);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].profile.as_deref(), Some("default"));
+        assert!(
+            notifiers
+                .usage_alerts(&reading(55.0, 91.0), &thresholds)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn profile_notifiers_with_one_profile_name_nothing() {
+        let mut notifiers = ProfileNotifiers::new();
+        let at = |percent: f64| UsageSnapshot {
+            session: Some(metric(Some(percent), None)),
+            ..UsageSnapshot::default()
+        };
+        assert!(notifiers.usage_alerts(&at(10.0), &[50]).is_empty());
+        let alerts = notifiers.usage_alerts(&at(60.0), &[50]);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].profile, None);
+    }
+
+    #[test]
+    fn profile_notifiers_find_the_earliest_reset_across_profiles() {
+        let mut notifiers = ProfileNotifiers::new();
+        let mut snapshot = two_profiles();
+        snapshot.profiles[0].snapshot.session = Some(metric(Some(10.0), Some(BASE + 900)));
+        snapshot.profiles[1].snapshot.session = Some(metric(Some(10.0), Some(BASE + 300)));
+        notifiers.usage_alerts(&snapshot, &[50]);
+        assert!(notifiers.reset_alerts(&snapshot, ts(BASE), true).is_empty());
+        assert_eq!(notifiers.deadline(), Some(ts(BASE + 300)));
+        let alerts = notifiers.reset_alerts(&snapshot, ts(BASE + 300), true);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].profile.as_deref(), Some("work"));
     }
 
     #[test]
