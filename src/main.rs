@@ -90,16 +90,19 @@ fn reset_toast(alert: &ResetAlert) -> (Toast, Channel) {
 }
 
 /// Builds the toast that follows a *user-initiated* action ("Check for new
-/// data", the `Install hook` item, or a left-click status readout): low
-/// urgency and transient, so it acknowledges the click without piling up in
-/// notification history the way the threshold alerts (deliberately) do, and
-/// ephemeral so it never competes with a threshold alert for the same slot.
+/// data", the `Install hook` item, or a left-click status readout). Normal
+/// urgency because the user is waiting for the answer: GNOME files low-urgency
+/// notifications away without a banner and macOS shows passive ones without
+/// one either, which made the click look like it did nothing. Transient, so
+/// it acknowledges the click without piling up in notification history the
+/// way the threshold alerts (deliberately) do, and ephemeral so it never
+/// competes with a threshold alert for the same slot.
 fn refresh_toast(body: &str) -> (Toast, Channel) {
     (
         Toast {
             summary: "Claude usage tray".to_string(),
             body: body.to_string(),
-            urgency: Urgency::Low,
+            urgency: Urgency::Normal,
             transient: true,
         },
         Channel::Ephemeral,
@@ -143,8 +146,8 @@ fn welcome_toast() -> (Toast, Channel) {
     )
 }
 
-/// Builds the toast shown once after an upgrade. Low urgency and transient,
-/// like [`refresh_toast`]: routine good news that should not pile up in
+/// Builds the toast shown once after an upgrade. Low urgency and transient:
+/// routine good news that nobody is waiting on and that should not pile up in
 /// notification history.
 fn updated_toast(version: &str) -> (Toast, Channel) {
     (
@@ -1728,6 +1731,11 @@ mod notify_channel_routing {
     fn refresh_toast_routes_to_ephemeral_channel() {
         let (toast, channel) = refresh_toast("2 requests today");
         assert_eq!(channel, Channel::Ephemeral);
+        assert_eq!(
+            toast.urgency,
+            Urgency::Normal,
+            "a low-urgency toast gets no banner, so the click looks ignored"
+        );
         assert!(toast.transient);
     }
 
