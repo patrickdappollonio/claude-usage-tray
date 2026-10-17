@@ -140,13 +140,16 @@ pub struct Toast {
 /// only the Linux backend can act on it today (see `notify` in
 /// `platform/linux/mod.rs` for the mechanism, and `platform/macos/mod.rs` for
 /// why macOS ignores it for now).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Channel {
-    /// Threshold alerts (75%, 90%, ...). A new one replaces whichever
-    /// threshold alert is still on screen, so the user always sees the
-    /// *current* severity instead of a pile of superseded ones — the 90%
-    /// critical banner should read where the 75% one was, not stack under it.
-    ThresholdAlert,
+    /// Threshold alerts (75%, 90%, ...), one slot per usage window. A new one
+    /// replaces whichever alert is still on screen in the same slot, so the
+    /// user always sees the *current* severity instead of a pile of
+    /// superseded ones — the 90% critical banner should read where the 75%
+    /// one was, not stack under it. Different slots (the 5-hour window and
+    /// the weekly one, say) stack, so a weekly alert never hides a live
+    /// session one.
+    ThresholdAlert(String),
     /// Everything else: the reset notice and the click acknowledgements
     /// (refresh, status, install). Each shows and disappears independently,
     /// exactly as before this lane existed.

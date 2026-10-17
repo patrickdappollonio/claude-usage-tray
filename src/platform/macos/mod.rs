@@ -203,7 +203,8 @@ where
     })
 }
 
-/// The `UNNotificationRequest` identifier every threshold alert reuses.
+/// The prefix of the `UNNotificationRequest` identifier a threshold alert
+/// reuses; the alert's slot is appended, so each usage window has its own.
 ///
 /// Re-posting a request under an identifier that is already delivered replaces
 /// it in place, which is exactly what [`Channel::ThresholdAlert`] asks for: the
@@ -315,8 +316,8 @@ fn notify_bundled(toast: &Toast, channel: Channel) {
             .summary(&toast.summary)
             .body(&toast.body)
             .interruption_level(interruption_level(toast.urgency));
-        if channel == Channel::ThresholdAlert {
-            notification.id(THRESHOLD_ALERT_ID);
+        if let Channel::ThresholdAlert(slot) = &channel {
+            notification.id(format!("{THRESHOLD_ALERT_ID}.{slot}"));
         }
         if notification.show().is_ok() {
             return;

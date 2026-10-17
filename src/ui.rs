@@ -89,13 +89,19 @@ pub const RESTART_TO_UPDATE_TOAST: &str = "Update installed — restart to apply
 /// only describe how stale the cache is — the freshness line already does
 /// that job.
 pub fn reset_suffix(at: Timestamp, now: Timestamp) -> Option<String> {
+    reset_countdown(at, now).map(|countdown| format!("resets in {countdown}"))
+}
+
+/// The time left until `at`, as `<1 min`, `45 min`, `17 h` or `3 d`; `None`
+/// once it has passed. See [`reset_suffix`].
+fn reset_countdown(at: Timestamp, now: Timestamp) -> Option<String> {
     let secs = at.as_second() - now.as_second();
     if secs <= 0 {
         None
     } else if secs < 60 {
-        Some("resets in <1 min".to_string())
+        Some("<1 min".to_string())
     } else {
-        Some(format!("resets in {}", humanize_age(secs)))
+        Some(humanize_age(secs))
     }
 }
 
@@ -448,10 +454,14 @@ pub fn snapshot_changed(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
 /// A threshold crossing the poll loop should turn into a desktop notification.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageAlert {
+    /// The window whose usage crossed the threshold.
+    pub window: UsageWindow,
     /// The threshold that was crossed — one of [`NOTIFY_THRESHOLDS`].
     pub threshold: u8,
-    /// The session percentage that triggered it.
+    /// The percentage that triggered it.
     pub percent: f64,
+    /// When the window resets, if the reading carried it.
+    pub resets_at: Option<Timestamp>,
     /// Whether the notification should use critical urgency.
     pub critical: bool,
     /// The profile it is about, when there is more than one.
@@ -461,25 +471,55 @@ pub struct UsageAlert {
 impl UsageAlert {
     /// Notification title.
     pub fn summary(&self) -> String {
-        let summary = format!("Claude session usage {}%", self.percent.round());
+        let summary = format!(
+            "Claude {} usage {}%",
+            self.window.name(),
+            self.percent.round()
+        );
         match &self.profile {
             Some(profile) => format!("{summary} ({profile})"),
             None => summary,
         }
     }
 
-    /// Notification body.
-    pub fn body(&self) -> String {
+    /// Notification body, with the time left until the reset as seen from
+    /// `now` when the reading carried one.
+    pub fn body(&self, now: Timestamp) -> String {
+        let window = self.window.phrase();
+        let countdown = self.resets_at.and_then(|at| reset_countdown(at, now));
         if self.threshold >= 100 {
-            "The 5-hour window is fully used. Further requests will wait for the reset.".to_string()
-        } else if self.critical {
-            format!(
-                "The 5-hour window is above {}%. You are close to the limit.",
-                self.threshold
-            )
+            match countdown {
+                Some(countdown) => format!(
+                    "{window} is fully used. Further requests will wait for the reset in {countdown}."
+                ),
+                None => {
+                    format!("{window} is fully used. Further requests will wait for the reset.")
+                }
+            }
         } else {
-            format!("The 5-hour window has passed {}% usage.", self.threshold)
+            let body = if self.critical {
+                format!(
+                    "{window} is above {}%. You are close to the limit.",
+                    self.threshold
+                )
+            } else {
+                format!("{window} has passed {}% usage.", self.threshold)
+            };
+            match countdown {
+                Some(countdown) => format!("{body} It resets in {countdown}."),
+                None => body,
+            }
         }
+    }
+
+    /// The notification slot this alert replaces: one per window per
+    /// profile, so a weekly alert never hides a session one.
+    pub fn slot(&self) -> String {
+        format!(
+            "{}/{}",
+            self.profile.as_deref().unwrap_or_default(),
+            self.window.slot()
+        )
     }
 }
 
@@ -532,6 +572,8 @@ fn same_window(a: Timestamp, b: Timestamp) -> bool {
 /// several thresholds fire only the highest one.
 #[derive(Debug)]
 pub struct Notifier {
+    /// The window this notifier watches, carried into its alerts.
+    kind: UsageWindow,
     /// The enabled subset of [`NOTIFY_THRESHOLDS`].
     enabled: Vec<u8>,
     /// Thresholds already delivered (or passed) for the current window.
@@ -545,9 +587,10 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    /// Builds a notifier for the given enabled thresholds.
-    pub fn new(enabled: &[u8]) -> Self {
+    /// Builds a notifier for one window with the given enabled thresholds.
+    pub fn new(kind: UsageWindow, enabled: &[u8]) -> Self {
         Notifier {
+            kind,
             enabled: enabled.to_vec(),
             fired: Vec::new(),
             window: None,
@@ -576,9 +619,9 @@ impl Notifier {
         }
     }
 
-    /// Feeds the latest session metric in and returns an alert to emit, if any.
-    pub fn evaluate(&mut self, session: Option<&Metric>) -> Option<UsageAlert> {
-        let metric = session?;
+    /// Feeds the window's latest metric in and returns an alert to emit, if any.
+    pub fn evaluate(&mut self, metric: Option<&Metric>) -> Option<UsageAlert> {
+        let metric = metric?;
         let percent = metric.percent?;
 
         // A rollover is the only thing that re-arms. The comparison is against
@@ -614,8 +657,10 @@ impl Notifier {
             })
             .max()
             .map(|threshold| UsageAlert {
+                window: self.kind.clone(),
                 threshold,
                 percent,
+                resets_at: metric.resets_at,
                 critical: config::is_critical(threshold),
                 profile: None,
             });
@@ -633,9 +678,9 @@ impl Notifier {
     }
 }
 
-/// Which usage window a [`ResetAlert`] is about — it decides the wording.
+/// Which usage window an alert is about — it decides the wording.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResetWindow {
+pub enum UsageWindow {
     /// The 5-hour session window.
     Session,
     /// The all-models weekly window.
@@ -644,11 +689,41 @@ pub enum ResetWindow {
     Scoped(String),
 }
 
+impl UsageWindow {
+    /// The window as it reads inside a title: `session`, `weekly`,
+    /// `Fable weekly`.
+    fn name(&self) -> String {
+        match self {
+            UsageWindow::Session => "session".to_string(),
+            UsageWindow::Weekly => "weekly".to_string(),
+            UsageWindow::Scoped(name) => format!("{name} weekly"),
+        }
+    }
+
+    /// The window as the subject of a sentence: `The 5-hour window`.
+    fn phrase(&self) -> String {
+        match self {
+            UsageWindow::Session => "The 5-hour window".to_string(),
+            UsageWindow::Weekly => "The weekly window".to_string(),
+            UsageWindow::Scoped(name) => format!("The {name} weekly window"),
+        }
+    }
+
+    /// A stable key for the window, for [`UsageAlert::slot`].
+    fn slot(&self) -> String {
+        match self {
+            UsageWindow::Session => "session".to_string(),
+            UsageWindow::Weekly => "weekly".to_string(),
+            UsageWindow::Scoped(name) => format!("model:{name}"),
+        }
+    }
+}
+
 /// The "your usage window rolled over" notification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResetAlert {
     /// The window that rolled over.
-    pub window: ResetWindow,
+    pub window: UsageWindow,
     /// The `resets_at` that came due.
     pub at: Timestamp,
     /// The profile it is about, when there is more than one.
@@ -662,9 +737,9 @@ impl ResetAlert {
 
     pub fn body(&self) -> String {
         let body = match &self.window {
-            ResetWindow::Session => "Session quota reset — fresh 5-hour window".to_string(),
-            ResetWindow::Weekly => "Weekly quota reset — fresh week".to_string(),
-            ResetWindow::Scoped(name) => format!("{name} weekly quota reset — fresh week"),
+            UsageWindow::Session => "Session quota reset — fresh 5-hour window".to_string(),
+            UsageWindow::Weekly => "Weekly quota reset — fresh week".to_string(),
+            UsageWindow::Scoped(name) => format!("{name} weekly quota reset — fresh week"),
         };
         match &self.profile {
             Some(profile) => format!("{profile}: {body}"),
@@ -770,7 +845,7 @@ impl ResetNotifiers {
         let session = snapshot.session.as_ref().and_then(|m| m.resets_at);
         if let Some(at) = self.session.evaluate(session, now, enabled) {
             alerts.push(ResetAlert {
-                window: ResetWindow::Session,
+                window: UsageWindow::Session,
                 at,
                 profile: None,
             });
@@ -778,7 +853,7 @@ impl ResetNotifiers {
         let weekly = snapshot.weekly.as_ref().and_then(|m| m.resets_at);
         if let Some(at) = self.weekly.evaluate(weekly, now, enabled) {
             alerts.push(ResetAlert {
-                window: ResetWindow::Weekly,
+                window: UsageWindow::Weekly,
                 at,
                 profile: None,
             });
@@ -788,7 +863,7 @@ impl ResetNotifiers {
             let notifier = self.scoped.entry(scoped.name.clone()).or_default();
             if let Some(at) = notifier.evaluate(scoped.metric.resets_at, now, enabled) {
                 alerts.push(ResetAlert {
-                    window: ResetWindow::Scoped(scoped.name.clone()),
+                    window: UsageWindow::Scoped(scoped.name.clone()),
                     at,
                     profile: None,
                 });
@@ -802,7 +877,7 @@ impl ResetNotifiers {
             }
             if let Some(at) = notifier.evaluate(None, now, enabled) {
                 alerts.push(ResetAlert {
-                    window: ResetWindow::Scoped(name.clone()),
+                    window: UsageWindow::Scoped(name.clone()),
                     at,
                     profile: None,
                 });
@@ -832,7 +907,54 @@ impl ResetNotifiers {
 /// the tray does at startup; one that disappears takes its state with it.
 #[derive(Debug, Default)]
 pub struct ProfileNotifiers {
-    watches: std::collections::HashMap<String, (Notifier, ResetNotifiers)>,
+    watches: std::collections::HashMap<String, Watch>,
+}
+
+/// One profile's notifiers: a usage [`Notifier`] per window, and the reset
+/// ones.
+#[derive(Debug)]
+struct Watch {
+    session: Notifier,
+    weekly: Notifier,
+    /// Keyed by bucket name (`Fable`, …), added as buckets appear.
+    scoped: std::collections::HashMap<String, Notifier>,
+    resets: ResetNotifiers,
+}
+
+impl Watch {
+    fn new(thresholds: &[u8]) -> Self {
+        Watch {
+            session: Notifier::new(UsageWindow::Session, thresholds),
+            weekly: Notifier::new(UsageWindow::Weekly, thresholds),
+            scoped: std::collections::HashMap::new(),
+            resets: ResetNotifiers::new(),
+        }
+    }
+
+    /// Feeds every window in `reading` through its notifier. A window whose
+    /// alerts are switched off is still fed, with no thresholds enabled, so
+    /// it keeps track of what has been crossed: switching it on later stays
+    /// quiet until the next crossing, as a re-enabled threshold does.
+    fn usage_alerts(&mut self, reading: &UsageSnapshot, prefs: &NotifyPrefs) -> Vec<UsageAlert> {
+        let enabled = |on: bool| if on { &prefs.thresholds[..] } else { &[] };
+        let mut alerts = Vec::new();
+
+        self.session.set_enabled(&prefs.thresholds);
+        alerts.extend(self.session.evaluate(reading.session.as_ref()));
+
+        self.weekly.set_enabled(enabled(prefs.weekly));
+        alerts.extend(self.weekly.evaluate(reading.weekly.as_ref()));
+
+        for scoped in &reading.scoped {
+            let notifier = self
+                .scoped
+                .entry(scoped.name.clone())
+                .or_insert_with(|| Notifier::new(UsageWindow::Scoped(scoped.name.clone()), &[]));
+            notifier.set_enabled(enabled(prefs.models));
+            alerts.extend(notifier.evaluate(Some(&scoped.metric)));
+        }
+        alerts
+    }
 }
 
 impl ProfileNotifiers {
@@ -866,20 +988,23 @@ impl ProfileNotifiers {
         for (name, _) in readings {
             self.watches
                 .entry(name.unwrap_or_default().to_string())
-                .or_insert_with(|| (Notifier::new(thresholds), ResetNotifiers::new()));
+                .or_insert_with(|| Watch::new(thresholds));
         }
     }
 
-    /// Feeds every profile's session reading through its [`Notifier`].
-    pub fn usage_alerts(&mut self, snapshot: &UsageSnapshot, thresholds: &[u8]) -> Vec<UsageAlert> {
-        self.sync(snapshot, thresholds);
+    /// Feeds every profile's windows through its usage [`Notifier`]s.
+    pub fn usage_alerts(
+        &mut self,
+        snapshot: &UsageSnapshot,
+        prefs: &NotifyPrefs,
+    ) -> Vec<UsageAlert> {
+        self.sync(snapshot, &prefs.thresholds);
         let mut alerts = Vec::new();
         for (name, reading) in Self::readings(snapshot) {
-            let Some((notifier, _)) = self.watches.get_mut(name.unwrap_or_default()) else {
+            let Some(watch) = self.watches.get_mut(name.unwrap_or_default()) else {
                 continue;
             };
-            notifier.set_enabled(thresholds);
-            if let Some(mut alert) = notifier.evaluate(reading.session.as_ref()) {
+            for mut alert in watch.usage_alerts(reading, prefs) {
                 alert.profile = name.map(str::to_string);
                 alerts.push(alert);
             }
@@ -896,10 +1021,10 @@ impl ProfileNotifiers {
     ) -> Vec<ResetAlert> {
         let mut alerts = Vec::new();
         for (name, reading) in Self::readings(snapshot) {
-            let Some((_, resets)) = self.watches.get_mut(name.unwrap_or_default()) else {
+            let Some(watch) = self.watches.get_mut(name.unwrap_or_default()) else {
                 continue;
             };
-            for mut alert in resets.evaluate(reading, now, enabled) {
+            for mut alert in watch.resets.evaluate(reading, now, enabled) {
                 alert.profile = name.map(str::to_string);
                 alerts.push(alert);
             }
@@ -911,7 +1036,7 @@ impl ProfileNotifiers {
     pub fn deadline(&self) -> Option<Timestamp> {
         self.watches
             .values()
-            .filter_map(|(_, resets)| resets.deadline())
+            .filter_map(|watch| watch.resets.deadline())
             .min()
     }
 }
@@ -938,10 +1063,14 @@ pub fn poll_wait(interval_secs: u64, deadline: Option<Timestamp>, now: Timestamp
 /// The notification preferences the poll loop needs, shared with the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotifyPrefs {
-    /// Enabled session-usage thresholds.
+    /// Enabled usage thresholds.
     pub thresholds: Vec<u8>,
     /// Whether the quota-reset alert fires.
     pub on_reset: bool,
+    /// Whether the thresholds also alert on the all-models weekly window.
+    pub weekly: bool,
+    /// Whether the thresholds also alert on each per-model weekly window.
+    pub models: bool,
 }
 
 impl NotifyPrefs {
@@ -949,6 +1078,8 @@ impl NotifyPrefs {
         NotifyPrefs {
             thresholds: config.notify_thresholds.clone(),
             on_reset: config.notify_on_reset,
+            weekly: config.notify_weekly,
+            models: config.notify_models,
         }
     }
 }
@@ -1454,6 +1585,18 @@ impl TrayCore {
         self.apply_notify_change();
     }
 
+    /// Checkbox handler for the weekly-window usage alerts.
+    fn toggle_notify_weekly(&mut self) {
+        self.settings.config.notify_weekly = !self.settings.config.notify_weekly;
+        self.apply_notify_change();
+    }
+
+    /// Checkbox handler for the per-model weekly usage alerts.
+    fn toggle_notify_models(&mut self) {
+        self.settings.config.notify_models = !self.settings.config.notify_models;
+        self.apply_notify_change();
+    }
+
     /// Checkbox handler for the update check. Switching it off stops the next
     /// scheduled check (the checker thread re-reads the shared flag before
     /// every request) but deliberately leaves an already-found update on the
@@ -1491,6 +1634,8 @@ impl TrayCore {
             MenuAction::ToggleLaunchAtLogin => self.toggle_launch_at_login(),
             MenuAction::ToggleThreshold(threshold) => self.toggle_threshold(*threshold),
             MenuAction::ToggleNotifyOnReset => self.toggle_notify_on_reset(),
+            MenuAction::ToggleNotifyWeekly => self.toggle_notify_weekly(),
+            MenuAction::ToggleNotifyModels => self.toggle_notify_models(),
             MenuAction::ToggleCheckUpdates => self.toggle_check_updates(),
             MenuAction::ToggleCliRefresh => self.toggle_cli_refresh(),
             MenuAction::RestartToUpdate => self.restart_to_update(),
@@ -1628,6 +1773,19 @@ impl TrayCore {
                 enabled,
             })
             .collect();
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::Check {
+            label: "Alerts for weekly".into(),
+            action: MenuAction::ToggleNotifyWeekly,
+            checked: self.settings.config.notify_weekly,
+            enabled,
+        });
+        rows.push(MenuRow::Check {
+            label: "Alerts for custom models".into(),
+            action: MenuAction::ToggleNotifyModels,
+            checked: self.settings.config.notify_models,
+            enabled,
+        });
         rows.push(MenuRow::Separator);
         rows.push(MenuRow::Check {
             label: "When quota resets".into(),
@@ -2380,7 +2538,7 @@ mod tests {
 
     /// All thresholds on, the shipped default.
     fn all_on() -> Notifier {
-        Notifier::new(&NOTIFY_THRESHOLDS)
+        Notifier::new(UsageWindow::Session, &NOTIFY_THRESHOLDS)
     }
 
     #[test]
@@ -2600,14 +2758,14 @@ mod tests {
 
     #[test]
     fn notifier_with_no_thresholds_never_fires() {
-        let mut n = Notifier::new(&[]);
+        let mut n = Notifier::new(UsageWindow::Session, &[]);
         assert_eq!(n.evaluate(Some(&metric(Some(100.0), Some(BASE)))), None);
     }
 
     #[test]
     fn notifier_skips_disabled_thresholds_and_fires_the_next_enabled_one() {
         // Only 50 and 100 on: passing 76 must stay silent, 100 must not.
-        let mut n = Notifier::new(&[50, 100]);
+        let mut n = Notifier::new(UsageWindow::Session, &[50, 100]);
         n.evaluate(Some(&metric(Some(10.0), Some(BASE)))); // baseline
         let alert = n
             .evaluate(Some(&metric(Some(51.0), Some(BASE))))
@@ -2625,7 +2783,7 @@ mod tests {
         // The reconfigure edge: 90 is off while usage climbs past it, then the
         // user switches it back on. Nothing happened at 90 that the user asked
         // to hear about, so it must stay silent until a real crossing.
-        let mut n = Notifier::new(&[50, 75]);
+        let mut n = Notifier::new(UsageWindow::Session, &[50, 75]);
         n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
         assert!(n.evaluate(Some(&metric(Some(95.0), Some(BASE)))).is_some());
 
@@ -2642,7 +2800,7 @@ mod tests {
 
     #[test]
     fn notifier_reenabling_stays_quiet_until_the_next_window() {
-        let mut n = Notifier::new(&[50, 75]);
+        let mut n = Notifier::new(UsageWindow::Session, &[50, 75]);
         // The startup baseline, which is silent whatever it reads.
         assert_eq!(n.evaluate(Some(&metric(Some(95.0), Some(BASE)))), None);
         n.set_enabled(&NOTIFY_THRESHOLDS);
@@ -2667,45 +2825,98 @@ mod tests {
     #[test]
     fn alert_text_differs_by_urgency() {
         let warn = UsageAlert {
+            window: UsageWindow::Session,
             threshold: 50,
             percent: 51.0,
+            resets_at: None,
             critical: false,
             profile: None,
         };
         assert_eq!(warn.summary(), "Claude session usage 51%");
-        assert!(warn.body().contains("50%"));
+        assert!(warn.body(ts(0)).contains("50%"));
 
         let crit = UsageAlert {
+            window: UsageWindow::Session,
             threshold: 90,
             percent: 91.0,
+            resets_at: None,
             critical: true,
             profile: None,
         };
         assert_eq!(crit.summary(), "Claude session usage 91%");
-        assert!(crit.body().contains("90%"));
+        assert!(crit.body(ts(0)).contains("90%"));
 
         // 100% is not "close to the limit" — it is the limit.
         let full = UsageAlert {
+            window: UsageWindow::Session,
             threshold: 100,
             percent: 100.0,
+            resets_at: None,
             critical: true,
             profile: None,
         };
         assert_eq!(full.summary(), "Claude session usage 100%");
-        assert!(full.body().contains("fully used"));
+        assert!(full.body(ts(0)).contains("fully used"));
+    }
+
+    #[test]
+    fn alert_body_says_when_the_window_resets() {
+        let crit = UsageAlert {
+            window: UsageWindow::Session,
+            threshold: 90,
+            percent: 91.0,
+            critical: true,
+            resets_at: Some(ts(BASE)),
+            profile: None,
+        };
+        assert_eq!(
+            crit.body(ts(BASE - 2 * 3600)),
+            "The 5-hour window is above 90%. You are close to the limit. It resets in 2 h."
+        );
+
+        let full = UsageAlert {
+            window: UsageWindow::Session,
+            threshold: 100,
+            percent: 100.0,
+            critical: true,
+            resets_at: Some(ts(BASE)),
+            profile: None,
+        };
+        assert_eq!(
+            full.body(ts(BASE - 45 * 60)),
+            "The 5-hour window is fully used. Further requests will wait for the reset in 45 min."
+        );
+
+        // A reset that has already passed says nothing rather than lying.
+        assert_eq!(
+            crit.body(ts(BASE + 60)),
+            "The 5-hour window is above 90%. You are close to the limit."
+        );
+    }
+
+    #[test]
+    fn evaluate_carries_the_reset_time_into_the_alert() {
+        let mut n = all_on();
+        n.evaluate(Some(&metric(Some(10.0), Some(BASE))));
+        let alert = n
+            .evaluate(Some(&metric(Some(55.0), Some(BASE))))
+            .expect("50 crossed");
+        assert_eq!(alert.resets_at, Some(ts(BASE)));
     }
 
     #[test]
     fn alerts_name_their_profile_when_they_have_one() {
         let alert = UsageAlert {
+            window: UsageWindow::Session,
             threshold: 75,
             percent: 76.0,
+            resets_at: None,
             critical: false,
             profile: Some("work".into()),
         };
         assert_eq!(alert.summary(), "Claude session usage 76% (work)");
         let reset = ResetAlert {
-            window: ResetWindow::Weekly,
+            window: UsageWindow::Weekly,
             at: ts(0),
             profile: Some("work".into()),
         };
@@ -2811,12 +3022,12 @@ mod tests {
             .body()
         };
         assert_eq!(
-            body(ResetWindow::Session),
+            body(UsageWindow::Session),
             "Session quota reset — fresh 5-hour window"
         );
-        assert_eq!(body(ResetWindow::Weekly), "Weekly quota reset — fresh week");
+        assert_eq!(body(UsageWindow::Weekly), "Weekly quota reset — fresh week");
         assert_eq!(
-            body(ResetWindow::Scoped("Fable".to_string())),
+            body(UsageWindow::Scoped("Fable".to_string())),
             "Fable weekly quota reset — fresh week"
         );
     }
@@ -2848,17 +3059,17 @@ mod tests {
 
         let alerts = r.evaluate(&s, ts(BASE + 600), true);
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].window, ResetWindow::Session);
+        assert_eq!(alerts[0].window, UsageWindow::Session);
         assert_eq!(alerts[0].at, ts(BASE + 600));
         assert_eq!(r.deadline(), Some(ts(BASE + 1200)));
 
         // Both remaining windows come due while the loop was asleep: one
         // alert each, in the same pass.
         let alerts = r.evaluate(&s, ts(BASE + 1800), true);
-        let windows: Vec<&ResetWindow> = alerts.iter().map(|alert| &alert.window).collect();
-        assert!(windows.contains(&&ResetWindow::Weekly), "{windows:?}");
+        let windows: Vec<&UsageWindow> = alerts.iter().map(|alert| &alert.window).collect();
+        assert!(windows.contains(&&UsageWindow::Weekly), "{windows:?}");
         assert!(
-            windows.contains(&&ResetWindow::Scoped("Fable".to_string())),
+            windows.contains(&&UsageWindow::Scoped("Fable".to_string())),
             "{windows:?}"
         );
         assert_eq!(r.deadline(), None);
@@ -2877,7 +3088,7 @@ mod tests {
         assert!(
             alerts
                 .iter()
-                .any(|alert| alert.window == ResetWindow::Scoped("Fable".to_string())),
+                .any(|alert| alert.window == UsageWindow::Scoped("Fable".to_string())),
             "{alerts:?}"
         );
         assert_eq!(r.deadline(), None);
@@ -3152,12 +3363,16 @@ mod tests {
             NotifyPrefs {
                 thresholds: NOTIFY_THRESHOLDS.to_vec(),
                 on_reset: true,
+                weekly: true,
+                models: true,
             }
         );
 
         let changed = NotifyPrefs {
             thresholds: vec![100],
             on_reset: false,
+            weekly: false,
+            models: true,
         };
         settings.notify.set(changed.clone());
         assert_eq!(handle.get(), changed);
@@ -3378,7 +3593,7 @@ mod tests {
     #[test]
     fn profile_notifiers_track_each_profile_separately() {
         let mut notifiers = ProfileNotifiers::new();
-        let thresholds = [50, 75, 90];
+        let thresholds = prefs(&[50, 75, 90]);
         let reading = |default: f64, work: f64| {
             let mut snapshot = two_profiles();
             snapshot.profiles[0].snapshot.session = Some(metric(Some(default), None));
@@ -3407,6 +3622,75 @@ mod tests {
         );
     }
 
+    /// Every window's alerts on, at `thresholds`.
+    fn prefs(thresholds: &[u8]) -> NotifyPrefs {
+        NotifyPrefs {
+            thresholds: thresholds.to_vec(),
+            on_reset: true,
+            weekly: true,
+            models: true,
+        }
+    }
+
+    #[test]
+    fn weekly_and_model_windows_alert_on_their_own_crossings() {
+        let mut notifiers = ProfileNotifiers::new();
+        let at = |session: f64, weekly: f64, model: f64| UsageSnapshot {
+            session: Some(metric(Some(session), Some(BASE))),
+            weekly: Some(metric(Some(weekly), Some(BASE + 86_400))),
+            scoped: vec![fable(model, Some(BASE + 3600))],
+            ..UsageSnapshot::default()
+        };
+        assert!(
+            notifiers
+                .usage_alerts(&at(10.0, 10.0, 10.0), &prefs(&[50, 90]))
+                .is_empty()
+        );
+
+        let alerts = notifiers.usage_alerts(&at(10.0, 55.0, 91.0), &prefs(&[50, 90]));
+        let windows: Vec<_> = alerts
+            .iter()
+            .map(|a| (a.window.clone(), a.threshold))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                (UsageWindow::Weekly, 50),
+                (UsageWindow::Scoped("Fable".into()), 90),
+            ]
+        );
+        assert_eq!(alerts[0].summary(), "Claude weekly usage 55%");
+        assert_eq!(alerts[0].resets_at, Some(ts(BASE + 86_400)));
+        assert_eq!(alerts[1].summary(), "Claude Fable weekly usage 91%");
+        assert!(
+            alerts[1]
+                .body(ts(0))
+                .starts_with("The Fable weekly window is above 90%.")
+        );
+        // Each window has its own notification slot.
+        assert_ne!(alerts[0].slot(), alerts[1].slot());
+    }
+
+    #[test]
+    fn switched_off_windows_stay_quiet_and_stay_quiet_when_switched_back_on() {
+        let mut notifiers = ProfileNotifiers::new();
+        let off = NotifyPrefs {
+            weekly: false,
+            models: false,
+            ..prefs(&[50])
+        };
+        let at = |percent: f64| UsageSnapshot {
+            weekly: Some(metric(Some(percent), Some(BASE))),
+            scoped: vec![fable(percent, Some(BASE))],
+            ..UsageSnapshot::default()
+        };
+        assert!(notifiers.usage_alerts(&at(10.0), &off).is_empty());
+        assert!(notifiers.usage_alerts(&at(60.0), &off).is_empty());
+        // The crossing happened while they were off; turning them on does
+        // not replay it.
+        assert!(notifiers.usage_alerts(&at(61.0), &prefs(&[50])).is_empty());
+    }
+
     #[test]
     fn profile_notifiers_with_one_profile_name_nothing() {
         let mut notifiers = ProfileNotifiers::new();
@@ -3414,8 +3698,8 @@ mod tests {
             session: Some(metric(Some(percent), None)),
             ..UsageSnapshot::default()
         };
-        assert!(notifiers.usage_alerts(&at(10.0), &[50]).is_empty());
-        let alerts = notifiers.usage_alerts(&at(60.0), &[50]);
+        assert!(notifiers.usage_alerts(&at(10.0), &prefs(&[50])).is_empty());
+        let alerts = notifiers.usage_alerts(&at(60.0), &prefs(&[50]));
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].profile, None);
     }
@@ -3426,7 +3710,7 @@ mod tests {
         let mut snapshot = two_profiles();
         snapshot.profiles[0].snapshot.session = Some(metric(Some(10.0), Some(BASE + 900)));
         snapshot.profiles[1].snapshot.session = Some(metric(Some(10.0), Some(BASE + 300)));
-        notifiers.usage_alerts(&snapshot, &[50]);
+        notifiers.usage_alerts(&snapshot, &prefs(&[50]));
         assert!(notifiers.reset_alerts(&snapshot, ts(BASE), true).is_empty());
         assert_eq!(notifiers.deadline(), Some(ts(BASE + 300)));
         let alerts = notifiers.reset_alerts(&snapshot, ts(BASE + 300), true);
@@ -3654,11 +3938,12 @@ mod tests {
         let mut config = Config::default();
         config.set_notifies_at(NOTIFY_THRESHOLDS[0], false);
         config.notify_on_reset = false;
+        config.notify_models = false;
         let (core, _rx) = core_for(timeless(SnapshotState::Fresh), config, None);
         let rows = core.menu_with(ts(BASE), all_available());
         let notifications = submenu(submenu(&rows, "Settings"), "Notifications");
 
-        assert_eq!(notifications.len(), NOTIFY_THRESHOLDS.len() + 2);
+        assert_eq!(notifications.len(), NOTIFY_THRESHOLDS.len() + 5);
         assert_eq!(
             notifications[0],
             MenuRow::Check {
@@ -3683,6 +3968,28 @@ mod tests {
         ));
         assert_eq!(
             notifications[NOTIFY_THRESHOLDS.len() + 1],
+            MenuRow::Check {
+                label: "Alerts for weekly".into(),
+                action: MenuAction::ToggleNotifyWeekly,
+                checked: true,
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            notifications[NOTIFY_THRESHOLDS.len() + 2],
+            MenuRow::Check {
+                label: "Alerts for custom models".into(),
+                action: MenuAction::ToggleNotifyModels,
+                checked: false,
+                enabled: true,
+            }
+        );
+        assert!(matches!(
+            notifications[NOTIFY_THRESHOLDS.len() + 3],
+            MenuRow::Separator
+        ));
+        assert_eq!(
+            notifications[NOTIFY_THRESHOLDS.len() + 4],
             MenuRow::Check {
                 label: "When quota resets".into(),
                 action: MenuAction::ToggleNotifyOnReset,
