@@ -34,10 +34,14 @@ pub enum MenuAction {
     Quit,
     /// Flip the autostart entry.
     ToggleLaunchAtLogin,
-    /// Flip one session-usage notification threshold.
+    /// Flip one usage notification threshold.
     ToggleThreshold(u8),
     /// Flip the quota-reset notification.
     ToggleNotifyOnReset,
+    /// Flip the usage alerts for the all-models weekly window.
+    ToggleNotifyWeekly,
+    /// Flip the usage alerts for the per-model weekly windows.
+    ToggleNotifyModels,
     /// Flip the daily update check.
     ToggleCheckUpdates,
     ToggleCliRefresh,

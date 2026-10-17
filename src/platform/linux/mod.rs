@@ -101,9 +101,9 @@ fn wait_for_watcher(patience: Duration) {
     }
 }
 
-/// The threshold-alert notification currently on screen, if any.
+/// The threshold-alert notifications currently on screen, one per slot.
 ///
-/// Kept so a later threshold alert can replace it in place instead of
+/// Kept so a later threshold alert can replace its slot's one in place instead of
 /// stacking underneath it. `notify_rust::NotificationHandle` is `Send` here —
 /// verified with a compile-time probe (`assert_send::<NotificationHandle>()`)
 /// against this crate's actual dependency graph, where `notify-rust`'s
@@ -113,13 +113,16 @@ fn wait_for_watcher(patience: Duration) {
 /// makes storing it in a `Mutex` behind a `static` sound. Every other toast
 /// (reset, refresh, status, install) stays fire-and-forget, matching
 /// `Channel::Ephemeral`.
-static THRESHOLD_HANDLE: Mutex<Option<notify_rust::NotificationHandle>> = Mutex::new(None);
+/// A `Vec` rather than a map because it has to be built in a `static`, and it
+/// only ever holds a handful of windows.
+static THRESHOLD_HANDLES: Mutex<Vec<(String, notify_rust::NotificationHandle)>> =
+    Mutex::new(Vec::new());
 
 /// Emits a freedesktop notification. Failures (no notification daemon, D-Bus
 /// down) are ignored on purpose.
 ///
-/// `Channel::ThresholdAlert` reuses the previous threshold notification's
-/// D-Bus id by calling [`notify_rust::NotificationHandle::update`] on the
+/// `Channel::ThresholdAlert` reuses the D-Bus id of the previous threshold
+/// notification in the same slot by calling [`notify_rust::NotificationHandle::update`] on the
 /// retained handle. Per that method's own documentation (`notify-rust`
 /// 4.18.0, `src/xdg/mod.rs`): "Replace the original notification with an
 /// updated version" — under the hood this re-sends the freedesktop `Notify`
@@ -136,12 +139,12 @@ pub fn notify(toast: &Toast, channel: Channel) {
         Urgency::Critical => notify_rust::Urgency::Critical,
     };
 
-    if channel == Channel::ThresholdAlert {
-        let mut slot = THRESHOLD_HANDLE
+    if let Channel::ThresholdAlert(key) = channel {
+        let mut handles = THRESHOLD_HANDLES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if let Some(handle) = slot.as_mut() {
+        if let Some((_, handle)) = handles.iter_mut().find(|(slot, _)| *slot == key) {
             handle
                 .appname("Claude usage tray")
                 .summary(&toast.summary)
@@ -166,7 +169,10 @@ pub fn notify(toast: &Toast, channel: Channel) {
         if toast.transient {
             notification.hint(notify_rust::Hint::Transient(true));
         }
-        *slot = notification.show().ok();
+        handles.retain(|(slot, _)| *slot != key);
+        if let Ok(handle) = notification.show() {
+            handles.push((key, handle));
+        }
         return;
     }
 

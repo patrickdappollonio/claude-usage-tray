@@ -58,11 +58,11 @@ use ui::{ResetAlert, UsageAlert, Wake};
 /// the routing to [`Channel::ThresholdAlert`] — the whole point of this
 /// function existing — is checkable without going through the backend's
 /// D-Bus call; see the `notify_channel_routing` tests below.
-fn threshold_toast(alert: &UsageAlert) -> (Toast, Channel) {
+fn threshold_toast(alert: &UsageAlert, now: Timestamp) -> (Toast, Channel) {
     (
         Toast {
             summary: alert.summary(),
-            body: alert.body(),
+            body: alert.body(now),
             urgency: if alert.critical {
                 Urgency::Critical
             } else {
@@ -70,7 +70,7 @@ fn threshold_toast(alert: &UsageAlert) -> (Toast, Channel) {
             },
             transient: false,
         },
-        Channel::ThresholdAlert,
+        Channel::ThresholdAlert(alert.slot()),
     )
 }
 
@@ -175,7 +175,7 @@ fn notify_greeting(greeting: &greeting::Greeting) {
 /// down) are ignored by the backend: a missing notification must never take
 /// the tray with it.
 fn notify(alert: &UsageAlert) {
-    let (toast, channel) = threshold_toast(alert);
+    let (toast, channel) = threshold_toast(alert, Timestamp::now());
     platform::notify(&toast, channel);
 }
 
@@ -1154,7 +1154,7 @@ fn poll_loop(
     loop {
         // Re-read the preferences every cycle so a menu toggle applies live.
         let prefs = notify_prefs.get();
-        for alert in notifiers.usage_alerts(&snapshot, &prefs.thresholds) {
+        for alert in notifiers.usage_alerts(&snapshot, &prefs) {
             notify(&alert);
         }
 
@@ -1673,13 +1673,15 @@ mod notify_channel_routing {
     #[test]
     fn normal_threshold_alert_routes_to_threshold_alert_channel() {
         let alert = UsageAlert {
+            window: ui::UsageWindow::Session,
             threshold: 75,
             percent: 75.0,
+            resets_at: None,
             critical: false,
             profile: None,
         };
-        let (toast, channel) = threshold_toast(&alert);
-        assert_eq!(channel, Channel::ThresholdAlert);
+        let (toast, channel) = threshold_toast(&alert, Timestamp::now());
+        assert_eq!(channel, Channel::ThresholdAlert("/session".into()));
         assert_eq!(toast.urgency, Urgency::Normal);
         assert!(!toast.transient);
     }
@@ -1690,13 +1692,15 @@ mod notify_channel_routing {
         // replaceable channel as the 75% one it supersedes, not a separate
         // lane that would let both stack.
         let alert = UsageAlert {
+            window: ui::UsageWindow::Session,
             threshold: 90,
             percent: 90.0,
+            resets_at: None,
             critical: true,
             profile: None,
         };
-        let (toast, channel) = threshold_toast(&alert);
-        assert_eq!(channel, Channel::ThresholdAlert);
+        let (toast, channel) = threshold_toast(&alert, Timestamp::now());
+        assert_eq!(channel, Channel::ThresholdAlert("/session".into()));
         assert_eq!(toast.urgency, Urgency::Critical);
         assert!(!toast.transient);
     }
@@ -1704,7 +1708,7 @@ mod notify_channel_routing {
     #[test]
     fn reset_alert_routes_to_ephemeral_channel() {
         let alert = ResetAlert {
-            window: ui::ResetWindow::Session,
+            window: ui::UsageWindow::Session,
             at: Timestamp::now(),
             profile: None,
         };

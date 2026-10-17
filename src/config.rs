@@ -2,13 +2,15 @@
 //! launch-at-login flag.
 //!
 //! The file lives at `~/.config/claude-usage-tray/config.toml` (respecting
-//! `$XDG_CONFIG_HOME`) and holds five keys:
+//! `$XDG_CONFIG_HOME`) and holds these keys:
 //!
 //! ```toml
 //! refresh_secs = 5
 //! launch_at_login = false
 //! notify_thresholds = [50, 75, 90, 99, 100]
 //! notify_on_reset = true
+//! notify_weekly = true
+//! notify_models = true
 //! icon_style = "color"
 //! check_updates = true
 //! cli_refresh = true
@@ -36,7 +38,8 @@ pub const DEFAULT_REFRESH_SECS: u64 = 5;
 /// The intervals offered by the `Refresh interval` radio group, in seconds.
 pub const REFRESH_CHOICES: [u64; 4] = [5, 15, 30, 60];
 
-/// Every session-usage threshold the tray knows how to alert on, ascending.
+/// Every usage threshold the tray knows how to alert on, ascending. The same
+/// set applies to every window the user has alerts switched on for.
 /// Values outside this set are meaningless to the notifier, so they are
 /// dropped on load rather than kept as dead weight in the config.
 pub const NOTIFY_THRESHOLDS: [u8; 5] = [50, 75, 90, 99, 100];
@@ -183,6 +186,10 @@ pub struct Config {
     pub notify_thresholds: Vec<u8>,
     /// Whether the "session quota reset" notification fires.
     pub notify_on_reset: bool,
+    /// Whether the thresholds also alert on the all-models weekly window.
+    pub notify_weekly: bool,
+    /// Whether the thresholds also alert on each per-model weekly window.
+    pub notify_models: bool,
     /// How the icon is colored.
     pub icon_style: IconStyle,
     /// Whether the once-daily GitHub releases check runs. The only setting
@@ -204,6 +211,8 @@ impl Default for Config {
             launch_at_login: false,
             notify_thresholds: NOTIFY_THRESHOLDS.to_vec(),
             notify_on_reset: true,
+            notify_weekly: true,
+            notify_models: true,
             icon_style: IconStyle::default(),
             check_updates: true,
             cli_refresh: true,
@@ -307,6 +316,14 @@ pub fn parse_config(body: &str) -> Config {
         .get("notify_on_reset")
         .and_then(|value| value.as_bool())
         .unwrap_or(defaults.notify_on_reset);
+    let notify_weekly = table
+        .get("notify_weekly")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(defaults.notify_weekly);
+    let notify_models = table
+        .get("notify_models")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(defaults.notify_models);
     // A missing, wrong-typed, or unrecognized style is not worth refusing to
     // start over: it just means "the default look".
     let icon_style = table
@@ -326,6 +343,8 @@ pub fn parse_config(body: &str) -> Config {
         launch_at_login,
         notify_thresholds,
         notify_on_reset,
+        notify_weekly,
+        notify_models,
         icon_style,
         check_updates,
         cli_refresh: table
@@ -352,12 +371,14 @@ pub fn render_config(config: &Config) -> String {
         .join(", ");
     let mut body = format!(
         "refresh_secs = {}\nlaunch_at_login = {}\nnotify_thresholds = [{}]\n\
-         notify_on_reset = {}\nicon_style = \"{}\"\ncheck_updates = {}\n\
-         cli_refresh = {}\n",
+         notify_on_reset = {}\nnotify_weekly = {}\nnotify_models = {}\n\
+         icon_style = \"{}\"\ncheck_updates = {}\ncli_refresh = {}\n",
         config.refresh_secs,
         config.launch_at_login,
         thresholds,
         config.notify_on_reset,
+        config.notify_weekly,
+        config.notify_models,
         config.icon_style.as_str(),
         config.check_updates,
         config.cli_refresh
@@ -473,6 +494,8 @@ mod tests {
                 launch_at_login: false,
                 notify_thresholds: vec![50, 75, 90, 99, 100],
                 notify_on_reset: true,
+                notify_weekly: true,
+                notify_models: true,
                 icon_style: IconStyle::default(),
                 check_updates: true,
                 cli_refresh: true,
@@ -582,6 +605,17 @@ mod tests {
     fn notify_on_reset_falls_back_when_wrong_typed() {
         assert!(!parse_config("notify_on_reset = false\n").notify_on_reset);
         assert!(parse_config("notify_on_reset = 1\n").notify_on_reset);
+    }
+
+    #[test]
+    fn weekly_and_model_alerts_parse_and_fall_back_when_wrong_typed() {
+        let config = parse_config("notify_weekly = false\nnotify_models = false\n");
+        assert!(!config.notify_weekly);
+        assert!(!config.notify_models);
+
+        let config = parse_config("notify_weekly = \"no\"\nnotify_models = 0\n");
+        assert!(config.notify_weekly);
+        assert!(config.notify_models);
     }
 
     #[test]
@@ -728,6 +762,8 @@ mod tests {
             launch_at_login: true,
             notify_thresholds: vec![75, 99],
             notify_on_reset: false,
+            notify_weekly: false,
+            notify_models: true,
             icon_style: IconStyle::MonoAuto,
             check_updates: false,
             cli_refresh: false,
@@ -786,6 +822,8 @@ mod tests {
             launch_at_login: true,
             notify_thresholds: vec![50, 100],
             notify_on_reset: false,
+            notify_weekly: true,
+            notify_models: false,
             icon_style: IconStyle::MonoLight,
             check_updates: false,
             cli_refresh: false,

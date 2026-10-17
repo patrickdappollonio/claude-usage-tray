@@ -8,7 +8,7 @@
 
 **[Jump to installation &rarr;](#install)**
 
-The app can also notify you at the moments that matter: when you cross usage thresholds you choose, and when your quotas reset, both the 5-hour window and the weekly one. All of it is configurable from the tray menu itself.
+The app can also notify you at the moments that matter: when you cross usage thresholds you choose, on the 5-hour window, the weekly one and each per-model weekly limit, and when those quotas reset. All of it is configurable from the tray menu itself.
 
 There is no window and no dashboard to keep open. Just a small gauge that changes color as you get closer to the limit, and a menu when you want the details. Green means you have room, red means wrap it up.
 
@@ -179,7 +179,7 @@ If you run Claude Code with more than one config folder, whether through `CLAUDE
 Everything configurable lives in the `Settings` submenu. Changes apply immediately, no restart.
 
 - **Launch at login.** A checkbox. On Linux it writes a standard autostart entry, which KDE, GNOME, XFCE, LXQt, Cinnamon and MATE all honor. On macOS it writes a LaunchAgent pointing at whichever copy you ran it from, the one inside the app bundle included; note that macOS lists LaunchAgents under Login Items as "Allow in the Background" rather than "Open at Login", but it starts at login all the same.
-- **Notifications.** One checkbox per threshold (50%, 75%, 90%, 99%, 100%), plus one for when your quota resets. All on by default, all optional. You get one notification per crossing, the highest one only, and restarting the tray never counts as a crossing.
+- **Notifications.** One checkbox per threshold (50%, 75%, 90%, 99%, 100%). The thresholds always apply to the 5-hour window; **Alerts for weekly** applies them to the weekly window too, and **Alerts for custom models** to each per-model weekly limit. One more checkbox covers when your quota resets. All on by default, all optional. Each alert says how long until that window resets. You get one notification per crossing, the highest one only, and restarting the tray never counts as a crossing.
 - **Refresh interval.** How often the tray re-reads the numbers: 5, 15, 30 or 60 seconds.
 - **Icon style.** Color, or monochrome for panels where four colors are more noise than signal. Monochrome auto follows your desktop's light or dark preference and repaints live when you switch. There's also a manual dark and light option, named after your desktop rather than the icon, so pick the one matching your panel. In monochrome the arc length carries the signal instead of the color. Linux defaults to color; macOS defaults to monochrome, drawn as a template image the system tints to match either menu bar, since the colored gauge's dim ring gets lost against a dark menu bar.
 - **Check for updates.** On by default, and the only setting that permits a network request. When a newer version exists, one row appears in the menu; clicking it opens the release page in your browser. Nothing is ever downloaded or installed for you. Once you have installed the new version through your package manager, run `claude-usage-tray restart` to switch over to it. The tray notices the swap on its own too, and offers a **Restart to update** row in the menu that does the same thing in one click. Uncheck it and the checks stop.
