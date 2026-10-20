@@ -1,0 +1,1411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>See your Claude Code usage in your menu bar or system tray</title>
+<meta name="description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code 5-hour and weekly usage. No credentials, no cookies, no calls to Anthropic.">
+<meta name="author" content="Patrick D'appollonio">
+<meta name="theme-color" content="#43A047">
+<link rel="canonical" href="https://claude-usage-tray.app/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="claude-usage-tray">
+<meta property="og:url" content="https://claude-usage-tray.app/">
+<meta property="og:title" content="See your Claude Code usage in your menu bar or system tray">
+<meta property="og:description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code usage. Green means you have room, red means wrap it up.">
+<meta property="og:image" content="https://claude-usage-tray.app/social.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A large green usage gauge next to the words: See your Claude usage in your menu bar.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="See your Claude Code usage in your menu bar or system tray">
+<meta name="twitter:description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code usage. Green means you have room, red means wrap it up.">
+<meta name="twitter:image" content="https://claude-usage-tray.app/social.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "claude-usage-tray",
+  "description": "A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code 5-hour and weekly usage.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, macOS",
+  "url": "https://claude-usage-tray.app/",
+  "downloadUrl": "https://github.com/patrickdappollonio/claude-usage-tray/releases/latest",
+  "image": "https://claude-usage-tray.app/social.png",
+  "license": "https://opensource.org/licenses/MIT",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Person", "name": "Patrick D'appollonio", "url": "https://www.patrickdap.com" }
+}
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%231C1F21'/%3E%3Ccircle cx='50' cy='50' r='27' fill='none' stroke='%23555A5C' stroke-width='12'/%3E%3Cpath d='M50 23a27 27 0 0 1 25.7 35.3' fill='none' stroke='%23EEEEEE' stroke-width='12' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23EEEEEE'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Fragment+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --green: #43A047;
+    --yellow: #FFB300;
+    --orange: #EF6C00;
+    --red: #D32F2F;
+    --charcoal: #1C1F21;
+    --ring: #555A5C;
+    --paper: #EEEEEE;
+
+    --bg: var(--charcoal);
+    --fg: var(--paper);
+    --muted: #A3A8AA;
+    --rule: #33383B;
+    --code-bg: #262A2D;
+
+    /* The hero follows the gauge: these two change with the session band. */
+    --band: var(--green);
+    --on-band: var(--charcoal);
+
+    --sans: "Archivo", system-ui, sans-serif;
+    --mono: "Fragment Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --gutter: clamp(16px, 4vw, 56px);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: var(--paper);
+      --fg: var(--charcoal);
+      --muted: #555A5C;
+      --rule: #D2D5D6;
+      --code-bg: #E1E3E4;
+    }
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 1.0625rem;
+    line-height: 1.6;
+    font-variation-settings: "wdth" 100;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration-color: var(--band); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+  a:hover { text-decoration-thickness: 3px; }
+  :focus-visible { outline: 3px solid var(--band); outline-offset: 3px; border-radius: 4px; }
+  code, pre { font-family: var(--mono); font-size: 0.875em; }
+  p code, li code, dd code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+
+  /* ---------- Panel bar ---------- */
+  .panel {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    height: 34px;
+    padding: 0 var(--gutter);
+    background: var(--charcoal);
+    color: var(--paper);
+    font-size: 0.8125rem;
+    font-variation-settings: "wdth" 100;
+  }
+  .panel .name { font-weight: 600; margin-right: auto; text-decoration: none; }
+  .panel a { text-decoration: none; }
+  .panel a:hover { text-decoration: underline; }
+  .tray-icon {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .tray-icon:hover, .tray-icon[aria-expanded="true"] { background: rgba(255, 255, 255, 0.12); }
+  .tray-icon svg { width: 22px; height: 22px; display: block; }
+  .clock { font-variant-numeric: tabular-nums; opacity: 0.85; white-space: pre; }
+
+  /* ---------- Hero ---------- */
+  .hero {
+    position: relative;
+    background: var(--band);
+    color: var(--on-band);
+    transition: background-color 600ms ease, color 600ms ease;
+    padding: clamp(40px, 7vh, 88px) var(--gutter) clamp(48px, 8vh, 96px);
+    min-height: calc(100svh - 34px);
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    align-items: center;
+    gap: clamp(24px, 4vw, 72px);
+    overflow: hidden;
+  }
+  .hero > * { min-width: 0; }
+  .hero a { text-decoration-color: currentColor; }
+  .hero :focus-visible { outline-color: var(--on-band); }
+
+  .headline {
+    margin: 0 0 18px;
+    font-size: clamp(3.5rem, 10.5vw, 10rem);
+    line-height: 0.86;
+    font-weight: 850;
+    font-variation-settings: "wdth" 62;
+    letter-spacing: -0.01em;
+  }
+  .subhead {
+    margin: 0 0 24px;
+    font-size: clamp(1.375rem, 2.3vw, 2rem);
+    line-height: 1.15;
+    font-weight: 700;
+    font-variation-settings: "wdth" 80;
+  }
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .count { display: flex; align-items: center; gap: 8px; margin: 0 0 20px; font-size: 1rem; }
+  .count[hidden] { display: none; }
+  .count svg { flex: none; width: 26px; height: 26px; }
+  .count svg path { fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+  .count strong { display: inline-block; text-align: right; font-size: 1.5rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .lede code {
+    padding: 0.1em 0.35em;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--on-band) 14%, transparent);
+    color: inherit;
+    font-size: 0.85em;
+  }
+  .lede {
+    margin: 0 0 32px;
+    max-width: 32rem;
+    font-size: clamp(1.125rem, 1.6vw, 1.3125rem);
+    line-height: 1.45;
+  }
+
+  .hero-install { max-width: 44rem; }
+  .hero-install p { margin: 0 0 8px; font-size: 0.9375rem; }
+  .hero-links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: 16px; font-size: 0.9375rem; }
+
+  .cmd {
+    display: flex;
+    align-items: stretch;
+    border-radius: 10px;
+    background: var(--charcoal);
+    color: var(--paper);
+    overflow: hidden;
+  }
+  .cmd code {
+    flex: 1;
+    min-width: 0;
+    padding: 14px 16px;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    /* Long commands wrap instead of scrolling: a scrollbar would sit inside the
+       bottom padding wherever the OS draws one, and push the text off center. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  /* Fonts sit at slightly different heights on each platform. Trimming the
+     line to the capitals and the baseline lets the padding alone center the
+     command, everywhere text-box is supported. */
+  @supports (text-box: trim-both cap alphabetic) {
+    .cmd code { text-box: trim-both cap alphabetic; padding-top: 19.5px; padding-bottom: 19.5px; }
+  }
+  .cmd code::before { content: "$ "; opacity: 0.45; }
+  .cmd.multi code::before { content: none; }
+  .copy {
+    flex: none;
+    border: 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.1);
+    /* Wide enough for every label, so "Copied" doesn't resize the box. */
+    width: 5.75em;
+    padding: 0 8px;
+    text-align: center;
+    background: transparent;
+    color: inherit;
+    font: 600 0.8125rem var(--sans);
+    cursor: pointer;
+  }
+  .copy:hover { background: rgba(255, 255, 255, 0.08); }
+
+  .stage {
+    display: grid;
+    justify-items: center;
+    gap: 22px;
+  }
+  .gauge {
+    width: min(100%, 34rem, 56svh);
+    aspect-ratio: 1;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: grab;
+    overflow: visible;
+  }
+  .gauge:active { cursor: grabbing; }
+  .gauge:focus-visible { outline: none; }
+  .gauge .focus { stroke: var(--on-band); opacity: 0; }
+  .gauge:focus-visible .focus { opacity: 1; }
+  .gauge .ring { stroke: var(--on-band); opacity: 0.2; transition: stroke 600ms ease; }
+  .gauge .arc { stroke: var(--on-band); transition: stroke 600ms ease; }
+  .gauge .dot { stroke: var(--on-band); transition: fill 600ms ease, stroke 600ms ease; }
+
+  .controls {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 6px 14px;
+    width: min(100%, 26rem);
+    font-size: 0.9375rem;
+  }
+  .controls .hint { grid-column: 1 / -1; margin: 0 0 6px; text-align: center; opacity: 0.8; }
+  .controls output { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 3.2ch; text-align: right; }
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 28px;
+    margin: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+  input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--on-band) 30%, transparent); }
+  input[type="range"]::-moz-range-track { height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--on-band) 30%, transparent); }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 20px; height: 20px; margin-top: -8px;
+    border-radius: 50%;
+    background: var(--thumb);
+    border: 3px solid var(--on-band);
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--thumb);
+    border: 3px solid var(--on-band);
+  }
+
+  /* The worded summary the tray shows when you click its icon. */
+  .toast-wrap {
+    position: absolute;
+    top: 14px;
+    right: var(--gutter);
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .callout {
+    display: flex;
+    align-items: flex-start;
+    margin: 64px 0 0;
+    text-align: right;
+    font-size: 1.0625rem;
+    font-weight: 700;
+    line-height: 1.25;
+  }
+  .callout span { max-width: 8em; }
+  .callout small { display: block; font-size: 0.8125rem; font-weight: 400; opacity: 0.8; margin-top: 2px; }
+  .callout svg { flex: none; width: 80px; height: 50px; margin: -28px 0 0 6px; overflow: visible; }
+  .callout .down { display: none; }
+  .callout path { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+  .toast {
+    width: min(23rem, calc(100vw - 2 * var(--gutter)));
+    display: grid;
+    grid-template-columns: 36px 1fr;
+    gap: 2px 12px;
+    padding: 14px 16px;
+    border-radius: 14px;
+    background: #2A2E31;
+    color: var(--paper);
+    font-size: 0.875rem;
+    line-height: 1.45;
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28);
+    transform-origin: top right;
+  }
+  .toast[hidden] { display: none; }
+  .toast img { grid-row: span 2; width: 36px; height: 36px; }
+  .toast strong { font-weight: 650; }
+  .toast p { margin: 0; color: #D4D7D8; }
+  .toast.pop { animation: pop 260ms cubic-bezier(.2, .9, .3, 1.25); }
+  @keyframes pop { from { opacity: 0; transform: translateY(-8px) scale(0.96); } }
+
+  /* ---------- Reading sections ---------- */
+  main { padding: 0 var(--gutter); }
+  .section {
+    display: grid;
+    grid-template-columns: minmax(12rem, 18rem) minmax(0, 42rem);
+    gap: 24px clamp(24px, 5vw, 80px);
+    padding: clamp(56px, 9vw, 112px) 0;
+    border-top: 1px solid var(--rule);
+    max-width: 82rem;
+  }
+  .section:first-child { border-top: 0; }
+  .section h2 {
+    margin: 0;
+    font-size: clamp(2rem, 3.6vw, 3rem);
+    line-height: 0.95;
+    font-weight: 800;
+    font-variation-settings: "wdth" 68;
+  }
+  .section .body > :first-child { margin-top: 0; }
+  .section h3 { margin: 36px 0 10px; font-size: 1.1875rem; font-weight: 700; line-height: 1.3; }
+  .section p { margin: 0 0 16px; }
+  .muted { color: var(--muted); }
+
+  /* Data flow */
+  .flow {
+    list-style: none;
+    margin: 32px 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    position: relative;
+  }
+  .flow::before {
+    content: "";
+    position: absolute;
+    top: 9px;
+    left: 9px;
+    right: calc(25% - 9px);
+    height: 2px;
+    background: var(--fg);
+  }
+  .flow li { position: relative; padding: 32px 16px 0 0; font-size: 0.9375rem; line-height: 1.4; }
+  .flow li::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 2px solid var(--fg);
+  }
+  .flow li:last-child::before { background: var(--band); border-color: var(--band); transition: background-color 220ms ease, border-color 220ms ease; }
+  .flow strong { display: block; font-size: 1.0625rem; margin-bottom: 4px; }
+  .flow span { color: var(--muted); }
+  .never {
+    margin: 0 0 16px;
+    padding: 16px 18px;
+    border: 2px dashed var(--rule);
+    border-radius: 10px;
+  }
+  .never strong { display: block; margin-bottom: 2px; }
+
+  /* Legend */
+  .legend {
+    list-style: none;
+    margin: 28px 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    gap: 28px 24px;
+  }
+  .legend li { display: grid; grid-template-columns: 64px 1fr; gap: 14px; align-items: start; font-size: 0.9375rem; line-height: 1.45; }
+  .legend .tile {
+    width: 64px; height: 64px;
+    border-radius: 15px;
+    background: var(--charcoal);
+    display: grid;
+    place-items: center;
+  }
+  .legend .tile svg { width: 44px; height: 44px; }
+  .legend strong { display: block; }
+  .legend span { color: var(--muted); }
+
+  /* Install */
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 24px; }
+  .tab {
+    border: 2px solid var(--rule);
+    border-radius: 999px;
+    padding: 6px 16px;
+    background: transparent;
+    color: var(--fg);
+    font: 600 0.9375rem var(--sans);
+    cursor: pointer;
+  }
+  .tab:hover { border-color: var(--muted); }
+  .tab[aria-selected="true"] { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+  .tab .here { font-weight: 400; opacity: 0.7; }
+  button.link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    text-decoration: underline;
+    text-decoration-color: var(--band);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  .notice { padding: 12px 16px; border-left: 4px solid var(--band); background: var(--code-bg); border-radius: 0 8px 8px 0; }
+  .section .panel-body > * { margin-top: 0; margin-bottom: 0; }
+  .section .panel-body > * + * { margin-top: 16px; }
+  .section .panel-body > .cmd + *, .section .panel-body > .downloads + * { margin-top: 24px; }
+  .panel-body .cmd { background: var(--code-bg); color: var(--fg); }
+  .panel-body .copy { border-left-color: var(--rule); }
+  .panel-body .copy:hover { background: rgba(127, 127, 127, 0.12); }
+
+  .downloads { display: flex; flex-wrap: wrap; gap: 10px; }
+  .button {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 18px;
+    border-radius: 10px;
+    background: var(--fg);
+    color: var(--bg);
+    font-weight: 650;
+    text-decoration: none;
+  }
+  .button.secondary { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 2px var(--rule); }
+  .button:hover { text-decoration: none; filter: brightness(1.08); }
+  .button small { font-weight: 400; opacity: 0.75; }
+
+  .choice { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 0.9375rem; }
+  .choice label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .choice select {
+    font: inherit;
+    color: var(--fg);
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 4px 8px;
+  }
+
+  .steps { list-style: none; counter-reset: step; margin: 0; padding: 0; }
+  .steps li { counter-increment: step; position: relative; padding-left: 48px; margin-bottom: 24px; }
+  .steps li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: -2px;
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--fg);
+    color: var(--bg);
+    font-weight: 800;
+  }
+  .steps p { margin: 0 0 10px; }
+  .steps .cmd { background: var(--code-bg); color: var(--fg); }
+  .steps .copy { border-left-color: var(--rule); }
+
+  /* Settings: the real menus, drawn the way macOS shows them, each submenu
+     opening to the left of its parent and lined up with the row that opened it. */
+  .menus {
+    display: flex;
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    align-items: flex-start;
+    margin: 28px 0 0;
+    font: 13px/22px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: #EBEBF0;
+  }
+  .menu {
+    position: relative;
+    flex: none;
+    list-style: none;
+    margin: 0;
+    padding: 5px;
+    min-width: 190px;
+    border-radius: 9px;
+    background: #2C2C2E;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12) inset, 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+  .menu.main { z-index: 1; }
+  .menu.settings { z-index: 2; margin: 99px -6px 0 0; }
+  .menu.notifications { z-index: 3; margin: 132px -6px 0 0; }
+  .menu li { display: flex; align-items: center; gap: 4px; height: 22px; padding: 0 10px; border-radius: 5px; white-space: nowrap; }
+  .menu li.sep { height: 1px; margin: 5px 10px; padding: 0; border-radius: 0; background: rgba(255, 255, 255, 0.12); }
+  .menu li.info, .menu li.head { color: rgba(235, 235, 240, 0.45); }
+  .menu li.active { background: #0A64D8; color: #fff; }
+  .menu li.sub::after { content: "›"; margin-left: auto; padding-left: 24px; font-size: 16px; }
+  .menu .check { flex: none; width: 16px; }
+  .menu .check:not(.off)::before { content: "✓"; }
+  .section .fine-print { margin-top: 20px; font-size: 0.875rem; color: var(--muted); }
+  @media (max-width: 1199px) {
+    .menus { flex-direction: column; align-items: flex-start; gap: 0; }
+    .menus .menu { min-width: 0; max-width: 100%; }
+    /* Each submenu tucks 10px under its parent's bottom edge, into extra
+       padding added there, so the cascade overlaps without covering a row. */
+    .menu.main, .menu.settings { padding-bottom: 15px; }
+    .menu.settings { margin: -10px 0 0 20px; }
+    .menu.notifications { margin: -10px 0 0 40px; }
+  }
+
+  .faq details { border-bottom: 1px solid var(--rule); }
+  .faq details:first-child { border-top: 1px solid var(--rule); }
+  .faq summary {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 18px 0;
+    font-size: 1.1875rem;
+    font-weight: 700;
+    line-height: 1.35;
+    cursor: pointer;
+    list-style: none;
+  }
+  .faq summary::-webkit-details-marker { display: none; }
+  .faq summary::after {
+    content: "+";
+    flex: none;
+    font-weight: 400;
+    font-size: 1.5rem;
+    line-height: 1;
+    transition: transform 200ms ease;
+  }
+  .faq details[open] summary::after { transform: rotate(45deg); }
+  .faq details p { margin: 0 0 16px; }
+  .faq details p:last-child { margin-bottom: 22px; }
+  .features {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    gap: 28px 36px;
+  }
+  .features li { display: grid; gap: 4px; align-content: start; }
+  .features li > a, .features .title { font-weight: 700; font-size: 1.0625rem; }
+  .features li > span:last-child { color: var(--muted); }
+  .facts { margin: 0; }
+  .facts .mark { text-decoration: none; font-weight: 700; padding: 0 1px; }
+  /* Superscripts keep the line height of the text around them. */
+  .facts sup { font-size: 0.7em; line-height: 0; vertical-align: super; }
+  .facts .fine sup { line-height: 1.5; }
+  .facts .fine { display: grid; grid-template-columns: auto 1fr; gap: 0 6px; margin-top: 8px; font-size: 0.875rem; line-height: 1.5; color: var(--muted); }
+  .facts dt { font-weight: 700; margin-top: 20px; }
+  .facts dd { margin: 4px 0 0; }
+
+  footer {
+    padding: 40px var(--gutter) 56px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 28px;
+    font-size: 0.9375rem;
+    color: var(--muted);
+  }
+  footer .who { margin-right: auto; }
+
+  /* Narrower desktops: the headline reaches under the notification, so the hero
+     content starts below it and the callout gets the strip to itself. */
+  @media (min-width: 861px) and (max-width: 1299px) {
+    .hero { padding-top: 176px; align-items: start; }
+  }
+
+  /* ---------- Small screens ---------- */
+  @media (max-width: 860px) {
+    .hero { grid-template-columns: minmax(0, 1fr); min-height: 0; padding-top: 32px; }
+    .gauge { width: min(78vw, 22rem); }
+    .headline { margin-bottom: 14px; }
+    .toast-wrap { position: static; flex-direction: column; gap: 14px; }
+    .callout { margin: 0; text-align: left; }
+    .callout span { max-width: none; }
+    .callout .side { display: none; }
+    .callout .down { display: block; width: 40px; height: 40px; margin: 14px 0 -14px 8px; }
+    .toast { width: 100%; transform-origin: top center; }
+    .section { grid-template-columns: minmax(0, 1fr); }
+    .flow { grid-template-columns: 1fr; gap: 22px; }
+    .flow::before { top: 9px; bottom: 30px; left: 9px; right: auto; width: 2px; height: auto; }
+    .flow li { padding: 0 0 0 36px; }
+  }
+  @media (max-width: 480px) {
+    .panel .clock { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="panel">
+  <a class="name" href="./">claude-usage-tray</a>
+  <a href="https://github.com/patrickdappollonio/claude-usage-tray">GitHub</a>
+  <button class="tray-icon" id="trayIcon" type="button" aria-label="Show usage summary" aria-controls="toast" aria-expanded="true">
+    <svg viewBox="0 0 100 100" aria-hidden="true" id="trayGauge"></svg>
+  </button>
+  <span class="clock" id="clock"></span>
+</header>
+
+<section class="hero" aria-labelledby="headline">
+  <div class="copy-col">
+    <h1 class="headline" id="headline">Plenty of room.</h1>
+    <p class="subhead" id="subhead">Under half of your 5-hour session used.</p>
+    <p class="lede"><code>claude-usage-tray</code> is a small gauge in your macOS menu bar or Linux system tray that shows how much of your Claude usage is left. Drag the gauge or move its sliders to see how it changes.</p>
+    <p class="count" id="downloads" hidden></p>
+    <div class="hero-install">
+      <p id="heroLabel">Install on macOS with Homebrew:</p>
+      <div class="cmd"><code id="heroCmd">brew install --cask patrickdappollonio/tap/claude-usage-tray</code><button class="copy" type="button">Copy</button></div>
+      <div class="hero-links">
+        <a id="heroApp" href="https://github.com/patrickdappollonio/claude-usage-tray/releases/latest" hidden>Or download the macOS app</a>
+        <a href="#install">Other operating systems or architectures</a>
+        <a href="#privacy">How it works without risking a ban</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="stage">
+    <svg class="gauge" id="gauge" viewBox="0 0 100 100" role="slider" tabindex="0"
+         aria-label="5-hour session usage. Drag the ring or use the arrow keys."
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="32" aria-valuetext="32%">
+      <circle class="focus" cx="50" cy="50" r="45.5" fill="none" stroke-width="0.8" stroke-dasharray="1.5 1.5"/>
+      <circle class="ring" cx="50" cy="50" r="34" fill="none" stroke-width="16"/>
+      <path class="arc" id="arc" fill="none" stroke-width="16" stroke-linecap="round" d=""/>
+      <circle class="dot" id="dot" cx="50" cy="50" r="8.8" stroke-width="2.4" fill="var(--green)"/>
+    </svg>
+    <div class="controls">
+      <p class="hint">Drag the ring or move the sliders.</p>
+      <label for="sessionRange">5-hour session, the ring</label>
+      <input type="range" id="sessionRange" min="0" max="100" value="32" style="--thumb: var(--band)">
+      <output for="sessionRange" id="sessionOut">32%</output>
+      <label for="weekly">Weekly, the dot</label>
+      <input type="range" id="weekly" min="0" max="100" value="33" style="--thumb: var(--week, var(--green))">
+      <output for="weekly" id="weeklyOut">33%</output>
+    </div>
+  </div>
+
+  <div class="toast-wrap">
+    <p class="callout">
+      <span>This is what it looks like<small>Depending on your OS</small></span>
+      <svg class="side" viewBox="0 0 80 50" aria-hidden="true">
+        <path d="M4 42C24 46 50 40 70 16"/>
+        <path d="M59.8 20.2L70 16L67.8 26.8"/>
+      </svg>
+      <svg class="down" viewBox="0 0 40 40" aria-hidden="true">
+        <path d="M4 10C20 8 30 18 30 36"/>
+        <path d="M24 30L30 37L36 30"/>
+      </svg>
+    </p>
+    <div class="toast pop" id="toast" role="status">
+      <img src="icon.png" alt="">
+      <strong>Claude Usage Tray</strong>
+      <p id="summary">You've used 32% of your 5-hour session (resets in 3 h) and 33% of your weekly limit (resets in 2 d).</p>
+    </div>
+  </div>
+</section>
+
+<main>
+  <section class="section" id="features" aria-labelledby="features-h">
+    <h2 id="features-h">Features</h2>
+    <div class="body">
+      <ul class="features">
+        <li><a href="#reading">Your usage at a glance</a><span>The ring is your 5-hour session and the dot is your week. Green, yellow, orange and red tell you how close you are.</span></li>
+        <li><a href="#settings">Color or monochrome</a><span>Use the colored gauge, or a monochrome one that matches a light or dark panel, picked automatically or by hand.</span></li>
+        <li><span class="title"><a href="#linux">Linux</a> and <a href="#macos">macOS</a></span><span>Developed on Linux and tested on GNOME and KDE Plasma, with a signed and notarized Mac app. Builds for Intel/AMD and ARM.</span></li>
+        <li><a href="#settings">Alerts before you hit a limit</a><span>Notifications at 50, 75, 90, 99 and 100% for the session, the week and each model, plus one when your quota resets.</span></li>
+        <li><a href="#why">Light and self-contained</a><span>A download of about 2 MB that uses about 4 MB of memory on Linux, with nothing else to install.</span></li>
+        <li><a href="#privacy">Never touches your login</a><span>It reads what Claude Code already writes on your machine. No credentials, no cookies, no API calls of its own.</span></li>
+        <li><a href="#settings">Per-model limits</a><span>Models with their own weekly limit get their own row in the menu, with their own reset time.</span></li>
+        <li><a href="#settings">Every Claude Code profile</a><span>Run Claude Code with more than one config folder? Each one gets its own section, and you pick which one the icon follows.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="why" aria-labelledby="why-h">
+    <h2 id="why-h">Small, standalone and safe</h2>
+    <div class="body">
+      <dl class="facts">
+        <dt>Light to download and to run</dt>
+        <dd>Downloads are 1.4 to 2.2 MB. Measured on the author's own machines, the running tray uses about 4 MB of memory on Linux and about 22 MB<a class="mark" href="#macos-memory" aria-describedby="macos-memory"><sup>1</sup></a> on macOS. CPU barely registers: 67 seconds of CPU time in almost three days on a Linux desktop, and 21 seconds in four and a half hours on an M4 Pro Mac.
+          <small class="fine" id="macos-memory"><sup aria-hidden="true">1</sup><span>Why macOS uses more: a menu bar item has to go through AppKit, Apple's app framework, which sets aside memory in every app that uses it. On Linux the tray talks to your desktop's tray directly, with no framework at all. The macOS figure is the one Activity Monitor shows as Memory.</span></small></dd>
+        <dt>Nothing else to install</dt>
+        <dd>The Linux builds are single static binaries, and the macOS app carries everything it needs. No runtime, no browser extension, no background service. The only requirement is Claude Code itself, version 2.1.80 or newer.</dd>
+        <dt>Safe for your account</dt>
+        <dd>Some usage trackers pretend to be the Claude CLI and call Anthropic's API with your credentials, which <a href="https://www.theregister.com/2026/02/20/anthropic_clarifies_ban_third_party_claude_access/" rel="nofollow noreferrer">Anthropic disallows</a> and which can get an account banned. This one never reads your credentials and never calls Anthropic's API. It reads the numbers Claude Code already writes on your machine.</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="section" id="privacy" aria-labelledby="privacy-h">
+    <h2 id="privacy-h">It never talks to Anthropic</h2>
+    <div class="body">
+      <p>The tray never reads your Claude credentials, never touches your OAuth tokens, and never contacts Anthropic or claude.ai. There is no account to create and nothing to log into.</p>
+      <p>Claude Code already works out your usage and hands it to your statusline. One command adds the tray to that handoff:</p>
+      <ol class="flow">
+        <li><strong>Claude Code</strong><span>works out your usage while you use it</span></li>
+        <li><strong>Your statusline</strong><span>keeps printing what it always did</span></li>
+        <li><strong>A file on your machine</strong><span>where the hook copies the numbers</span></li>
+        <li><strong>The tray</strong><span>reads that file, and that's all</span></li>
+      </ol>
+      <div class="never">
+        <strong>The one network request it can make</strong>
+        An optional check for new versions, once a day, against GitHub releases. It sends only the program name and version. Turn off <em>Check for updates</em> and the tray makes no network requests at all.
+      </div>
+      <p>One setting involves Claude itself: <em>Refresh usage via Claude CLI</em> runs the official <code>claude</code> command, at most once an hour, so it fetches your latest numbers with your normal login. It's on by default, and turning it off leaves the tray fully passive. <a href="#faq">More in the questions below.</a></p>
+      <p class="muted">Other tools pretend to be the Claude CLI to fetch these numbers, which can get an account banned. This one only reads what Claude Code already wrote to your statusline.</p>
+    </div>
+  </section>
+
+  <section class="section" id="reading" aria-labelledby="reading-h">
+    <h2 id="reading-h">Reading the icon</h2>
+    <div class="body">
+      <p>The outer arc is your 5-hour session, sweeping clockwise as you use it. The dot in the middle is your weekly usage. Both turn yellow at 50%, orange at 75% and red at 90%, the same points where the tray can notify you.</p>
+      <ul class="legend" id="legend"></ul>
+      <p class="muted" style="margin-top:28px">Prefer a quieter panel? Switch to monochrome, and the length of the arc carries the reading on its own.</p>
+    </div>
+  </section>
+
+  <section class="section" id="linux" aria-labelledby="linux-h">
+    <h2 id="linux-h">Made on Linux first</h2>
+    <div class="body">
+      <p>claude-usage-tray is developed on Linux and tested on GNOME and KDE Plasma. The macOS menu bar version came later. The Linux builds are single static binaries with no dependencies, packaged for Debian, Fedora, Arch and Alpine.</p>
+      <dl class="facts">
+        <dt>KDE Plasma</dt>
+        <dd>Tested. Works out of the box.</dd>
+        <dt>GNOME</dt>
+        <dd>Tested. Needs the <a href="https://extensions.gnome.org/extension/615/appindicator-support/">AppIndicator and KStatusNotifierItem Support</a> extension, because GNOME has no tray of its own. If it's missing, the tray tells you instead of running invisibly.</dd>
+        <dt>XFCE 4.16 and newer, LXQt, Cinnamon, MATE</dt>
+        <dd>Work out of the box through the standard freedesktop tray.</dd>
+      </dl>
+      <p style="margin-top:24px">Notifications go through your desktop's own notification service, and Launch at login writes a standard autostart entry.</p>
+    </div>
+  </section>
+
+  <section class="section" id="macos" aria-labelledby="macos-h">
+    <h2 id="macos-h">Signed and notarized for macOS</h2>
+    <div class="body">
+      <p>Every macOS build is signed with an Apple Developer ID and notarized by Apple. It opens on the first try: no "unidentified developer" warning, no trip to Privacy &amp; Security to allow it, and no <code>xattr</code> command to run. Builds come for Apple silicon and Intel.</p>
+      <dl class="facts">
+        <dt>A real app, in the menu bar only</dt>
+        <dd>Homebrew installs it into Applications. There's no Dock icon and no window, just the gauge in your menu bar.</dd>
+        <dt>Notifications in Notification Center</dt>
+        <dd>The first time it has something to tell you, macOS asks once for permission. After that you can tune or silence it in System Settings like any other app.</dd>
+        <dt>Matches your menu bar</dt>
+        <dd>The icon is monochrome by default and tinted by macOS to match a light or dark menu bar. You can switch to the colored gauge in Settings.</dd>
+        <dt>Launch at login</dt>
+        <dd>macOS lists it under Login Items as "Allow in the Background", and it starts at login all the same.</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="section" id="install" aria-labelledby="install-h">
+    <h2 id="install-h">Install</h2>
+    <div class="body">
+      <p>Runs on macOS and on Linux, on both Intel/AMD and ARM. The Linux builds have no dependencies, and the macOS builds are signed and notarized by Apple, so they open without warnings.</p>
+      <p class="notice" id="osNotice" hidden></p>
+
+      <div class="tabs" role="tablist" aria-label="Platform">
+        <button class="tab" role="tab" id="tab-mac" aria-controls="panel-mac" aria-selected="true" type="button">macOS</button>
+        <button class="tab" role="tab" id="tab-linux" aria-controls="panel-linux" aria-selected="false" tabindex="-1" type="button">Linux</button>
+        <button class="tab" role="tab" id="tab-npm" aria-controls="panel-npm" aria-selected="false" tabindex="-1" type="button">npm</button>
+      </div>
+
+      <div class="panel-body" role="tabpanel" id="panel-mac" aria-labelledby="tab-mac">
+        <p>Homebrew installs the full app into Applications and puts the <code>claude-usage-tray</code> command on your path:</p>
+        <div class="cmd"><code>brew install --cask patrickdappollonio/tap/claude-usage-tray</code><button class="copy" type="button">Copy</button></div>
+        <p>Or download the app and drag it into Applications:</p>
+        <div class="downloads">
+          <a class="button" id="dl-mac-arm" href="https://github.com/patrickdappollonio/claude-usage-tray/releases/latest">Download for Apple silicon</a>
+          <a class="button secondary" id="dl-mac-intel" href="https://github.com/patrickdappollonio/claude-usage-tray/releases/latest">Intel Mac</a>
+        </div>
+        <p class="muted">Get the app, through Homebrew or the download, if you want notifications. macOS only shows them for a real app. The bare binary from npm or a tarball runs the same tray, but its notifications often don't appear.</p>
+      </div>
+
+      <div class="panel-body" role="tabpanel" id="panel-linux" aria-labelledby="tab-linux" hidden>
+        <p>With Homebrew:</p>
+        <div class="cmd"><code>brew install patrickdappollonio/tap/claude-usage-tray</code><button class="copy" type="button">Copy</button></div>
+        <p>Or with your system's package manager:</p>
+        <div class="choice">
+          <label>Package
+            <select id="pkg">
+              <option value="deb">Debian, Ubuntu</option>
+              <option value="rpm">Fedora, RHEL, openSUSE</option>
+              <option value="arch">Arch Linux</option>
+              <option value="apk">Alpine</option>
+              <option value="tar">Plain tarball</option>
+            </select>
+          </label>
+          <label>Architecture
+            <select id="arch">
+              <option value="amd64">x86_64</option>
+              <option value="arm64">arm64</option>
+            </select>
+          </label>
+        </div>
+        <div class="cmd multi"><code id="pkgCmd"></code><button class="copy" type="button">Copy</button></div>
+        <p class="muted">GNOME needs the <a href="https://extensions.gnome.org/extension/615/appindicator-support/">AppIndicator and KStatusNotifierItem Support</a> extension to show tray icons. KDE Plasma, XFCE, LXQt, Cinnamon and MATE work as they are.</p>
+      </div>
+
+      <div class="panel-body" role="tabpanel" id="panel-npm" aria-labelledby="tab-npm" hidden>
+        <p class="notice">On a Mac, install the app instead. The npm package installs a bare binary rather than the signed and notarized macOS app, so notifications show without the app's icon and some background features may not work. <button class="link" type="button" data-tab="mac">Show the macOS install</button></p>
+        <p>The npm package carries the same binaries for macOS and Linux:</p>
+        <div class="cmd"><code>npm install -g @patrickdappollonio/claude-usage-tray</code><button class="copy" type="button">Copy</button></div>
+        <p>To try it once without installing:</p>
+        <div class="cmd"><code>npx -y @patrickdappollonio/claude-usage-tray</code><button class="copy" type="button">Copy</button></div>
+      </div>
+
+      <h3>Then turn it on</h3>
+      <ol class="steps">
+        <li>
+          <p>Let Claude Code share its usage numbers. If you already have a statusline, it keeps working exactly as before, and your settings are backed up first.</p>
+          <div class="cmd"><code>claude-usage-tray hook install</code><button class="copy" type="button">Copy</button></div>
+        </li>
+        <li>
+          <p>Start the tray. It hands your terminal straight back and keeps running after you close it.</p>
+          <div class="cmd"><code>claude-usage-tray</code><button class="copy" type="button">Copy</button></div>
+        </li>
+        <li>
+          <p>Start a Claude Code session. The numbers show up as soon as you send a prompt.</p>
+        </li>
+      </ol>
+      <p class="muted">Changed your mind? <code>claude-usage-tray hook uninstall</code> puts your settings back exactly as they were.</p>
+    </div>
+  </section>
+
+  <section class="section" id="settings" aria-labelledby="settings-h">
+    <h2 id="settings-h">Settings live in the menu</h2>
+    <div class="body">
+      <p>There's no window to open. Your numbers sit at the top of the menu, and everything you can change is under Settings. Changes apply right away.</p>
+      <div class="menus">
+        <ul class="menu main" aria-label="Tray menu">
+          <li class="info"><span>Session: 19% · resets in 1 h</span></li>
+          <li class="info"><span>Weekly: 67% · resets in 3 d</span></li>
+          <li class="info"><span>Fable weekly: 6% · resets in 3 d · as of 8 h ago</span></li>
+          <li class="info"><span>Updated by Claude Code CLI 2 min ago</span></li>
+          <li class="sep" role="separator"></li>
+          <li class="sub active"><span>Settings</span></li>
+          <li><span>Check for new data</span></li>
+          <li><span>Quit</span></li>
+        </ul>
+        <ul class="menu settings" aria-label="Settings">
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>Launch at login</span></li>
+          <li class="sep" role="separator"></li>
+          <li class="sub active"><span class="check off"></span><span>Notifications</span></li>
+          <li class="sep" role="separator"></li>
+          <li class="head"><span class="check off"></span><span>Refresh interval</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>5 s</span></li>
+          <li><span class="check off"></span><span>15 s</span></li>
+          <li><span class="check off"></span><span>30 s</span></li>
+          <li><span class="check off"></span><span>60 s</span></li>
+          <li class="sep" role="separator"></li>
+          <li class="head"><span class="check off"></span><span>Icon style</span></li>
+          <li><span class="check off"></span><span>Color</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>Monochrome (auto)</span></li>
+          <li><span class="check off"></span><span>Monochrome dark</span></li>
+          <li><span class="check off"></span><span>Monochrome light</span></li>
+          <li class="sep" role="separator"></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>Check for updates</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>Refresh usage via Claude CLI</span></li>
+        </ul>
+        <ul class="menu notifications" aria-label="Notifications">
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>At 50%</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>At 75%</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>At 90%</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>At 99%</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>At 100%</span></li>
+          <li class="sep" role="separator"></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>Alerts for weekly</span></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>Alerts for custom models</span></li>
+          <li class="sep" role="separator"></li>
+          <li><span class="check"><span class="visually-hidden">On:</span></span><span>When quota resets</span></li>
+        </ul>
+      </div>
+      <p class="fine-print">Shown on macOS. On Linux, the menu follows your desktop's style.</p>
+      <p>Use more than one Claude Code profile, like <code>~/.claude-work</code>? The tray finds them all and gives each its own section in the menu. You choose which one the icon follows.</p>
+    </div>
+  </section>
+
+  <section class="section" id="faq" aria-labelledby="faq-h">
+    <h2 id="faq-h">Questions</h2>
+    <div class="body faq">
+      <details>
+        <summary>Why do I see a question mark inside the icon?</summary>
+        <p>Claude Code hasn't reported new numbers in the last 10 minutes, usually because no Claude Code session is running. The tray keeps showing the last reading, the reset countdowns stay accurate, and the session drops back to 0% when its 5-hour window rolls over. The question mark goes away the next time Claude Code reports, which happens as soon as you send a prompt.</p>
+      </details>
+      <details>
+        <summary>"Check for new data" seems to do nothing</summary>
+        <p>It re-reads the numbers Claude Code last wrote and tells you whether anything changed, and how long ago Claude Code last reported. It can't make Claude Code report sooner, because Claude Code only reports while a session is running. Send a prompt in any Claude Code session, then check again.</p>
+      </details>
+      <details>
+        <summary>What does "Refresh usage via Claude CLI" do?</summary>
+        <p>Some numbers, like the per-model weekly limits, only update when Claude Code fetches them itself, for example when you open <code>/usage</code>. Left alone, they can go hours without updating. With this setting on, the tray runs <code>claude -p "/usage"</code> in the background at most once an hour: the official Claude CLI, with your normal login, and it doesn't count against your usage.</p>
+        <p>It's on by default. Turn it off in Settings if you'd rather the tray never start Claude for you; everything else keeps working, and the per-model rows update whenever you open <code>/usage</code> yourself.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="section" id="limits" aria-labelledby="limits-h">
+    <h2 id="limits-h">Before you install</h2>
+    <div class="body">
+      <dl class="facts">
+        <dt>You need Claude Code 2.1.80 or newer</dt>
+        <dd>That's the first version that includes usage in the statusline data.</dd>
+        <dt>You need a Pro or Max subscription</dt>
+        <dd>Billing through an API key doesn't report usage numbers, so there's nothing to show.</dd>
+        <dt>Numbers only move while Claude Code is running</dt>
+        <dd>That's when Claude Code reports them. In between, the icon shows a question mark and keeps the last reading. Reset countdowns stay accurate, and the session drops back to 0% when its window rolls over.</dd>
+      </dl>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span class="who">MIT licensed. Made by <a href="https://www.patrickdap.com">Patrick D'appollonio</a>.</span>
+  <a href="https://github.com/patrickdappollonio/claude-usage-tray">Source on GitHub</a>
+  <a href="https://github.com/patrickdappollonio/claude-usage-tray/releases/latest" id="releaseLink">Latest release</a>
+  <a href="https://github.com/patrickdappollonio/claude-usage-tray/issues">Report a problem</a>
+</footer>
+
+<!-- Filled in by scripts/build-website.mjs when the site is published. -->
+<script type="application/json" id="release-data">{"version": null, "downloads": null, "github": null, "npm": null}</script>
+<script>
+(function () {
+  "use strict";
+
+  var REPO = "patrickdappollonio/claude-usage-tray";
+  var RELEASES = "https://github.com/" + REPO + "/releases/latest";
+  var COLORS = { green: "#43A047", yellow: "#FFB300", orange: "#EF6C00", red: "#D32F2F" };
+  var HEADLINES = { green: "Plenty of room.", yellow: "Past halfway.", orange: "Start wrapping up.", red: "Wrap it up." };
+  var SUBHEADS = {
+    green: "Under half of your 5-hour session used.",
+    yellow: "Over half of your 5-hour session used.",
+    orange: "Three quarters of your 5-hour session used.",
+    red: "Your 5-hour session is nearly used up."
+  };
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Same boundaries as band_color() in src/icon.rs.
+  function band(p) {
+    if (p < 50) return "green";
+    if (p < 75) return "yellow";
+    if (p < 90) return "orange";
+    return "red";
+  }
+
+  // ---------- Gauge drawing, matching the tray's geometry ----------
+  // Stroke is 16% of the edge, radius is half the edge minus the stroke,
+  // the weekly dot is 0.55 strokes wide, the "?" is 44% of the edge tall.
+  var QUESTION =
+    '<path d="M44.06 47.84A9.24 9.24 0 1 1 56.53 47.29L50 57.04" fill="none" stroke="#999" stroke-width="6.6" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '<circle cx="50" cy="68.04" r="3.96" fill="#999"/>';
+
+  // A clockwise arc from the top covering `p` percent of the circle.
+  function arcD(p) {
+    if (p <= 0) return "";
+    if (p >= 99.99) return "M50 16A34 34 0 1 1 50 84A34 34 0 1 1 50 16";
+    var t = p / 100 * 2 * Math.PI;
+    var x = (50 + 34 * Math.sin(t)).toFixed(3);
+    var y = (50 - 34 * Math.cos(t)).toFixed(3);
+    return "M50 16A34 34 0 " + (p > 50 ? 1 : 0) + " 1 " + x + " " + y;
+  }
+
+  function iconSVG(state) {
+    var ring = '<circle cx="50" cy="50" r="34" fill="none" stroke="#808080" stroke-opacity=".27" stroke-width="16"/>';
+    if (state.missing) {
+      return '<circle cx="50" cy="50" r="34" fill="none" stroke="#808080" stroke-opacity=".86" stroke-width="16"/>' +
+        '<circle cx="50" cy="50" r="9.6" fill="#808080" fill-opacity=".86"/>';
+    }
+    var arc = state.session > 0
+      ? '<path d="' + arcD(state.session) + '" fill="none" stroke="' + COLORS[band(state.session)] +
+        '" stroke-width="16" stroke-linecap="round"/>'
+      : "";
+    var center = state.stale ? QUESTION
+      : '<circle cx="50" cy="50" r="8.8" fill="' + COLORS[band(state.weekly)] + '"/>';
+    return ring + arc + center;
+  }
+
+  // ---------- Hero ----------
+  var root = document.documentElement;
+  var gauge = document.getElementById("gauge");
+  var arc = document.getElementById("arc");
+  var dot = document.getElementById("dot");
+  var headline = document.getElementById("headline");
+  var summary = document.getElementById("summary");
+  var subhead = document.getElementById("subhead");
+  var sessionInput = document.getElementById("sessionRange");
+  var sessionOut = document.getElementById("sessionOut");
+  var weeklyInput = document.getElementById("weekly");
+  var weeklyOut = document.getElementById("weeklyOut");
+  var trayGauge = document.getElementById("trayGauge");
+  var themeColor = document.querySelector('meta[name="theme-color"]');
+
+  var session = 32;
+  var weekly = 33;
+  var shownBand = null;
+
+  function render() {
+    var s = Math.round(session);
+    var b = band(s);
+    var wb = band(weekly);
+
+    arc.setAttribute("d", arcD(s));
+    dot.setAttribute("fill", COLORS[wb]);
+    root.style.setProperty("--week", COLORS[wb]);
+
+    if (b !== shownBand) {
+      shownBand = b;
+      root.style.setProperty("--band", COLORS[b]);
+      // Dark ink fails contrast on red, so the hero flips to light text there.
+      root.style.setProperty("--on-band", b === "red" ? "#EEEEEE" : "#1C1F21");
+      swapText(headline, HEADLINES[b], 0);
+      swapText(subhead, SUBHEADS[b], 60);
+      themeColor.setAttribute("content", COLORS[b]);
+    }
+
+    gauge.setAttribute("aria-valuenow", s);
+    gauge.setAttribute("aria-valuetext", s + "%");
+    sessionInput.value = s;
+    sessionOut.textContent = s + "%";
+    weeklyInput.value = weekly;
+    weeklyOut.textContent = weekly + "%";
+    summary.textContent = "You've used " + s + "% of your 5-hour session (resets in 3 h) and " +
+      weekly + "% of your weekly limit (resets in 2 d).";
+    trayGauge.innerHTML = iconSVG({ session: s, weekly: weekly });
+  }
+
+  // New wording slides up into place when the band changes. The first render
+  // has nothing to replace, so it just sets the text.
+  function swapText(el, text, delay) {
+    if (el.textContent === text) return;
+    el.textContent = text;
+    if (reduceMotion || !el.animate) return;
+    el.animate([
+      { opacity: 0, transform: "translateY(0.35em)" },
+      { opacity: 1, transform: "none" }
+    ], { duration: 380, delay: delay, easing: "cubic-bezier(.2, .8, .2, 1)", fill: "backwards" });
+  }
+
+  function percentAt(evt) {
+    var r = gauge.getBoundingClientRect();
+    var dx = evt.clientX - (r.left + r.width / 2);
+    var dy = evt.clientY - (r.top + r.height / 2);
+    var deg = Math.atan2(dx, -dy) * 180 / Math.PI; // 0 at the top, clockwise
+    if (deg < 0) deg += 360;
+    return deg / 3.6;
+  }
+
+  var dragging = false;
+  gauge.addEventListener("pointerdown", function (evt) {
+    evt.preventDefault();
+    stopIntro();
+    dragging = true;
+    gauge.setPointerCapture(evt.pointerId);
+    session = percentAt(evt);
+    render();
+  });
+  gauge.addEventListener("pointermove", function (evt) {
+    if (!dragging) return;
+    var next = percentAt(evt);
+    // Don't wrap from full to empty (or back) when the pointer crosses the top.
+    if (session > 75 && next < 25) next = 100;
+    else if (session < 25 && next > 75) next = 0;
+    session = next;
+    render();
+  });
+  ["pointerup", "pointercancel"].forEach(function (type) {
+    gauge.addEventListener(type, function () { dragging = false; });
+  });
+  gauge.addEventListener("keydown", function (evt) {
+    var step = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1, PageUp: 10, PageDown: -10 }[evt.key];
+    if (evt.key === "Home") session = 0;
+    else if (evt.key === "End") session = 100;
+    else if (step) session = Math.min(100, Math.max(0, Math.round(session) + step));
+    else return;
+    evt.preventDefault();
+    stopIntro();
+    render();
+  });
+  sessionInput.addEventListener("input", function () {
+    stopIntro();
+    session = Number(sessionInput.value);
+    render();
+  });
+  weeklyInput.addEventListener("input", function () {
+    weekly = Number(weeklyInput.value);
+    render();
+  });
+
+  // The tray icon in the panel bar shows the summary, like a left-click on Linux.
+  var toast = document.getElementById("toast");
+  var trayIcon = document.getElementById("trayIcon");
+  trayIcon.addEventListener("click", function () {
+    toast.hidden = false;
+    toast.classList.remove("pop");
+    void toast.offsetWidth;
+    toast.classList.add("pop");
+    trayIcon.setAttribute("aria-expanded", "true");
+  });
+
+  // Opening sweep: the arc grows to its reading once. It stays below 50% so the
+  // hero never changes color on its own; only a visitor's drag does that.
+  var introFrame = null;
+  function stopIntro() {
+    if (introFrame !== null) cancelAnimationFrame(introFrame);
+    introFrame = null;
+  }
+  function intro() {
+    var duration = 1400, target = 32, start = null;
+    function frame(t) {
+      if (start === null) start = t;
+      var e = t - start;
+      if (e < duration) {
+        session = target * (1 - Math.pow(1 - e / duration, 3));
+      } else {
+        session = target;
+        render();
+        introFrame = null;
+        return;
+      }
+      render();
+      introFrame = requestAnimationFrame(frame);
+    }
+    introFrame = requestAnimationFrame(frame);
+  }
+
+  // ---------- Panel clock ----------
+  var clock = document.getElementById("clock");
+  function tick() {
+    // "Tue Oct 20  12:34 AM", like a desktop panel clock.
+    var now = new Date();
+    var date = now.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }).replace(/,/g, "");
+    var time = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    clock.textContent = date + "  " + time;
+  }
+  tick();
+  setInterval(tick, 15000);
+
+  // ---------- Legend ----------
+  var LEGEND = [
+    { session: 22, weekly: 30, title: "Plenty left", text: "Both the session and the week are under half." },
+    { session: 62, weekly: 40, title: "Past halfway", text: "The session turned yellow. The week is still fine." },
+    { session: 82, weekly: 58, title: "Getting close", text: "Orange arc, and the week is past halfway too." },
+    { session: 96, weekly: 91, title: "Wrap it up", text: "Both are nearly out. Time to pause." },
+    { session: 45, weekly: 0, stale: true, title: "Not updated lately", text: "You're seeing the last reading. It refreshes when Claude Code runs." },
+    { missing: true, title: "No data yet", text: "Usually the hook isn't installed. The menu offers to install it." }
+  ];
+  document.getElementById("legend").innerHTML = LEGEND.map(function (item) {
+    return '<li><span class="tile"><svg viewBox="0 0 100 100" aria-hidden="true">' + iconSVG(item) +
+      '</svg></span><span><strong>' + item.title + "</strong><span>" + item.text + "</span></span></li>";
+  }).join("");
+
+  // ---------- Install: OS detection, tabs, release links ----------
+  function detectOS() {
+    var ua = navigator.userAgent;
+    var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+    if (/iPhone|iPad|iPod/.test(ua)) return "ios";
+    if (/Android/i.test(ua)) return "android";
+    if (/mac/i.test(platform) || /Mac OS X/.test(ua)) return "mac";
+    if (/win/i.test(platform) || /Windows/.test(ua)) return "windows";
+    if (/linux|x11|cros/i.test(platform + " " + ua)) return "linux";
+    return "other";
+  }
+  var os = detectOS();
+  var archSelect = document.getElementById("arch");
+  var pkgSelect = document.getElementById("pkg");
+  // Opened straight from the folder, both values stay null: the download links
+  // fall back to the releases page and the count stays hidden.
+  var release = JSON.parse(document.getElementById("release-data").textContent);
+  var version = release.version;
+
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+  function selectTab(name, focus) {
+    tabs.forEach(function (tab) {
+      var on = tab.id === "tab-" + name;
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+      tab.tabIndex = on ? 0 : -1;
+      document.getElementById(tab.getAttribute("aria-controls")).hidden = !on;
+      if (on && focus) tab.focus();
+    });
+  }
+  document.querySelectorAll("[data-tab]").forEach(function (btn) {
+    btn.addEventListener("click", function () { selectTab(btn.getAttribute("data-tab"), true); });
+  });
+  tabs.forEach(function (tab, i) {
+    tab.addEventListener("click", function () { selectTab(tab.id.slice(4)); });
+    tab.addEventListener("keydown", function (evt) {
+      var d = evt.key === "ArrowRight" ? 1 : evt.key === "ArrowLeft" ? -1 : 0;
+      if (!d) return;
+      evt.preventDefault();
+      selectTab(tabs[(i + d + tabs.length) % tabs.length].id.slice(4), true);
+    });
+  });
+
+  var heroLabel = document.getElementById("heroLabel");
+  var heroCmd = document.getElementById("heroCmd");
+  var notice = document.getElementById("osNotice");
+  if (os === "linux") {
+    selectTab("linux");
+    heroLabel.textContent = "Install on Linux with Homebrew:";
+    heroCmd.textContent = "brew install patrickdappollonio/tap/claude-usage-tray";
+    document.getElementById("tab-linux").insertAdjacentHTML("beforeend", ' <span class="here">your system</span>');
+  } else {
+    selectTab("mac");
+    if (os === "mac") {
+      document.getElementById("heroApp").hidden = false;
+      document.getElementById("tab-mac").insertAdjacentHTML("beforeend", ' <span class="here">your system</span>');
+    } else {
+      var where = { windows: "Windows", ios: "an iPhone or iPad", android: "Android" }[os];
+      notice.textContent = (where ? "You're on " + where + ". " : "") +
+        "claude-usage-tray runs on macOS and Linux, so here are the commands for when you're at one of those.";
+      notice.hidden = false;
+    }
+  }
+
+  // Chromium can tell us the CPU; Safari can't, and most Macs sold today are Apple silicon.
+  if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+    navigator.userAgentData.getHighEntropyValues(["architecture"]).then(function (v) {
+      if (v.architecture === "arm") archSelect.value = "arm64";
+      if (os === "mac" && v.architecture === "x86") {
+        macIntel = true;
+        renderMacDownloads();
+      }
+      renderPkg();
+    }).catch(function () {});
+  } else if (/aarch64|arm64/i.test(navigator.userAgent)) {
+    archSelect.value = "arm64";
+  }
+
+  var macIntel = false;
+  function renderMacDownloads() {
+    var arm = document.getElementById("dl-mac-arm");
+    var intel = document.getElementById("dl-mac-intel");
+    var tag = version ? " <small>v" + version + "</small>" : "";
+    if (version) {
+      arm.href = url(asset("darwin_arm64_app.zip"));
+      intel.href = url(asset("darwin_amd64_app.zip"));
+    }
+    arm.innerHTML = (macIntel ? "Apple silicon" : "Download for Apple silicon") + tag;
+    intel.innerHTML = (macIntel ? "Download for Intel Mac" : "Intel Mac") + tag;
+    arm.classList.toggle("secondary", macIntel);
+    intel.classList.toggle("secondary", !macIntel);
+    if (macIntel) intel.parentNode.insertBefore(intel, arm);
+    document.getElementById("heroApp").href = macIntel ? intel.href : arm.href;
+  }
+
+  function asset(suffix) {
+    return "claude-usage-tray_" + (version || "<version>") + "_" + suffix;
+  }
+  function url(name) {
+    return "https://github.com/" + REPO + "/releases/latest/download/" + name;
+  }
+
+  function renderPkg() {
+    var a = archSelect.value;
+    var lines;
+    switch (pkgSelect.value) {
+      case "deb":
+        var deb = asset("linux_" + a + ".deb");
+        lines = ["curl -LO " + url(deb), "sudo dpkg -i " + deb];
+        break;
+      case "rpm":
+        var rpm = asset("linux_" + a + ".rpm");
+        lines = ["curl -LO " + url(rpm), "sudo dnf install ./" + rpm];
+        break;
+      case "arch":
+        var zst = asset("linux_" + a + ".pkg.tar.zst");
+        lines = ["curl -LO " + url(zst), "sudo pacman -U " + zst];
+        break;
+      case "apk":
+        var apk = asset("linux_" + a + ".apk");
+        lines = ["curl -LO " + url(apk), "sudo apk add --allow-untrusted " + apk];
+        break;
+      default:
+        var tgz = asset("linux_" + a + ".tar.gz");
+        lines = ["curl -LO " + url(tgz), "tar xzf " + tgz, "sudo install -m 0755 claude-usage-tray /usr/local/bin/claude-usage-tray"];
+    }
+    document.getElementById("pkgCmd").textContent = lines.join("\n");
+  }
+  archSelect.addEventListener("change", renderPkg);
+  pkgSelect.addEventListener("change", renderPkg);
+  renderPkg();
+
+  renderMacDownloads();
+  if (version) {
+    document.getElementById("releaseLink").textContent = "Latest release, v" + version;
+  }
+  if (release.downloads) {
+    var count = document.getElementById("downloads");
+    var total = release.downloads;
+    count.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>' +
+      '<strong aria-hidden="true">' + total.toLocaleString() + "</strong>" +
+      '<span class="visually-hidden">' + total.toLocaleString() + "</span> downloads from GitHub and npm";
+    if (release.github && release.npm) {
+      count.title = release.github.toLocaleString() + " from GitHub releases, " + release.npm.toLocaleString() + " from npm";
+    }
+    count.hidden = false;
+    countUp(count.querySelector("strong"), total);
+  }
+
+  // Counts up to the total once. The box is fixed at the final number's width
+  // and the digits sit at its right edge, so nothing moves as digits and
+  // separators appear.
+  function countUp(el, total) {
+    if (reduceMotion || !document.fonts) return;
+    // Measure only once the web font is in, or the width comes from the fallback.
+    el.style.visibility = "hidden";
+    document.fonts.ready.then(function () {
+      el.style.minWidth = el.getBoundingClientRect().width + "px";
+      el.style.visibility = "";
+      var duration = 1600, start = null;
+      function frame(t) {
+        if (start === null) start = t;
+        var progress = Math.min(1, (t - start) / duration);
+        el.textContent = Math.round(total * (1 - Math.pow(1 - progress, 3))).toLocaleString();
+        if (progress < 1) requestAnimationFrame(frame);
+      }
+      el.textContent = "0";
+      requestAnimationFrame(frame);
+    });
+  }
+
+  // ---------- Copy buttons ----------
+  document.addEventListener("click", function (evt) {
+    var btn = evt.target.closest(".copy");
+    if (!btn) return;
+    var code = btn.parentNode.querySelector("code");
+    var text = code.textContent;
+    var reset = function () { setTimeout(function () { btn.textContent = "Copy"; }, 1600); };
+    var done = function () { btn.textContent = "Copied"; reset(); };
+    // Last resort: select the command so the visitor can copy it themselves.
+    var failed = function () {
+      var range = document.createRange();
+      range.selectNodeContents(code);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      btn.textContent = /Mac/.test(navigator.platform) ? "\u2318C" : "Ctrl+C";
+      reset();
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text) ? done() : failed(); });
+    } else {
+      legacyCopy(text) ? done() : failed();
+    }
+  });
+
+  function legacyCopy(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    area.style.opacity = "0";
+    var focused = document.activeElement;
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (err) { ok = false; }
+    document.body.removeChild(area);
+    if (focused && focused.focus) focused.focus();
+    return ok;
+  }
+
+  render();
+  if (!reduceMotion) intro();
+})();
+</script>
+</body>
+</html>
