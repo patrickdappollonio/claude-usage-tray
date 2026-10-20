@@ -1331,7 +1331,7 @@
     var total = release.downloads;
     count.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>' +
       '<strong aria-hidden="true">' + total.toLocaleString() + "</strong>" +
-      '<span class="visually-hidden">' + total.toLocaleString() + "</span> downloads so far";
+      '<span class="visually-hidden">' + total.toLocaleString() + "</span> downloads from GitHub and npm";
     if (release.github && release.npm) {
       count.title = release.github.toLocaleString() + " from GitHub releases, " + release.npm.toLocaleString() + " from npm";
     }
