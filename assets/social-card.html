@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>claude-usage-tray social card</title>
+<!-- Source for website/social.png: render this page at 1200x630 and screenshot it. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; }
+  body {
+    width: 1200px;
+    height: 630px;
+    overflow: hidden;
+    position: relative;
+    background: #43A047;
+    color: #1C1F21;
+    font-family: "Archivo", sans-serif;
+  }
+  .panel {
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 46px;
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    padding: 0 56px;
+    background: #1C1F21;
+    color: #EEEEEE;
+    font-size: 21px;
+    font-weight: 600;
+  }
+  .panel .name { margin-right: auto; }
+  .panel svg { width: 28px; height: 28px; }
+  .panel .clock { font-weight: 400; opacity: 0.85; white-space: pre; }
+  h1 {
+    position: absolute;
+    left: 56px;
+    top: 92px;
+    margin: 0;
+    font-size: 188px;
+    line-height: 0.86;
+    font-weight: 850;
+    font-variation-settings: "wdth" 62;
+  }
+  p {
+    position: absolute;
+    left: 58px;
+    bottom: 52px;
+    width: 560px;
+    margin: 0;
+    font-size: 33px;
+    line-height: 1.2;
+    font-weight: 700;
+    font-variation-settings: "wdth" 80;
+  }
+  .gauge {
+    position: absolute;
+    right: -120px;
+    top: 96px;
+    width: 640px;
+    height: 640px;
+  }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <span class="name">claude-usage-tray</span>
+    <svg viewBox="0 0 100 100" aria-hidden="true">
+      <circle cx="50" cy="50" r="34" fill="none" stroke="#808080" stroke-opacity=".27" stroke-width="16"/>
+      <path d="M50 16A34 34 0 0 1 80.763 64.477" fill="none" stroke="#43A047" stroke-width="16" stroke-linecap="round"/>
+      <circle cx="50" cy="50" r="8.8" fill="#43A047"/>
+    </svg>
+    <span class="clock">Tue Oct 20  9:41 AM</span>
+  </div>
+
+  <h1>Plenty<br>of room.</h1>
+  <p>Your Claude Code usage, live in the Linux system tray and macOS menu bar.</p>
+
+  <!-- 32% session arc and a weekly dot, the same geometry as the tray icon. -->
+  <svg class="gauge" viewBox="0 0 100 100" aria-hidden="true">
+    <circle cx="50" cy="50" r="34" fill="none" stroke="#1C1F21" stroke-opacity=".2" stroke-width="16"/>
+    <path d="M50 16A34 34 0 0 1 80.763 64.477" fill="none" stroke="#1C1F21" stroke-width="16" stroke-linecap="round"/>
+    <circle cx="50" cy="50" r="8.8" fill="#43A047" stroke="#1C1F21" stroke-width="2.4"/>
+  </svg>
+</body>
+</html>
