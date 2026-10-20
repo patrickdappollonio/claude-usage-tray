@@ -49,6 +49,12 @@ pub fn entry_path(dir: &Path) -> PathBuf {
 /// in the background and exits, and `launchd` would then be supervising a
 /// process that is already gone while the real tray runs outside its
 /// knowledge. Attached, the job `launchd` started is the tray itself.
+///
+/// `AssociatedBundleIdentifiers` names the app bundle this agent belongs to.
+/// Without it, System Settings > Login Items lists the agent under the name on
+/// the signing certificate and with a generic icon; with it, macOS 13 and later
+/// show the app's name and icon instead, provided the bundle is installed.
+/// Older releases ignore the key.
 pub fn launch_agent_plist(exec: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -58,6 +64,10 @@ pub fn launch_agent_plist(exec: &Path) -> String {
          <dict>\n\
          \t<key>Label</key>\n\
          \t<string>{LABEL}</string>\n\
+         \t<key>AssociatedBundleIdentifiers</key>\n\
+         \t<array>\n\
+         \t\t<string>{LABEL}</string>\n\
+         \t</array>\n\
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
          \t\t<string>{exec}</string>\n\
@@ -200,6 +210,7 @@ mod tests {
             "<string>com.patrickdappollonio.claude-usage-tray</string>",
             "<key>ProgramArguments</key>",
             "<string>/usr/local/bin/claude-usage-tray</string>",
+            "<key>AssociatedBundleIdentifiers</key>",
             "<key>RunAtLoad</key>",
             "<true/>",
         ] {
@@ -236,6 +247,20 @@ mod tests {
     #[test]
     fn the_label_matches_the_file_name() {
         assert_eq!(ENTRY_NAME, format!("{LABEL}.plist"));
+    }
+
+    /// Login Items shows the app's name and icon only when the agent names the
+    /// bundle it belongs to, so the association must be the bundle identifier.
+    #[test]
+    fn the_plist_associates_the_agent_with_the_app_bundle() {
+        let plist = launch_agent_plist(Path::new("/usr/local/bin/claude-usage-tray"));
+        let associated = plist
+            .split("<key>AssociatedBundleIdentifiers</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</array>").next())
+            .expect("an AssociatedBundleIdentifiers array");
+        assert_eq!(associated.matches("<string>").count(), 1);
+        assert!(associated.contains(&format!("<string>{LABEL}</string>")));
     }
 
     #[test]
