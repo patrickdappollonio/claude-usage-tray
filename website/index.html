@@ -145,17 +145,28 @@
   .hero :focus-visible { outline-color: var(--on-band); }
 
   .headline {
-    margin: 0 0 18px;
-    font-size: clamp(3.5rem, 10.5vw, 10rem);
-    line-height: 0.86;
+    margin: 0 0 24px;
+    font-size: clamp(3rem, 6.5vw, 6.5rem);
+    line-height: 0.9;
     font-weight: 850;
     font-variation-settings: "wdth" 62;
     letter-spacing: -0.01em;
+    text-wrap: balance;
   }
-  .subhead {
-    margin: 0 0 24px;
-    font-size: clamp(1.375rem, 2.3vw, 2rem);
-    line-height: 1.15;
+
+  /* What the gauge is saying right now; changes with the session band. */
+  .status { text-align: center; }
+  .status-word {
+    margin: 0;
+    font-size: clamp(2rem, 4vw, 3.5rem);
+    line-height: 1;
+    font-weight: 850;
+    font-variation-settings: "wdth" 62;
+  }
+  .status-note {
+    margin: 6px 0 0;
+    font-size: clamp(1rem, 1.5vw, 1.25rem);
+    line-height: 1.2;
     font-weight: 700;
     font-variation-settings: "wdth" 80;
   }
@@ -238,7 +249,7 @@
     gap: 22px;
   }
   .gauge {
-    width: min(100%, 34rem, 56svh);
+    width: min(100%, 34rem, 46svh);
     aspect-ratio: 1;
     touch-action: none;
     user-select: none;
@@ -609,7 +620,7 @@
   @media (max-width: 860px) {
     .hero { grid-template-columns: minmax(0, 1fr); min-height: 0; padding-top: 32px; }
     .gauge { width: min(78vw, 22rem); }
-    .headline { margin-bottom: 14px; }
+    .headline { margin-bottom: 18px; }
     .toast-wrap { position: static; flex-direction: column; gap: 14px; }
     .callout { margin: 0; text-align: left; }
     .callout span { max-width: none; }
@@ -642,9 +653,8 @@
 
 <section class="hero" aria-labelledby="headline">
   <div class="copy-col">
-    <h1 class="headline" id="headline">Plenty of room.</h1>
-    <p class="subhead" id="subhead">Under half of your 5-hour session used.</p>
-    <p class="lede"><code>claude-usage-tray</code> is a small gauge in your macOS menu bar or Linux system tray that shows how much of your Claude usage is left. Drag the gauge or move its sliders to see how it changes.</p>
+    <h1 class="headline" id="headline">Claude Code usage, in your <span id="where">menu bar</span>.</h1>
+    <p class="lede"><code>claude-usage-tray</code> is a small gauge in your macOS menu bar or Linux system tray. It shows how much of your 5-hour session and weekly limit you've used, and warns you before you run out.</p>
     <p class="count" id="downloads" hidden></p>
     <div class="hero-install">
       <p id="heroLabel">Install on macOS with Homebrew:</p>
@@ -666,6 +676,10 @@
       <path class="arc" id="arc" fill="none" stroke-width="16" stroke-linecap="round" d=""/>
       <circle class="dot" id="dot" cx="50" cy="50" r="8.8" stroke-width="2.4" fill="var(--green)"/>
     </svg>
+    <div class="status" aria-live="polite">
+      <p class="status-word" id="status">Plenty of room.</p>
+      <p class="status-note" id="statusNote">Under half of your 5-hour session used.</p>
+    </div>
     <div class="controls">
       <p class="hint">Drag the ring or move the sliders.</p>
       <label for="sessionRange">5-hour session, the ring</label>
@@ -1022,9 +1036,9 @@
   var gauge = document.getElementById("gauge");
   var arc = document.getElementById("arc");
   var dot = document.getElementById("dot");
-  var headline = document.getElementById("headline");
+  var status = document.getElementById("status");
   var summary = document.getElementById("summary");
-  var subhead = document.getElementById("subhead");
+  var statusNote = document.getElementById("statusNote");
   var sessionInput = document.getElementById("sessionRange");
   var sessionOut = document.getElementById("sessionOut");
   var weeklyInput = document.getElementById("weekly");
@@ -1050,8 +1064,8 @@
       root.style.setProperty("--band", COLORS[b]);
       // Dark ink fails contrast on red, so the hero flips to light text there.
       root.style.setProperty("--on-band", b === "red" ? "#EEEEEE" : "#1C1F21");
-      swapText(headline, HEADLINES[b], 0);
-      swapText(subhead, SUBHEADS[b], 60);
+      swapText(status, HEADLINES[b], 0);
+      swapText(statusNote, SUBHEADS[b], 60);
       themeColor.setAttribute("content", COLORS[b]);
     }
 
@@ -1238,6 +1252,7 @@
   var notice = document.getElementById("osNotice");
   if (os === "linux") {
     selectTab("linux");
+    document.getElementById("where").textContent = "system tray";
     heroLabel.textContent = "Install on Linux with Homebrew:";
     heroCmd.textContent = "brew install patrickdappollonio/tap/claude-usage-tray";
     document.getElementById("tab-linux").insertAdjacentHTML("beforeend", ' <span class="here">your system</span>');
