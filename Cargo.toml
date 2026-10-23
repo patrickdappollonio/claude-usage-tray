@@ -21,7 +21,7 @@ strip = true      # Strip symbols from the binary.
 # Portable dependencies: everything the platform-independent core needs (see
 # `src/platform/mod.rs` for where the boundary runs).
 [dependencies]
-dirs = "6.0.0"
+dirs = "7.0.0"
 jiff = "0.2.35"
 # Only for `flock` and `kill` in `src/instance.rs` (the single-instance lock and
 # `restart`); std has neither. Both supported platforms are Unix, and libc is
