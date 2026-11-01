@@ -766,7 +766,7 @@
   <section class="section" id="reading" aria-labelledby="reading-h">
     <h2 id="reading-h">Reading the icon</h2>
     <div class="body">
-      <p>The outer arc is your 5-hour session, sweeping clockwise as you use it. The dot in the middle is your weekly usage. Both turn yellow at 50%, orange at 75% and red at 90%, the same points where the tray can notify you.</p>
+      <p>The outer arc is your 5-hour session, sweeping clockwise as you use it. The dot in the middle is your weekly usage. Both turn yellow at 50%, orange at 75% and red at 90%, the same points where the tray can notify you. If your account has no 5-hour limit, the arc shows your weekly usage instead and the dot goes away.</p>
       <ul class="legend" id="legend"></ul>
       <p class="muted" style="margin-top:28px">Prefer a quieter panel? Switch to monochrome, and the length of the arc carries the reading on its own.</p>
     </div>
@@ -940,6 +940,11 @@
         <p>Claude Code hasn't reported new numbers in the last 10 minutes, usually because no Claude Code session is running. The tray keeps showing the last reading, the reset countdowns stay accurate, and the session drops back to 0% when its 5-hour window rolls over. The question mark goes away the next time Claude Code reports, which happens as soon as you send a prompt.</p>
       </details>
       <details>
+        <summary>Where did the session row and the dot go?</summary>
+        <p>Some accounts don't have a 5-hour limit, only a weekly one. For those, Claude Code reports the weekly window and leaves the 5-hour one out. The tray takes that to mean there's no session limit, not that data is missing: the arc shows your weekly usage, the center dot goes away because it would repeat the arc, and the menu starts at the Weekly row. Session alerts stay quiet and weekly alerts still fire.</p>
+        <p>If your account gets a 5-hour limit again, the session row, the arc and the dot come back on their own the next time Claude Code reports.</p>
+      </details>
+      <details>
         <summary>"Check for new data" seems to do nothing</summary>
         <p>It re-reads the numbers Claude Code last wrote and tells you whether anything changed, and how long ago Claude Code last reported. It can't make Claude Code report sooner, because Claude Code only reports while a session is running. Send a prompt in any Claude Code session, then check again.</p>
       </details>
@@ -1022,11 +1027,15 @@
       return '<circle cx="50" cy="50" r="34" fill="none" stroke="#808080" stroke-opacity=".86" stroke-width="16"/>' +
         '<circle cx="50" cy="50" r="9.6" fill="#808080" fill-opacity=".86"/>';
     }
-    var arc = state.session > 0
-      ? '<path d="' + arcD(state.session) + '" fill="none" stroke="' + COLORS[band(state.session)] +
+    // Without a 5-hour limit the arc carries the weekly reading and the
+    // center stays empty.
+    var arcPercent = state.noSession ? state.weekly : state.session;
+    var arc = arcPercent > 0
+      ? '<path d="' + arcD(arcPercent) + '" fill="none" stroke="' + COLORS[band(arcPercent)] +
         '" stroke-width="16" stroke-linecap="round"/>'
       : "";
     var center = state.stale ? QUESTION
+      : state.noSession ? ""
       : '<circle cx="50" cy="50" r="8.8" fill="' + COLORS[band(state.weekly)] + '"/>';
     return ring + arc + center;
   }
@@ -1197,6 +1206,7 @@
     { session: 62, weekly: 40, title: "Past halfway", text: "The session turned yellow. The week is still fine." },
     { session: 82, weekly: 58, title: "Getting close", text: "Orange arc, and the week is past halfway too." },
     { session: 96, weekly: 91, title: "Wrap it up", text: "Both are nearly out. Time to pause." },
+    { noSession: true, weekly: 38, title: "No 5-hour limit", text: "Your account only has a weekly limit, so the arc shows the week." },
     { session: 45, weekly: 0, stale: true, title: "Not updated lately", text: "You're seeing the last reading. It refreshes when Claude Code runs." },
     { missing: true, title: "No data yet", text: "Usually the hook isn't installed. The menu offers to install it." }
   ];
