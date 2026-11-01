@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>See your Claude Code usage in your menu bar or system tray</title>
-<meta name="description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code 5-hour and weekly usage. No credentials, no cookies, no calls to Anthropic.">
+<meta name="description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code weekly usage, and your 5-hour session if your account has one. No credentials, no cookies, no calls to Anthropic.">
 <meta name="author" content="Patrick D'appollonio">
 <meta name="theme-color" content="#43A047">
 <link rel="canonical" href="https://claude-usage-tray.app/">
@@ -26,7 +26,7 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "claude-usage-tray",
-  "description": "A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code 5-hour and weekly usage.",
+  "description": "A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code weekly usage, and your 5-hour session if your account has one.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, macOS",
   "url": "https://claude-usage-tray.app/",
@@ -39,6 +39,7 @@
 </script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%231C1F21'/%3E%3Ccircle cx='50' cy='50' r='27' fill='none' stroke='%23555A5C' stroke-width='12'/%3E%3Cpath d='M50 23a27 27 0 0 1 25.7 35.3' fill='none' stroke='%23EEEEEE' stroke-width='12' stroke-linecap='round'/%3E%3Ccircle cx='50' cy='50' r='7' fill='%23EEEEEE'/%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="icon.png">
+<script defer src="https://m.blogmetrics.fyi/script.js" data-website-id="142e98bc-e738-4509-8582-2cdb793df6a6"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Fragment+Mono&display=swap" rel="stylesheet">
@@ -275,6 +276,41 @@
   }
   .controls .hint { grid-column: 1 / -1; margin: 0 0 6px; text-align: center; opacity: 0.8; }
   .controls output { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 3.2ch; text-align: right; }
+  .controls [hidden] { display: none; }
+  .switch {
+    grid-column: 1 / -1;
+    justify-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 8px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+  .switch .track {
+    position: relative;
+    flex: none;
+    width: 40px;
+    height: 24px;
+    border-radius: 12px;
+    border: 2px solid var(--on-band);
+    transition: background-color 180ms ease;
+  }
+  .switch .track::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--on-band);
+    transition: transform 180ms ease, background-color 180ms ease;
+  }
+  .switch input:checked + .track { background: var(--on-band); }
+  .switch input:checked + .track::after { transform: translateX(16px); background: var(--band); }
+  .switch input:focus-visible + .track { outline: 3px solid var(--on-band); outline-offset: 3px; }
   input[type="range"] {
     -webkit-appearance: none;
     appearance: none;
@@ -654,7 +690,7 @@
 <section class="hero" aria-labelledby="headline">
   <div class="copy-col">
     <h1 class="headline" id="headline">Claude Code usage, in your <span id="where">menu bar</span>.</h1>
-    <p class="lede"><code>claude-usage-tray</code> is a small gauge in your macOS menu bar or Linux system tray. It shows how much of your 5-hour session and weekly limit you've used, and warns you before you run out.</p>
+    <p class="lede"><code>claude-usage-tray</code> is a small gauge in your macOS menu bar or Linux system tray. It shows how much of your weekly limit you've used, and your 5-hour session too if your account has one, and warns you before you run out.</p>
     <p class="count" id="downloads" hidden></p>
     <div class="hero-install">
       <p id="heroLabel">Install on macOS with Homebrew:</p>
@@ -669,25 +705,30 @@
 
   <div class="stage">
     <svg class="gauge" id="gauge" viewBox="0 0 100 100" role="slider" tabindex="0"
-         aria-label="5-hour session usage. Drag the ring or use the arrow keys."
+         aria-label="Weekly usage. Drag the ring or use the arrow keys."
          aria-valuemin="0" aria-valuemax="100" aria-valuenow="32" aria-valuetext="32%">
       <circle class="focus" cx="50" cy="50" r="45.5" fill="none" stroke-width="0.8" stroke-dasharray="1.5 1.5"/>
       <circle class="ring" cx="50" cy="50" r="34" fill="none" stroke-width="16"/>
       <path class="arc" id="arc" fill="none" stroke-width="16" stroke-linecap="round" d=""/>
-      <circle class="dot" id="dot" cx="50" cy="50" r="8.8" stroke-width="2.4" fill="var(--green)"/>
+      <circle class="dot" id="dot" cx="50" cy="50" r="8.8" stroke-width="2.4" fill="var(--green)" display="none"/>
     </svg>
     <div class="status" aria-live="polite">
       <p class="status-word" id="status">Plenty of room.</p>
-      <p class="status-note" id="statusNote">Under half of your 5-hour session used.</p>
+      <p class="status-note" id="statusNote">Under half of your weekly limit used.</p>
     </div>
     <div class="controls">
-      <p class="hint">Drag the ring or move the sliders.</p>
-      <label for="sessionRange">5-hour session, the ring</label>
-      <input type="range" id="sessionRange" min="0" max="100" value="32" style="--thumb: var(--band)">
-      <output for="sessionRange" id="sessionOut">32%</output>
-      <label for="weekly">Weekly, the dot</label>
-      <input type="range" id="weekly" min="0" max="100" value="33" style="--thumb: var(--week, var(--green))">
-      <output for="weekly" id="weeklyOut">33%</output>
+      <p class="hint">Drag the ring or move the slider.</p>
+      <label class="switch">
+        <input type="checkbox" id="hasSession" role="switch">
+        <span class="track" aria-hidden="true"></span>
+        <span>My account has a 5-hour limit</span>
+      </label>
+      <label for="sessionRange" class="session-row" hidden>5-hour session, the ring</label>
+      <input type="range" id="sessionRange" class="session-row" min="0" max="100" value="32" style="--thumb: var(--band)" hidden>
+      <output for="sessionRange" id="sessionOut" class="session-row" hidden>32%</output>
+      <label for="weekly" id="weeklyLabel">Weekly, the ring</label>
+      <input type="range" id="weekly" min="0" max="100" value="32" style="--thumb: var(--week, var(--green))">
+      <output for="weekly" id="weeklyOut">32%</output>
     </div>
   </div>
 
@@ -706,7 +747,7 @@
     <div class="toast pop" id="toast" role="status">
       <img src="icon.png" alt="">
       <strong>Claude Usage Tray</strong>
-      <p id="summary">You've used 32% of your 5-hour session (resets in 3 h) and 33% of your weekly limit (resets in 2 d).</p>
+      <p id="summary">You've used 32% of your weekly limit (resets in 2 d).</p>
     </div>
   </div>
 </section>
@@ -716,7 +757,7 @@
     <h2 id="features-h">Features</h2>
     <div class="body">
       <ul class="features">
-        <li><a href="#reading">Your usage at a glance</a><span>The ring is your 5-hour session and the dot is your week. Green, yellow, orange and red tell you how close you are.</span></li>
+        <li><a href="#reading">Your usage at a glance</a><span>The ring shows your weekly usage. If your account has a 5-hour limit, the ring shows the session and a dot shows the week. Green, yellow, orange and red tell you how close you are.</span></li>
         <li><a href="#settings">Color or monochrome</a><span>Use the colored gauge, or a monochrome one that matches a light or dark panel, picked automatically or by hand.</span></li>
         <li><span class="title"><a href="#linux">Linux</a> and <a href="#macos">macOS</a></span><span>Developed on Linux and tested on GNOME and KDE Plasma, with a signed and notarized Mac app. Builds for Intel/AMD and ARM.</span></li>
         <li><a href="#settings">Alerts before you hit a limit</a><span>Notifications at 50, 75, 90, 99 and 100% for the session, the week and each model, plus one when your quota resets.</span></li>
@@ -766,8 +807,13 @@
   <section class="section" id="reading" aria-labelledby="reading-h">
     <h2 id="reading-h">Reading the icon</h2>
     <div class="body">
-      <p>The outer arc is your 5-hour session, sweeping clockwise as you use it. The dot in the middle is your weekly usage. Both turn yellow at 50%, orange at 75% and red at 90%, the same points where the tray can notify you. If your account has no 5-hour limit, the arc shows your weekly usage instead and the dot goes away.</p>
-      <ul class="legend" id="legend"></ul>
+      <p>The outer arc sweeps clockwise as you use your limit. It turns yellow at 50%, orange at 75% and red at 90%, the same points where the tray can notify you. What it measures depends on whether your account has a 5-hour limit.</p>
+      <h3>Without a 5-hour limit</h3>
+      <p>Most accounts only have a weekly limit. The arc is your weekly usage, and the center stays empty.</p>
+      <ul class="legend" id="legend-weekly"></ul>
+      <h3>With a 5-hour limit</h3>
+      <p>The arc is your 5-hour session, and the dot in the middle is your weekly usage, colored the same way.</p>
+      <ul class="legend" id="legend-session"></ul>
       <p class="muted" style="margin-top:28px">Prefer a quieter panel? Switch to monochrome, and the length of the arc carries the reading on its own.</p>
     </div>
   </section>
@@ -988,11 +1034,20 @@
   var RELEASES = "https://github.com/" + REPO + "/releases/latest";
   var COLORS = { green: "#43A047", yellow: "#FFB300", orange: "#EF6C00", red: "#D32F2F" };
   var HEADLINES = { green: "Plenty of room.", yellow: "Past halfway.", orange: "Start wrapping up.", red: "Wrap it up." };
+  // The subhead names whichever window the ring is showing.
   var SUBHEADS = {
-    green: "Under half of your 5-hour session used.",
-    yellow: "Over half of your 5-hour session used.",
-    orange: "Three quarters of your 5-hour session used.",
-    red: "Your 5-hour session is nearly used up."
+    session: {
+      green: "Under half of your 5-hour session used.",
+      yellow: "Over half of your 5-hour session used.",
+      orange: "Three quarters of your 5-hour session used.",
+      red: "Your 5-hour session is nearly used up."
+    },
+    weekly: {
+      green: "Under half of your weekly limit used.",
+      yellow: "Over half of your weekly limit used.",
+      orange: "Three quarters of your weekly limit used.",
+      red: "Your weekly limit is nearly used up."
+    }
   };
   var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
@@ -1054,40 +1109,73 @@
   var weeklyOut = document.getElementById("weeklyOut");
   var trayGauge = document.getElementById("trayGauge");
   var themeColor = document.querySelector('meta[name="theme-color"]');
+  var hasSessionInput = document.getElementById("hasSession");
+  var weeklyLabel = document.getElementById("weeklyLabel");
+  var sessionRows = document.querySelectorAll(".session-row");
 
+  // Most accounts have only a weekly limit, so the hero starts there: the ring
+  // shows the week and there's no dot. The switch adds the 5-hour session.
+  var hasSession = false;
   var session = 32;
-  var weekly = 33;
+  var weekly = 32;
   var shownBand = null;
+  var shownWindow = null;
+
+  // The ring's reading: the session when there is one, otherwise the week.
+  function ringValue() { return hasSession ? session : weekly; }
+  function setRing(p) {
+    if (hasSession) session = p;
+    else weekly = p;
+  }
 
   function render() {
     var s = Math.round(session);
-    var b = band(s);
-    var wb = band(weekly);
+    var w = Math.round(weekly);
+    var r = hasSession ? s : w;
+    var b = band(r);
+    var wb = band(w);
+    var win = hasSession ? "session" : "weekly";
 
-    arc.setAttribute("d", arcD(s));
+    arc.setAttribute("d", arcD(r));
     dot.setAttribute("fill", COLORS[wb]);
+    dot.setAttribute("display", hasSession ? "inline" : "none");
     root.style.setProperty("--week", COLORS[wb]);
 
-    if (b !== shownBand) {
+    if (b !== shownBand || win !== shownWindow) {
+      if (b !== shownBand) swapText(status, HEADLINES[b], 0);
       shownBand = b;
+      shownWindow = win;
       root.style.setProperty("--band", COLORS[b]);
       // Dark ink fails contrast on red, so the hero flips to light text there.
       root.style.setProperty("--on-band", b === "red" ? "#EEEEEE" : "#1C1F21");
-      swapText(status, HEADLINES[b], 0);
-      swapText(statusNote, SUBHEADS[b], 60);
+      swapText(statusNote, SUBHEADS[win][b], 60);
       themeColor.setAttribute("content", COLORS[b]);
     }
 
-    gauge.setAttribute("aria-valuenow", s);
-    gauge.setAttribute("aria-valuetext", s + "%");
+    gauge.setAttribute("aria-label", (hasSession ? "5-hour session" : "Weekly") +
+      " usage. Drag the ring or use the arrow keys.");
+    gauge.setAttribute("aria-valuenow", r);
+    gauge.setAttribute("aria-valuetext", r + "%");
     sessionInput.value = s;
     sessionOut.textContent = s + "%";
-    weeklyInput.value = weekly;
-    weeklyOut.textContent = weekly + "%";
-    summary.textContent = "You've used " + s + "% of your 5-hour session (resets in 3 h) and " +
-      weekly + "% of your weekly limit (resets in 2 d).";
-    trayGauge.innerHTML = iconSVG({ session: s, weekly: weekly });
+    weeklyInput.value = w;
+    weeklyOut.textContent = w + "%";
+    summary.textContent = hasSession
+      ? "You've used " + s + "% of your 5-hour session (resets in 3 h) and " +
+        w + "% of your weekly limit (resets in 2 d)."
+      : "You've used " + w + "% of your weekly limit (resets in 2 d).";
+    trayGauge.innerHTML = iconSVG({ session: s, weekly: w, noSession: !hasSession });
   }
+
+  hasSessionInput.addEventListener("change", function () {
+    stopIntro();
+    hasSession = hasSessionInput.checked;
+    sessionRows.forEach(function (el) { el.hidden = !hasSession; });
+    weeklyLabel.textContent = hasSession ? "Weekly, the dot" : "Weekly, the ring";
+    document.querySelector(".controls .hint").textContent =
+      hasSession ? "Drag the ring or move the sliders." : "Drag the ring or move the slider.";
+    render();
+  });
 
   // New wording slides up into place when the band changes. The first render
   // has nothing to replace, so it just sets the text.
@@ -1116,16 +1204,17 @@
     stopIntro();
     dragging = true;
     gauge.setPointerCapture(evt.pointerId);
-    session = percentAt(evt);
+    setRing(percentAt(evt));
     render();
   });
   gauge.addEventListener("pointermove", function (evt) {
     if (!dragging) return;
     var next = percentAt(evt);
+    var current = ringValue();
     // Don't wrap from full to empty (or back) when the pointer crosses the top.
-    if (session > 75 && next < 25) next = 100;
-    else if (session < 25 && next > 75) next = 0;
-    session = next;
+    if (current > 75 && next < 25) next = 100;
+    else if (current < 25 && next > 75) next = 0;
+    setRing(next);
     render();
   });
   ["pointerup", "pointercancel"].forEach(function (type) {
@@ -1133,9 +1222,9 @@
   });
   gauge.addEventListener("keydown", function (evt) {
     var step = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1, PageUp: 10, PageDown: -10 }[evt.key];
-    if (evt.key === "Home") session = 0;
-    else if (evt.key === "End") session = 100;
-    else if (step) session = Math.min(100, Math.max(0, Math.round(session) + step));
+    if (evt.key === "Home") setRing(0);
+    else if (evt.key === "End") setRing(100);
+    else if (step) setRing(Math.min(100, Math.max(0, Math.round(ringValue()) + step)));
     else return;
     evt.preventDefault();
     stopIntro();
@@ -1147,6 +1236,7 @@
     render();
   });
   weeklyInput.addEventListener("input", function () {
+    stopIntro();
     weekly = Number(weeklyInput.value);
     render();
   });
@@ -1175,9 +1265,9 @@
       if (start === null) start = t;
       var e = t - start;
       if (e < duration) {
-        session = target * (1 - Math.pow(1 - e / duration, 3));
+        setRing(target * (1 - Math.pow(1 - e / duration, 3)));
       } else {
-        session = target;
+        setRing(target);
         render();
         introFrame = null;
         return;
@@ -1201,19 +1291,29 @@
   setInterval(tick, 15000);
 
   // ---------- Legend ----------
-  var LEGEND = [
+  var LEGEND_WEEKLY = [
+    { noSession: true, weekly: 22, title: "Plenty left", text: "Under half of the week used." },
+    { noSession: true, weekly: 62, title: "Past halfway", text: "The week turned yellow." },
+    { noSession: true, weekly: 82, title: "Getting close", text: "Three quarters of the week is gone." },
+    { noSession: true, weekly: 96, title: "Wrap it up", text: "The week is nearly out. Time to pause." },
+    { noSession: true, weekly: 45, stale: true, title: "Not updated lately", text: "You're seeing the last reading. It refreshes when Claude Code runs." },
+    { missing: true, title: "No data yet", text: "Usually the hook isn't installed. The menu offers to install it." }
+  ];
+  var LEGEND_SESSION = [
     { session: 22, weekly: 30, title: "Plenty left", text: "Both the session and the week are under half." },
     { session: 62, weekly: 40, title: "Past halfway", text: "The session turned yellow. The week is still fine." },
     { session: 82, weekly: 58, title: "Getting close", text: "Orange arc, and the week is past halfway too." },
     { session: 96, weekly: 91, title: "Wrap it up", text: "Both are nearly out. Time to pause." },
-    { noSession: true, weekly: 38, title: "No 5-hour limit", text: "Your account only has a weekly limit, so the arc shows the week." },
-    { session: 45, weekly: 0, stale: true, title: "Not updated lately", text: "You're seeing the last reading. It refreshes when Claude Code runs." },
-    { missing: true, title: "No data yet", text: "Usually the hook isn't installed. The menu offers to install it." }
+    { session: 45, weekly: 0, stale: true, title: "Not updated lately", text: "You're seeing the last reading. It refreshes when Claude Code runs." }
   ];
-  document.getElementById("legend").innerHTML = LEGEND.map(function (item) {
-    return '<li><span class="tile"><svg viewBox="0 0 100 100" aria-hidden="true">' + iconSVG(item) +
-      '</svg></span><span><strong>' + item.title + "</strong><span>" + item.text + "</span></span></li>";
-  }).join("");
+  function legendHTML(items) {
+    return items.map(function (item) {
+      return '<li><span class="tile"><svg viewBox="0 0 100 100" aria-hidden="true">' + iconSVG(item) +
+        '</svg></span><span><strong>' + item.title + "</strong><span>" + item.text + "</span></span></li>";
+    }).join("");
+  }
+  document.getElementById("legend-weekly").innerHTML = legendHTML(LEGEND_WEEKLY);
+  document.getElementById("legend-session").innerHTML = legendHTML(LEGEND_SESSION);
 
   // ---------- Install: OS detection, tabs, release links ----------
   function detectOS() {
