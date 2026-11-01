@@ -6,9 +6,9 @@
 //! deliberately the least interesting one possible: no credentials, no
 //! telemetry, no query parameters, nothing sent but a `User-Agent` naming the
 //! program and its version. Everything a caller needs from it is
-//! `Some((version, url))` or `None`; a DNS failure, a rate limit, a proxy that
-//! swallows the request, a redesigned JSON body — all of them are the same
-//! quiet `None`. A background version check must never toast, never log, and
+//! an [`Outcome`]; a DNS failure, a rate limit, a proxy that swallows the
+//! request, a redesigned JSON body — all of them are the same quiet
+//! [`Outcome::Nothing`]. A background version check must never toast, never log, and
 //! never be a reason the tray behaves differently.
 //!
 //! The two pieces that can be wrong in an interesting way — reading the
@@ -49,11 +49,24 @@ impl Update {
     }
 }
 
-/// Pulls `(tag_name, html_url)` out of a releases-API body, with the tag's
-/// leading `v` stripped. `None` for anything that is not an object carrying
-/// both fields as non-empty strings — including HTML error pages, GitHub's
-/// `{"message": "Not Found"}`, and truncated bodies.
-pub fn parse_release_json(body: &str) -> Option<(String, String)> {
+/// What the releases API said about the latest release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Release {
+    /// The tag with any leading `v` stripped, e.g. `0.2.0`.
+    pub version: String,
+    /// The release page to open in a browser.
+    pub url: String,
+    /// Names of the files fully uploaded to the release. An asset GitHub still
+    /// reports as mid-upload is left out.
+    pub assets: Vec<String>,
+}
+
+/// Pulls the tag, page and asset names out of a releases-API body, with the
+/// tag's leading `v` stripped. `None` for anything that is not an object
+/// carrying `tag_name` and `html_url` as non-empty strings — including HTML
+/// error pages, GitHub's `{"message": "Not Found"}`, and truncated bodies. A
+/// missing or malformed `assets` list reads as no assets.
+pub fn parse_release_json(body: &str) -> Option<Release> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let tag = value.get("tag_name")?.as_str()?.trim();
     let url = value.get("html_url")?.as_str()?.trim();
@@ -64,7 +77,58 @@ pub fn parse_release_json(body: &str) -> Option<(String, String)> {
     if version.is_empty() {
         return None;
     }
-    Some((version.to_string(), url.to_string()))
+    let assets = value
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .map(|assets| assets.iter().filter_map(uploaded_asset_name).collect())
+        .unwrap_or_default();
+    Some(Release {
+        version: version.to_string(),
+        url: url.to_string(),
+        assets,
+    })
+}
+
+/// An asset's name, unless GitHub says it is not fully uploaded yet
+/// (`"state": "open"`). An asset with no `state` at all is taken as uploaded.
+fn uploaded_asset_name(asset: &serde_json::Value) -> Option<String> {
+    let state = asset.get("state").and_then(serde_json::Value::as_str);
+    if state.is_some_and(|state| state != "uploaded") {
+        return None;
+    }
+    let name = asset.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The OS and architecture words the release workflow puts in asset names,
+/// for Rust's own [`std::env::consts::OS`] and [`std::env::consts::ARCH`].
+/// `None` for a platform the project does not publish a build for.
+fn release_platform(os: &str, arch: &str) -> Option<(&'static str, &'static str)> {
+    let os = match os {
+        "linux" => "linux",
+        "macos" => "darwin",
+        _ => return None,
+    };
+    let arch = match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    Some((os, arch))
+}
+
+/// The tarball `.github/workflows/release.yml` builds for this version on
+/// this platform, e.g. `claude-usage-tray_0.2.0_linux_amd64.tar.gz`. The
+/// other downloads for a platform (the `.deb`, the macOS `.app` zip) come out
+/// of the same job, so the tarball stands for all of them.
+fn asset_name(version: &str, os: &str, arch: &str) -> Option<String> {
+    let (os, arch) = release_platform(os, arch)?;
+    Some(format!("claude-usage-tray_{version}_{os}_{arch}.tar.gz"))
+}
+
+/// Whether `release` already carries the build for the given platform.
+fn has_build_for(release: &Release, os: &str, arch: &str) -> bool {
+    asset_name(&release.version, os, arch).is_some_and(|wanted| release.assets.contains(&wanted))
 }
 
 /// Splits a version into its numeric triple, tolerating missing components
@@ -135,11 +199,45 @@ fn fetch() -> Option<String> {
     response.body_mut().read_to_string().ok()
 }
 
-/// The whole check: fetch, parse, compare. `None` means "nothing to say" —
-/// no update, or no answer. Callers must not distinguish the two.
-pub fn check() -> Option<Update> {
-    let (version, url) = parse_release_json(&fetch()?)?;
-    is_newer(&version, current_version()).then_some(Update { version, url })
+/// What one update check found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// A newer release with a build for this platform.
+    Available(Update),
+    /// A newer release whose build for this platform is not uploaded yet. Not
+    /// worth showing, but worth checking again soon rather than tomorrow.
+    Pending,
+    /// No update, or no answer. Callers must not distinguish the two.
+    Nothing,
+}
+
+/// Decides what a release means for a binary at version `current` running on
+/// `os`/`arch` (spelled as in [`std::env::consts`]).
+fn judge(release: Release, current: &str, os: &str, arch: &str) -> Outcome {
+    if !is_newer(&release.version, current) {
+        return Outcome::Nothing;
+    }
+    if !has_build_for(&release, os, arch) {
+        return Outcome::Pending;
+    }
+    Outcome::Available(Update {
+        version: release.version,
+        url: release.url,
+    })
+}
+
+/// The whole check: fetch, parse, compare, and make sure the release has a
+/// build for this platform before offering it.
+pub fn check() -> Outcome {
+    let Some(release) = fetch().as_deref().and_then(parse_release_json) else {
+        return Outcome::Nothing;
+    };
+    judge(
+        release,
+        current_version(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
 }
 
 /// The platform's own "hand this URL to the default browser" command:
@@ -178,10 +276,11 @@ mod tests {
         }"#;
         assert_eq!(
             parse_release_json(body),
-            Some((
-                "0.2.0".to_string(),
-                "https://github.com/o/r/releases/tag/v0.2.0".to_string()
-            ))
+            Some(Release {
+                version: "0.2.0".to_string(),
+                url: "https://github.com/o/r/releases/tag/v0.2.0".to_string(),
+                assets: vec![],
+            })
         );
     }
 
@@ -190,7 +289,11 @@ mod tests {
         let body = r#"{"tag_name": "1.4.2", "html_url": "https://example.test/r"}"#;
         assert_eq!(
             parse_release_json(body),
-            Some(("1.4.2".to_string(), "https://example.test/r".to_string()))
+            Some(Release {
+                version: "1.4.2".to_string(),
+                url: "https://example.test/r".to_string(),
+                assets: vec![],
+            })
         );
     }
 
@@ -337,6 +440,138 @@ mod tests {
         assert_eq!(OPENER, "open");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(OPENER, "xdg-open");
+    }
+
+    fn release(version: &str, assets: &[&str]) -> Release {
+        Release {
+            version: version.to_string(),
+            url: "https://example.test/r".to_string(),
+            assets: assets.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn asset_names_are_read_and_unfinished_uploads_skipped() {
+        let body = r#"{
+            "tag_name": "v0.2.0",
+            "html_url": "https://example.test/r",
+            "assets": [
+                {"name": "claude-usage-tray_0.2.0_linux_amd64.tar.gz", "state": "uploaded"},
+                {"name": "claude-usage-tray_0.2.0_darwin_arm64.tar.gz", "state": "open"},
+                {"name": "claude-usage-tray_0.2.0_linux_arm64.tar.gz"},
+                {"state": "uploaded"},
+                {"name": "", "state": "uploaded"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_release_json(body).map(|release| release.assets),
+            Some(vec![
+                "claude-usage-tray_0.2.0_linux_amd64.tar.gz".to_string(),
+                "claude-usage-tray_0.2.0_linux_arm64.tar.gz".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_malformed_assets_list_reads_as_no_assets() {
+        let body = r#"{"tag_name": "v0.2.0", "html_url": "https://x.test", "assets": "nope"}"#;
+        assert_eq!(
+            parse_release_json(body).map(|release| release.assets),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn asset_names_match_the_release_workflow() {
+        for (os, arch, want) in [
+            (
+                "linux",
+                "x86_64",
+                "claude-usage-tray_1.2.3_linux_amd64.tar.gz",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "claude-usage-tray_1.2.3_linux_arm64.tar.gz",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "claude-usage-tray_1.2.3_darwin_amd64.tar.gz",
+            ),
+            (
+                "macos",
+                "aarch64",
+                "claude-usage-tray_1.2.3_darwin_arm64.tar.gz",
+            ),
+        ] {
+            assert_eq!(
+                asset_name("1.2.3", os, arch).as_deref(),
+                Some(want),
+                "{os}/{arch}"
+            );
+        }
+        assert_eq!(asset_name("1.2.3", "windows", "x86_64"), None);
+        assert_eq!(asset_name("1.2.3", "linux", "riscv64"), None);
+    }
+
+    #[test]
+    fn this_build_has_a_release_asset_name() {
+        // Without one, no release could ever be offered on this platform.
+        assert!(release_platform(std::env::consts::OS, std::env::consts::ARCH).is_some());
+    }
+
+    #[test]
+    fn a_newer_release_with_this_platforms_build_is_offered() {
+        let release = release(
+            "0.2.0",
+            &[
+                "claude-usage-tray_0.2.0_darwin_arm64_app.zip",
+                "claude-usage-tray_0.2.0_darwin_arm64.tar.gz",
+            ],
+        );
+        assert_eq!(
+            judge(release, "0.1.0", "macos", "aarch64"),
+            Outcome::Available(Update {
+                version: "0.2.0".to_string(),
+                url: "https://example.test/r".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_newer_release_without_this_platforms_build_is_pending() {
+        // Every build but Apple Silicon's: a release whose last job is still running.
+        let release = release(
+            "0.2.0",
+            &[
+                "claude-usage-tray_0.2.0_darwin_amd64.tar.gz",
+                "claude-usage-tray_0.2.0_linux_amd64.tar.gz",
+                "claude-usage-tray_0.2.0_linux_arm64.tar.gz",
+            ],
+        );
+        assert_eq!(
+            judge(release.clone(), "0.1.0", "macos", "aarch64"),
+            Outcome::Pending
+        );
+        assert!(matches!(
+            judge(release, "0.1.0", "linux", "x86_64"),
+            Outcome::Available(_)
+        ));
+    }
+
+    #[test]
+    fn another_versions_build_does_not_count() {
+        let release = release("0.2.0", &["claude-usage-tray_0.1.0_linux_amd64.tar.gz"]);
+        assert_eq!(judge(release, "0.1.0", "linux", "x86_64"), Outcome::Pending);
+    }
+
+    #[test]
+    fn a_release_that_is_not_newer_is_nothing_even_without_a_build() {
+        assert_eq!(
+            judge(release("0.1.0", &[]), "0.1.0", "linux", "x86_64"),
+            Outcome::Nothing
+        );
     }
 
     #[test]
