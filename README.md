@@ -31,6 +31,7 @@ The icon is a small gauge, and it tells you two things at once.
 - **The outer arc** is your 5-hour session, sweeping clockwise as you use it up.
 - **The dot in the middle** is your weekly usage.
 - **The color** is the warning: green under 50%, yellow under 75%, orange under 90%, red at 90% and above. Both parts use the same bands.
+- **No dot in the middle** means your account has no 5-hour limit. The arc shows your weekly usage instead, and the menu skips the session row.
 - **A question mark in the middle** means the numbers haven't been updated recently. You still see the last known reading, it just might not be current.
 - **A gray icon** means there's no data yet, usually because the hook isn't installed.
 

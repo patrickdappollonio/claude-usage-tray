@@ -218,12 +218,14 @@ pub fn status_line(snapshot: &UsageSnapshot, now: Timestamp) -> String {
 }
 
 /// One snapshot's info rows: session, weekly, any per-model scoped rows, then
-/// the freshness line.
+/// the freshness line. The session row is left out for an account without a
+/// 5-hour limit, where "no data" would read as a fault.
 pub fn info_lines(snapshot: &UsageSnapshot, now: Timestamp) -> Vec<String> {
-    let mut lines = vec![
-        session_line(snapshot.session.as_ref(), now),
-        weekly_line(snapshot.weekly.as_ref(), now),
-    ];
+    let mut lines = Vec::new();
+    if !snapshot.has_no_session_limit() {
+        lines.push(session_line(snapshot.session.as_ref(), now));
+    }
+    lines.push(weekly_line(snapshot.weekly.as_ref(), now));
     for scoped in &snapshot.scoped {
         lines.push(scoped_line(scoped, snapshot.scoped_fetched_at, now));
     }
@@ -264,6 +266,20 @@ fn short_metric(label: &str, metric: Option<&Metric>) -> String {
     }
 }
 
+/// `Session 7%, Weekly 40%`, or just `Weekly 40%` for an account without a
+/// 5-hour limit.
+fn short_metrics(snapshot: &UsageSnapshot) -> String {
+    let weekly = short_metric("Weekly", snapshot.weekly.as_ref());
+    if snapshot.has_no_session_limit() {
+        weekly
+    } else {
+        format!(
+            "{}, {weekly}",
+            short_metric("Session", snapshot.session.as_ref())
+        )
+    }
+}
+
 /// Body of the notification shown after a *user-initiated* refresh.
 ///
 /// Pure so the three outcomes are unit-testable: the cache moved forward, it
@@ -284,11 +300,7 @@ pub fn refresh_message(
     // reliable evidence that Claude Code reported something new; percentages
     // can legitimately stay identical between two real reports.
     if current.written_at.is_some() && current.written_at != previous.written_at {
-        return format!(
-            "Updated — {}, {}",
-            short_metric("Session", current.session.as_ref()),
-            short_metric("Weekly", current.weekly.as_ref())
-        );
+        return format!("Updated — {}", short_metrics(current));
     }
     match current.written_at {
         Some(at) => format!(
@@ -327,14 +339,7 @@ fn profiles_refresh_message(
             profile.snapshot.written_at.is_some()
                 && profile.snapshot.written_at != before(&profile.name)
         })
-        .map(|profile| {
-            format!(
-                "{}: {}, {}",
-                profile.name,
-                short_metric("Session", profile.snapshot.session.as_ref()),
-                short_metric("Weekly", profile.snapshot.weekly.as_ref())
-            )
-        })
+        .map(|profile| format!("{}: {}", profile.name, short_metrics(&profile.snapshot)))
         .collect();
     if !updated.is_empty() {
         return format!("Updated — {}", updated.join("; "));
@@ -397,6 +402,9 @@ pub fn status_message(snapshot: &UsageSnapshot, now: Timestamp) -> String {
     let mut sentence = match (session, weekly) {
         (Some(session), Some(weekly)) => format!("You've used {session} and {weekly}."),
         (Some(session), None) => format!("You've used {session}; weekly usage is unknown."),
+        (None, Some(weekly)) if snapshot.has_no_session_limit() => {
+            format!("You've used {weekly}.")
+        }
         (None, Some(weekly)) => format!("You've used {weekly}; session usage is unknown."),
         (None, None) => {
             "Claude hasn't reported any usage yet — open Claude Code and send a prompt to update."
@@ -2295,6 +2303,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tooltip_without_a_session_limit_has_no_session_row() {
+        let mut s = snapshot(SnapshotState::Fresh, Some(BASE));
+        s.weekly = Some(metric(Some(12.0), Some(BASE + 1000)));
+        assert_eq!(
+            tooltip_text(&s, ts(BASE)),
+            "Weekly: 12% · resets in 16 min\nUpdated by Claude Code CLI just now"
+        );
+    }
+
+    #[test]
+    fn tooltip_with_neither_window_still_says_no_data_for_both() {
+        let s = snapshot(SnapshotState::Fresh, Some(BASE));
+        assert_eq!(
+            tooltip_text(&s, ts(BASE)),
+            "Session: no data\nWeekly: no data\nUpdated by Claude Code CLI just now"
+        );
+    }
+
+    #[test]
+    fn refresh_message_without_a_session_limit_only_names_weekly() {
+        let before = snapshot(SnapshotState::Fresh, Some(BASE - 300));
+        let mut after = snapshot(SnapshotState::Fresh, Some(BASE - 10));
+        after.weekly = Some(metric(Some(12.0), Some(BASE + 1000)));
+        assert_eq!(
+            refresh_message(&before, &after, ts(BASE)),
+            "Updated — Weekly 12%"
+        );
+    }
+
     /// Builds a snapshot with both metrics populated.
     fn full(state: SnapshotState, written_at: i64, session: f64, weekly: f64) -> UsageSnapshot {
         let mut s = snapshot(state, Some(written_at));
@@ -2441,13 +2479,13 @@ mod tests {
     }
 
     #[test]
-    fn status_message_session_missing_says_so() {
+    fn status_message_without_a_session_limit_only_mentions_weekly() {
+        // No `five_hour` window at all: the account has no 5-hour limit.
         let mut s = snapshot(SnapshotState::Fresh, Some(BASE - 30));
         s.weekly = Some(metric(Some(33.0), Some(BASE + 12 * 3600)));
         assert_eq!(
             status_message(&s, ts(BASE)),
-            "You've used 33% of your weekly limit (resets in 12 h); session \
-             usage is unknown."
+            "You've used 33% of your weekly limit (resets in 12 h)."
         );
     }
 
@@ -3630,6 +3668,26 @@ mod tests {
             weekly: true,
             models: true,
         }
+    }
+
+    #[test]
+    fn without_a_session_limit_only_the_weekly_window_alerts() {
+        let mut notifiers = ProfileNotifiers::new();
+        let at = |weekly: f64| UsageSnapshot {
+            weekly: Some(metric(Some(weekly), Some(BASE + 86_400))),
+            ..UsageSnapshot::default()
+        };
+        assert!(
+            notifiers
+                .usage_alerts(&at(10.0), &prefs(&[50, 90]))
+                .is_empty()
+        );
+        let windows: Vec<_> = notifiers
+            .usage_alerts(&at(55.0), &prefs(&[50, 90]))
+            .into_iter()
+            .map(|a| (a.window, a.threshold))
+            .collect();
+        assert_eq!(windows, vec![(UsageWindow::Weekly, 50)]);
     }
 
     #[test]
