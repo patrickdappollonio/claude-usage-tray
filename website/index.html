@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>See your Claude Code usage in your menu bar or system tray</title>
-<meta name="description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code 5-hour and weekly usage. No credentials, no cookies, no calls to Anthropic.">
+<meta name="description" content="A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code weekly usage, and your 5-hour session if your account has one. No credentials, no cookies, no calls to Anthropic.">
 <meta name="author" content="Patrick D'appollonio">
 <meta name="theme-color" content="#43A047">
 <link rel="canonical" href="https://claude-usage-tray.app/">
@@ -26,7 +26,7 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "claude-usage-tray",
-  "description": "A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code 5-hour and weekly usage.",
+  "description": "A small gauge in your Linux system tray or macOS menu bar that shows your Claude Code weekly usage, and your 5-hour session if your account has one.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, macOS",
   "url": "https://claude-usage-tray.app/",
@@ -757,7 +757,7 @@
     <h2 id="features-h">Features</h2>
     <div class="body">
       <ul class="features">
-        <li><a href="#reading">Your usage at a glance</a><span>The ring is your 5-hour session and the dot is your week. Green, yellow, orange and red tell you how close you are.</span></li>
+        <li><a href="#reading">Your usage at a glance</a><span>The ring shows your weekly usage. If your account has a 5-hour limit, the ring shows the session and a dot shows the week. Green, yellow, orange and red tell you how close you are.</span></li>
         <li><a href="#settings">Color or monochrome</a><span>Use the colored gauge, or a monochrome one that matches a light or dark panel, picked automatically or by hand.</span></li>
         <li><span class="title"><a href="#linux">Linux</a> and <a href="#macos">macOS</a></span><span>Developed on Linux and tested on GNOME and KDE Plasma, with a signed and notarized Mac app. Builds for Intel/AMD and ARM.</span></li>
         <li><a href="#settings">Alerts before you hit a limit</a><span>Notifications at 50, 75, 90, 99 and 100% for the session, the week and each model, plus one when your quota resets.</span></li>
