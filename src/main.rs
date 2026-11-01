@@ -954,6 +954,25 @@ const FIRST_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(5);
 /// Interval between update checks thereafter.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Wait before checking again after the first check that finds a newer
+/// release without this platform's build. Release builds take about five
+/// minutes; this leaves room for a slow one.
+const FIRST_PENDING_RECHECK_DELAY: Duration = Duration::from_secs(10 * 60);
+
+/// Wait between later checks while the build is still missing: a build that
+/// slow has likely failed and needs a person to re-run it.
+const LATER_PENDING_RECHECK_DELAY: Duration = Duration::from_secs(60 * 60);
+
+/// How long to wait after a check that found the build missing, given how
+/// many checks in a row had found it missing before this one.
+fn pending_recheck_delay(earlier_pending_checks: u32) -> Duration {
+    if earlier_pending_checks == 0 {
+        FIRST_PENDING_RECHECK_DELAY
+    } else {
+        LATER_PENDING_RECHECK_DELAY
+    }
+}
+
 /// How long after startup the greeting toast fires. It must not fire inline
 /// before [`platform::run`]: the macOS backend refuses to post until the main
 /// run loop is pumping (`MainThreadNotRunning`), and its built-in retry only
@@ -974,7 +993,9 @@ fn spawn_greeting() {
 }
 
 /// Runs the update check on its own thread, forever: once shortly after
-/// startup, then daily.
+/// startup, then daily. A newer release that does not have this platform's
+/// build yet is not shown, and is checked again sooner than the next day:
+/// see [`pending_recheck_delay`].
 ///
 /// The `enabled` flag is re-read before every check rather than captured, so
 /// unticking `Settings ▸ Check for updates` stops the next one without a
@@ -992,23 +1013,32 @@ fn spawn_update_checker(
 ) {
     std::thread::spawn(move || {
         let mut wait = FIRST_UPDATE_CHECK_DELAY;
+        let mut pending_checks = 0;
         loop {
             std::thread::sleep(wait);
             wait = UPDATE_CHECK_INTERVAL;
             if !enabled.load(Ordering::Relaxed) {
                 continue;
             }
-            if let Some(update) = update::check() {
-                // Already showing this exact release: no need to make the tray
-                // re-render for it.
-                if found.get().as_ref() == Some(&update) {
-                    continue;
-                }
-                found.set(Some(update));
-                if wake.send(Wake::UpdateAvailable).is_err() {
-                    // The poll loop is gone: the process is on its way out.
-                    return;
-                }
+            let outcome = update::check();
+            if outcome == update::Outcome::Pending {
+                wait = pending_recheck_delay(pending_checks);
+                pending_checks += 1;
+                continue;
+            }
+            pending_checks = 0;
+            let update::Outcome::Available(update) = outcome else {
+                continue;
+            };
+            // Already showing this exact release: no need to make the tray
+            // re-render for it.
+            if found.get().as_ref() == Some(&update) {
+                continue;
+            }
+            found.set(Some(update));
+            if wake.send(Wake::UpdateAvailable).is_err() {
+                // The poll loop is gone: the process is on its way out.
+                return;
             }
         }
     });
@@ -1749,6 +1779,18 @@ mod notify_channel_routing {
         assert_eq!(channel, Channel::Ephemeral);
         assert_eq!(toast.urgency, Urgency::Normal);
         assert!(!toast.transient, "a once-ever hello belongs in history");
+    }
+
+    #[test]
+    fn a_missing_build_is_rechecked_in_ten_minutes_then_hourly() {
+        assert_eq!(pending_recheck_delay(0), Duration::from_secs(10 * 60));
+        for earlier in [1, 2, 50] {
+            assert_eq!(
+                pending_recheck_delay(earlier),
+                Duration::from_secs(60 * 60),
+                "after {earlier} earlier pending checks"
+            );
+        }
     }
 
     #[test]

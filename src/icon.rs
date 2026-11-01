@@ -158,11 +158,15 @@ fn render_one(size: u32, snapshot: &UsageSnapshot, appearance: IconAppearance) -
     match snapshot.state {
         SnapshotState::Missing => draw_missing(&mut pixmap, center, radius, stroke_width),
         SnapshotState::Fresh | SnapshotState::Stale => {
-            let session_percent = extract_percent(snapshot.session.as_ref());
+            // Without a session limit the arc shows the weekly window, so a
+            // weekly dot under it would only repeat it.
+            let arc_percent = extract_percent(snapshot.arc_metric());
             // Stale swaps the weekly dot for the "?" glyph; the ring and arc
             // are byte-for-byte what `Fresh` draws.
             let center_mark = if snapshot.state == SnapshotState::Stale {
                 CenterMark::QuestionMark
+            } else if snapshot.has_no_session_limit() {
+                CenterMark::Empty
             } else {
                 CenterMark::WeeklyDot(extract_percent(snapshot.weekly.as_ref()))
             };
@@ -172,7 +176,7 @@ fn render_one(size: u32, snapshot: &UsageSnapshot, appearance: IconAppearance) -
                 center,
                 radius,
                 stroke_width,
-                session_percent,
+                arc_percent,
                 center_mark,
                 appearance,
             );
@@ -204,6 +208,8 @@ fn draw_missing(pixmap: &mut Pixmap, center: f32, radius: f32, stroke_width: f32
 enum CenterMark {
     /// The normal weekly-percent dot; `None` means "no reading" (gray).
     WeeklyDot(Option<f64>),
+    /// Nothing: the arc already shows the weekly window.
+    Empty,
     /// The stale marker. It replaces the dot rather than joining it: the
     /// center is the only spot free of the ring and the arc, and two marks
     /// there would be unreadable at 22 px.
@@ -217,7 +223,7 @@ fn draw_gauge(
     center: f32,
     radius: f32,
     stroke_width: f32,
-    session_percent: Option<f64>,
+    arc_percent: Option<f64>,
     center_mark: CenterMark,
     appearance: IconAppearance,
 ) {
@@ -232,15 +238,15 @@ fn draw_gauge(
         70,
     );
 
-    match session_percent {
-        Some(session_percent) => {
+    match arc_percent {
+        Some(arc_percent) => {
             // Foreground arc: sweeps clockwise from the top, proportional to
-            // session%.
-            let sweep_deg = (session_percent / 100.0 * 360.0) as f32;
+            // the arc window's percent.
+            let sweep_deg = (arc_percent / 100.0 * 360.0) as f32;
             if sweep_deg > 0.0
                 && let Some(path) = arc_path(center, center, radius, -90.0, sweep_deg)
             {
-                let color = appearance.arc(session_percent);
+                let color = appearance.arc(arc_percent);
                 let mut paint = Paint::default();
                 paint.set_color_rgba8(color.0, color.1, color.2, 255);
                 paint.anti_alias = true;
@@ -289,6 +295,7 @@ fn draw_gauge(
                 255,
             );
         }
+        CenterMark::Empty => {}
         CenterMark::QuestionMark => {
             draw_question_mark(
                 pixmap,
@@ -557,6 +564,40 @@ mod tests {
             gray_like as f64 / visible as f64 > 0.9,
             "expected the missing-state icon to be overwhelmingly gray, got {gray_like}/{visible}"
         );
+    }
+
+    /// An account without a 5-hour limit: the arc shows the weekly percent
+    /// in color and the center stays empty, rather than the gray "no reading"
+    /// ring.
+    #[test]
+    fn weekly_only_reading_draws_the_weekly_arc_and_no_center_dot() {
+        let size = 48usize;
+        let mut snap = snapshot(SnapshotState::Fresh, None, Some(95.0));
+        snap.session = None;
+        let icon = &render_icons(&snap, IconAppearance::Color)[2];
+
+        let red = band_color(95.0);
+        let near = |px: &[u8], c: (u8, u8, u8)| {
+            (px[1] as i32 - c.0 as i32).abs()
+                + (px[2] as i32 - c.1 as i32).abs()
+                + (px[3] as i32 - c.2 as i32).abs()
+                < 30
+        };
+        let pixels = icon.data.as_chunks::<4>().0;
+        assert!(
+            pixels.iter().any(|px| px[0] == 255 && near(px, red)),
+            "the arc should carry the weekly percent's color"
+        );
+        let center = size / 2;
+        for y in center - 2..=center + 2 {
+            for x in center - 2..=center + 2 {
+                assert_eq!(
+                    pixels[y * size + x][0],
+                    0,
+                    "the center at ({x},{y}) should be empty"
+                );
+            }
+        }
     }
 
     #[test]

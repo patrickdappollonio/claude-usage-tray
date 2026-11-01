@@ -94,6 +94,23 @@ impl UsageSnapshot {
             ..UsageSnapshot::default()
         }
     }
+
+    /// Whether this reading has a weekly window but no 5-hour one. Claude Code
+    /// leaves `five_hour` out entirely for accounts without a 5-hour limit, so
+    /// this is "the account has no session limit", not "we lack data".
+    pub fn has_no_session_limit(&self) -> bool {
+        self.session.is_none() && self.weekly.is_some()
+    }
+
+    /// The window the icon's arc tracks: the 5-hour session, or the weekly
+    /// window for an account without a session limit.
+    pub fn arc_metric(&self) -> Option<&Metric> {
+        if self.has_no_session_limit() {
+            self.weekly.as_ref()
+        } else {
+            self.session.as_ref()
+        }
+    }
 }
 
 /// Cache files whose mtime is older than this many seconds are stale.
@@ -460,15 +477,25 @@ pub fn merge_snapshot(
         (Some(_), None) => true,
         (None, _) => false,
     };
+    // A winner that reports a weekly window but no session one is saying the
+    // account has no 5-hour limit, so the loser's session must not fill in:
+    // it would be an older reading from before the limit went away.
+    let pick_session = |winner: Option<Metric>, winner_weekly: bool, loser: Option<Metric>| {
+        if winner.is_none() && winner_weekly {
+            None
+        } else {
+            winner.or(loser)
+        }
+    };
     let (session, weekly, written_at) = if app_newer {
         (
-            app.session.or(hook.session),
+            pick_session(app.session, app.weekly.is_some(), hook.session),
             app.weekly.or(hook.weekly),
             app.fetched_at,
         )
     } else {
         (
-            hook.session.or(app.session),
+            pick_session(hook.session, hook.weekly.is_some(), app.session),
             hook.weekly.or(app.weekly),
             hook.written_at.or(app.fetched_at),
         )
@@ -754,6 +781,35 @@ mod tests {
         let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
         assert_eq!(merged.session.as_ref().and_then(|m| m.percent), Some(10.0));
         assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(47.0));
+    }
+
+    #[test]
+    fn merge_does_not_fill_a_session_the_winner_has_no_limit_for() {
+        // The newer hook reports weekly only: the account has no 5-hour
+        // limit, so the older app cache's session window must not come back.
+        let mut hook = hook_snapshot(MERGE_NOW - 60, 0.0, 12.0);
+        hook.session = None;
+        let app = app_usage(MERGE_NOW - 300, 11.0, 47.0);
+        let merged = merge_snapshot(hook, Some(app), ts(MERGE_NOW));
+        assert_eq!(merged.session, None);
+        assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(12.0));
+        assert!(merged.has_no_session_limit());
+    }
+
+    #[test]
+    fn a_weekly_only_statusline_has_no_session_limit() {
+        let body = r#"{"rate_limits":{"seven_day":{"used_percentage":12,"resets_at":1793710800}}}"#;
+        let snap = snapshot_from(body, Some(ts(MERGE_NOW)), ts(MERGE_NOW));
+        assert_eq!(snap.state, SnapshotState::Fresh);
+        assert!(snap.has_no_session_limit());
+        assert_eq!(snap.arc_metric().and_then(|m| m.percent), Some(12.0));
+    }
+
+    #[test]
+    fn a_reading_with_neither_window_is_not_a_missing_session_limit() {
+        let snap = snapshot_from("{}", Some(ts(MERGE_NOW)), ts(MERGE_NOW));
+        assert!(!snap.has_no_session_limit());
+        assert_eq!(snap.arc_metric(), None);
     }
 
     #[test]
