@@ -39,13 +39,17 @@ re-run it after upgrading the package.
   [releases page](https://github.com/patrickdappollonio/claude-usage-tray/releases/latest)
   instead. Everything else behaves the same.
 - Claude Code >= 2.1.80 (the version that added `rate_limits` to the statusline
-  JSON), on a Pro/Max subscription account.
+  JSON), on a Pro, Max, Ultra or Team subscription account.
 
-## No network calls, no credentials
+## No credentials, one optional network request
 
-This tray makes zero network requests and never reads your Claude credentials.
-It only reads a local JSON file — the data Claude Code itself already hands to
-your statusline on stdin.
+This tray never reads your Claude credentials. It only reads a local JSON
+file — the data Claude Code itself already hands to your statusline on stdin.
+
+The only network request it can make is an optional update check, once a day,
+against the GitHub releases API. It sends nothing but the program name and
+version. Turn off `Settings > Check for updates` and it makes no network
+requests at all.
 
 Full documentation:
 <https://github.com/patrickdappollonio/claude-usage-tray>

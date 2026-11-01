@@ -8,9 +8,11 @@ maintainer: Patrick D'appollonio <patrickdappollonio@gmail.com>
 description: |
   Linux tray icon showing Claude Code 5-hour and weekly usage.
   A StatusNotifierItem tray icon that renders your Claude Code
-  subscription usage — the 5-hour session percentage and the 7-day
-  weekly percentage — with reset times, read from a local cache file.
-  Makes no network calls and never reads your credentials.
+  subscription usage (the 5-hour session percentage and the 7-day
+  weekly percentage) with reset times, read from a local cache file.
+  Never reads your credentials. Its only network request is an
+  optional daily check for new releases on GitHub, which can be
+  turned off.
 vendor: Patrick D'appollonio
 homepage: https://github.com/patrickdappollonio/claude-usage-tray
 license: MIT

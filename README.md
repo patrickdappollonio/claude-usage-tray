@@ -214,7 +214,7 @@ The numbers only move forward while Claude Code is running a session, because th
 
 You need Claude Code 2.1.80 or newer, which is the version that started including usage in the statusline data.
 
-It also only works on Pro and Max subscriptions logged in the normal way. API-key billing doesn't include usage numbers, so there's nothing to show.
+It also only works on Pro, Max, Ultra and Team subscriptions logged in the normal way. API-key billing doesn't include usage numbers, so there's nothing to show.
 
 ### 📄 License
 
