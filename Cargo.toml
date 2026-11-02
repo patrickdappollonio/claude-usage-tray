@@ -74,4 +74,4 @@ notify-rust = { version = "4.18.0", default-features = false, features = ["previ
 # `platform/macos/mod.rs`.
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"] }
 tao = "0.37.2"
-tray-icon = "0.24.2"
+tray-icon = "0.26.1"

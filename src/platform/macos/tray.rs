@@ -101,7 +101,6 @@ impl MacTray {
             .with_id(TRAY_ID)
             .with_menu(Box::new(menu.clone()))
             .with_tooltip(self.core.tooltip())
-            .with_icon_as_template(is_template)
             // Any click opens the menu — the macOS menu bar convention (user
             // decision 2026-08-14). The Linux tray keeps its split behavior
             // (left click = summary toast, right click = menu) because that's
@@ -111,7 +110,11 @@ impl MacTray {
             .with_menu_on_left_click(true)
             .with_menu_on_right_click(true);
         if let Some(icon) = icon {
-            builder = builder.with_icon(icon);
+            builder = if is_template {
+                builder.with_icon_templated(icon)
+            } else {
+                builder.with_icon(icon)
+            };
         }
 
         self.tray = Some(builder.build()?);
@@ -132,9 +135,11 @@ impl MacTray {
         let (icon, is_template) = self.icon_image();
         let tooltip = self.core.tooltip();
         if let Some(tray) = &self.tray {
-            // `set_icon` on its own clears the template flag, so the two are
-            // always set together.
-            let _ = tray.set_icon_with_as_template(icon, is_template);
+            if is_template {
+                let _ = tray.set_icon_templated(icon);
+            } else {
+                let _ = tray.set_icon(icon);
+            }
             let _ = tray.set_tooltip(Some(tooltip));
         }
         self.rebuild_menu();
