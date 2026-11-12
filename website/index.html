@@ -799,7 +799,7 @@
         <strong>The one network request it can make</strong>
         An optional check for new versions, once a day, against GitHub releases. It sends only the program name and version. Turn off <em>Check for updates</em> and the tray makes no network requests at all.
       </div>
-      <p>One setting involves Claude itself: <em>Refresh usage via Claude CLI</em> runs the official <code>claude</code> command, at most once an hour, so it fetches your latest numbers with your normal login. It's on by default, and turning it off leaves the tray fully passive. <a href="#faq">More in the questions below.</a></p>
+      <p>One setting involves Claude itself: <em>Refresh usage via Claude CLI</em> runs the official <code>claude</code> command, every ten minutes while you're using Claude Code and once an hour otherwise, so it fetches your latest numbers with your normal login. It's on by default, and turning it off leaves the tray fully passive. <a href="#faq">More in the questions below.</a></p>
       <p class="muted">Other tools pretend to be the Claude CLI to fetch these numbers, which can get an account banned. This one only reads what Claude Code already wrote to your statusline.</p>
     </div>
   </section>
@@ -996,7 +996,7 @@
       </details>
       <details>
         <summary>What does "Refresh usage via Claude CLI" do?</summary>
-        <p>Some numbers, like the per-model weekly limits, only update when Claude Code fetches them itself, for example when you open <code>/usage</code>. Left alone, they can go hours without updating. With this setting on, the tray runs <code>claude -p "/usage"</code> in the background at most once an hour: the official Claude CLI, with your normal login, and it doesn't count against your usage.</p>
+        <p>Some numbers, like the per-model weekly limits, only update when Claude Code fetches them itself, for example when you open <code>/usage</code>. Left alone, they can go hours without updating. With this setting on, the tray runs <code>claude -p "/usage"</code> in the background, every ten minutes while you're using Claude Code on this machine and once an hour otherwise: the official Claude CLI, with your normal login, and it doesn't count against your usage.</p>
         <p>It's on by default. Turn it off in Settings if you'd rather the tray never start Claude for you; everything else keeps working, and the per-model rows update whenever you open <code>/usage</code> yourself.</p>
       </details>
     </div>
