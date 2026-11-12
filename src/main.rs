@@ -725,8 +725,9 @@ fn run_tray_locked(spawned: bool) -> i32 {
 }
 
 /// The `statusline` subcommand: pure transport. Reads Claude Code's statusline
-/// JSON from stdin, writes it verbatim to the cache, and — with `--exec` —
-/// hands the same bytes to the user's own statusline command and lets its
+/// JSON from stdin, writes it to the cache with one note of its own added
+/// (where `claude` is; see `source::with_claude_path`), and — with `--exec` —
+/// hands the original bytes to the user's own statusline command and lets its
 /// stdout through untouched, killing it if it runs past [`wrapped::TIMEOUT`].
 ///
 /// It exits 0 whatever happens short of a usage error: a broken cache write or
@@ -751,8 +752,17 @@ fn run_statusline(args: &[String]) -> i32 {
             .unwrap_or_else(source::claude_config_dir);
         let cache_path = source::cache_path_in(&config_dir);
         let existing = std::fs::read(&cache_path).ok();
+        // Claude Code started this process, so `PATH` here is the user's own:
+        // the one place this program can reliably see where `claude` lives.
+        let claude = std::env::var_os("PATH").and_then(|path| {
+            cli_refresh::find_claude(&std::env::split_paths(&path).collect::<Vec<_>>())
+        });
         if source::should_write_cache(&input, existing.as_deref())
-            && source::write_cache(&cache_path, &input).is_ok()
+            && source::write_cache(
+                &cache_path,
+                &source::with_claude_path(&input, claude.as_deref()),
+            )
+            .is_ok()
             && existing.is_none()
         {
             // The tray may have started with a different `CLAUDE_CONFIG_DIR`,
@@ -1177,7 +1187,7 @@ fn poll_loop(
     // "ticker" that keeps `resets in 17 h` honest overnight.
     let mut last_rendered = ui::tooltip_text(&snapshot, Timestamp::now());
     // When this process last spawned `claude -p "/usage"`. Process-local on
-    // purpose: an hour-scale cadence does not need to survive restarts, and
+    // purpose: a minutes-scale cadence does not need to survive restarts, and
     // the blob's own `fetchedAtMs` already carries the cross-process truth.
     let mut last_cli_refresh: Option<Timestamp> = None;
 
@@ -1189,17 +1199,21 @@ fn poll_loop(
         }
 
         // Optionally keep Claude Code's usage blob (the per-model rows'
-        // only source) from going stale: at most one headless CLI run per
-        // hour, gated by the settings toggle. The spawn is fire-and-forget;
-        // a later poll tick picks up whatever it wrote.
+        // only source) from going stale: one headless CLI run every ten
+        // minutes while Claude Code is in use here, hourly otherwise, gated
+        // by the settings toggle. The spawn is fire-and-forget; a later poll
+        // tick picks up whatever it wrote.
         if cli_refresh::should_refresh(
             cli_refresh.load(Ordering::Relaxed),
             snapshot.scoped_fetched_at,
+            source::latest_hook_activity(&profiles::discover().profiles),
             last_cli_refresh,
             Timestamp::now(),
         ) {
             last_cli_refresh = Some(Timestamp::now());
-            cli_refresh::spawn_refresh();
+            cli_refresh::spawn_refresh(source::recorded_claude_path(
+                &profiles::discover().profiles,
+            ));
         }
 
         // Has the program on disk been replaced since this process started? One

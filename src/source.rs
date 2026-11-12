@@ -201,6 +201,48 @@ pub fn should_write_cache(incoming: &[u8], existing: Option<&[u8]>) -> bool {
     }
 }
 
+/// The key the `statusline` subcommand adds to the cached document. Everything
+/// else in the file is Claude Code's payload, untouched; this one object is
+/// the hook's own note to the tray.
+const HOOK_NOTE_KEY: &str = "claude_usage_tray";
+
+/// Returns the statusline document with the location of the `claude` binary
+/// recorded in it, for the tray's background refresh (see `cli_refresh.rs`).
+///
+/// The hook is the one part of this program that Claude Code itself starts,
+/// so it sees the `PATH` the user's shell built. The tray, started by
+/// `launchd` or a desktop autostart entry, does not. A body that is not a
+/// JSON object, or a path that is not UTF-8, comes back unchanged.
+pub fn with_claude_path(body: &[u8], claude: Option<&Path>) -> Vec<u8> {
+    let Some(claude) = claude.and_then(Path::to_str) else {
+        return body.to_vec();
+    };
+    let Ok(serde_json::Value::Object(mut document)) = serde_json::from_slice(body) else {
+        return body.to_vec();
+    };
+    document.insert(
+        HOOK_NOTE_KEY.to_string(),
+        serde_json::json!({ "claude_path": claude }),
+    );
+    serde_json::to_vec(&serde_json::Value::Object(document)).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Pure parser for the path [`with_claude_path`] recorded, if any.
+fn parse_claude_path(body: &str) -> Option<PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let path = value.get(HOOK_NOTE_KEY)?.get("claude_path")?.as_str()?;
+    Some(PathBuf::from(path))
+}
+
+/// Where the statusline hook last saw `claude`, from the first profile whose
+/// cache says. `None` until a hook new enough to record it has run.
+pub fn recorded_claude_path(profiles: &[crate::profiles::Profile]) -> Option<PathBuf> {
+    profiles.iter().find_map(|profile| {
+        let body = std::fs::read_to_string(&profile.cache_path).ok()?;
+        parse_claude_path(&body)
+    })
+}
+
 /// The cache file's mtime, or `None` when it cannot be read.
 pub fn cache_mtime(path: &Path) -> Option<jiff::Timestamp> {
     let modified = std::fs::metadata(path)
@@ -212,6 +254,15 @@ pub fn cache_mtime(path: &Path) -> Option<jiff::Timestamp> {
         Err(before) => -i64::try_from(before.duration().as_secs()).ok()?,
     };
     jiff::Timestamp::from_second(secs).ok()
+}
+
+/// When the statusline hook last wrote, across every profile: the most
+/// recent sign that Claude Code is in use on this machine.
+pub fn latest_hook_activity(profiles: &[crate::profiles::Profile]) -> Option<jiff::Timestamp> {
+    profiles
+        .iter()
+        .filter_map(|profile| cache_mtime(&profile.cache_path))
+        .max()
 }
 
 /// Reads and parses the cache file at `path`. Never panics: any I/O error
@@ -830,6 +881,119 @@ mod tests {
         assert_eq!(merged.weekly.as_ref().and_then(|m| m.percent), Some(40.0));
         assert!(merged.scoped.is_empty());
         assert!(!merged.hook_missing);
+    }
+
+    #[test]
+    fn latest_hook_activity_is_the_newest_hook_write_across_profiles() {
+        let temp = TempDir::new("hook-activity");
+        let mut profiles = Vec::new();
+        for (name, mtime) in [("a", 1_700_000_000), ("b", 1_700_000_900)] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create profile dir");
+            let cache = dir.join("usage-tray-statusline.json");
+            std::fs::write(&cache, "{}").expect("write cache");
+            crate::testutil::set_mtime(&cache, mtime);
+            profiles.push(profile(&cache, &dir.join(".claude.json")));
+        }
+        // A profile whose hook never wrote contributes nothing.
+        let silent = temp.path().join("c");
+        profiles.push(profile(
+            &silent.join("usage-tray-statusline.json"),
+            &silent.join(".claude.json"),
+        ));
+
+        assert_eq!(
+            latest_hook_activity(&profiles).map(|at| at.as_second()),
+            Some(1_700_000_900)
+        );
+        assert_eq!(latest_hook_activity(&[]), None);
+    }
+
+    #[test]
+    fn with_claude_path_adds_the_note_and_keeps_the_payload() {
+        let body = br#"{"rate_limits":{"five_hour":{"used_percentage":42}},"model":"opus"}"#;
+        let noted = with_claude_path(body, Some(Path::new("/home/someone/.local/bin/claude")));
+        let text = String::from_utf8(noted).expect("utf-8");
+
+        assert_eq!(
+            parse_claude_path(&text),
+            Some(PathBuf::from("/home/someone/.local/bin/claude"))
+        );
+        let limits = parse_statusline_json(&text, ts(MERGE_NOW)).expect("still parses");
+        assert_eq!(limits.session.expect("session").percent, Some(42.0));
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["model"], "opus");
+    }
+
+    #[test]
+    fn with_claude_path_leaves_the_body_alone_when_there_is_nothing_to_record() {
+        let body = br#"{"model":"opus"}"#;
+        assert_eq!(with_claude_path(body, None), body);
+        // Not an object: there is nowhere to put the note.
+        assert_eq!(
+            with_claude_path(b"[1,2]", Some(Path::new("/bin/claude"))),
+            b"[1,2]"
+        );
+        assert_eq!(
+            with_claude_path(b"nope", Some(Path::new("/bin/claude"))),
+            b"nope"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_the_note_records_no_claude_path() {
+        assert_eq!(parse_claude_path(r#"{"model":"opus"}"#), None);
+        assert_eq!(
+            parse_claude_path(r#"{"claude_usage_tray":{"claude_path":7}}"#),
+            None
+        );
+        assert_eq!(parse_claude_path("not json"), None);
+    }
+
+    #[test]
+    fn recorded_claude_path_reads_the_first_profile_that_has_one() {
+        let temp = TempDir::new("recorded-claude");
+        let mut profiles = Vec::new();
+        for (name, body) in [
+            ("a", r#"{"model":"opus"}"#),
+            (
+                "b",
+                r#"{"claude_usage_tray":{"claude_path":"/opt/x/claude"}}"#,
+            ),
+        ] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create profile dir");
+            let cache = dir.join("usage-tray-statusline.json");
+            std::fs::write(&cache, body).expect("write cache");
+            profiles.push(profile(&cache, &dir.join(".claude.json")));
+        }
+        assert_eq!(
+            recorded_claude_path(&profiles),
+            Some(PathBuf::from("/opt/x/claude"))
+        );
+        assert_eq!(recorded_claude_path(&[]), None);
+    }
+
+    #[test]
+    fn a_later_hook_write_replaces_the_recorded_claude_path() {
+        // Switching from an npm install to the native one: the next write
+        // records the new location, and nothing of the old one survives.
+        let temp = TempDir::new("recorded-claude-moves");
+        let cache = temp.path().join("usage-tray-statusline.json");
+        let body = br#"{"rate_limits":{"five_hour":{"used_percentage":3}}}"#;
+        let profiles = [profile(&cache, &temp.path().join(".claude.json"))];
+
+        let npm = Path::new("/home/someone/.npm-global/bin/claude");
+        write_cache(&cache, &with_claude_path(body, Some(npm))).expect("write");
+        assert_eq!(recorded_claude_path(&profiles), Some(npm.to_path_buf()));
+
+        let native = Path::new("/home/someone/.local/bin/claude");
+        write_cache(&cache, &with_claude_path(body, Some(native))).expect("write");
+        assert_eq!(recorded_claude_path(&profiles), Some(native.to_path_buf()));
+
+        // And a hook that can no longer see `claude` at all drops the note.
+        write_cache(&cache, &with_claude_path(body, None)).expect("write");
+        assert_eq!(recorded_claude_path(&profiles), None);
     }
 
     #[test]
