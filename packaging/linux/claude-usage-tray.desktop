@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Usage Tray
+GenericName=Usage Monitor
+Comment=Claude Code subscription usage in the system tray
+# --foreground for the same reason the autostart entry uses it (see
+# src/platform/linux/autostart.rs): a bare launch re-executes itself in the
+# background and exits, which the launcher would read as the app quitting.
+# A second launch while the tray is running exits immediately and harmlessly.
+Exec=claude-usage-tray --foreground
+TryExec=claude-usage-tray
+Icon=claude-usage-tray
+Terminal=false
+StartupNotify=false
+Categories=System;Monitor;
+Keywords=claude;anthropic;usage;quota;tray;

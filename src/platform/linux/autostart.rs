@@ -39,6 +39,10 @@ pub fn entry_path(dir: &Path) -> PathBuf {
 /// nothing useful with: an extra process launch, and a session manager that
 /// thinks the app quit the moment it started. Running attached keeps the
 /// process the session actually started the one that lives.
+///
+/// `Icon=` names the themed icon the distro packages install (see
+/// `packaging/linux/`); where it is not installed, desktops fall back to a
+/// generic icon, so the key is harmless for tarball and Homebrew installs.
 pub fn desktop_entry(exec: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
@@ -46,6 +50,7 @@ pub fn desktop_entry(exec: &Path) -> String {
          Name=Claude Usage Tray\n\
          Comment=Claude Code subscription usage in the system tray\n\
          Exec={} --foreground\n\
+         Icon=claude-usage-tray\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
         exec.display()
@@ -164,6 +169,7 @@ mod tests {
             "Type=Application",
             "Name=Claude Usage Tray",
             "Exec=/usr/local/bin/claude-usage-tray --foreground",
+            "Icon=claude-usage-tray",
             "X-GNOME-Autostart-enabled=true",
         ] {
             assert!(entry.lines().any(|l| l == line), "missing {line:?}");
