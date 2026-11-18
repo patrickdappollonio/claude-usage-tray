@@ -1375,10 +1375,17 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that set or clear `CLAUDE_CONFIG_DIR`: tests run
+    /// on parallel threads, and the environment is shared by all of them.
+    static CLAUDE_CONFIG_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn cache_path_respects_claude_config_dir_env_var() {
-        // SAFETY: test-only env mutation, single-threaded within this process
-        // for this variable's usage (no other test reads/writes it).
+        let _guard = CLAUDE_CONFIG_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: test-only env mutation; every test that touches this
+        // variable holds CLAUDE_CONFIG_DIR_LOCK.
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/custom-claude-dir");
         }
@@ -1459,6 +1466,10 @@ mod tests {
 
     #[test]
     fn cache_path_falls_back_to_home_dot_claude() {
+        let _guard = CLAUDE_CONFIG_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: as above, this test holds CLAUDE_CONFIG_DIR_LOCK.
         unsafe {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
         }
