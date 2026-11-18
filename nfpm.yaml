@@ -26,6 +26,46 @@ contents:
     file_info:
       mode: 0755
 
+  # Application-menu launcher (KDE, GNOME, XFCE, ...) and its themed icon.
+  # Without these the package installs only the binary, and the tray never
+  # shows up in the desktop's app launcher.
+  # The PNGs are assets/appicon-1024.png resized, e.g.
+  #   magick assets/appicon-1024.png -resize 256x256 -strip packaging/linux/icons/claude-usage-tray-256.png
+  - src: ./packaging/linux/claude-usage-tray.desktop
+    dst: /usr/share/applications/claude-usage-tray.desktop
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/linux/icons/claude-usage-tray-32.png
+    dst: /usr/share/icons/hicolor/32x32/apps/claude-usage-tray.png
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/linux/icons/claude-usage-tray-48.png
+    dst: /usr/share/icons/hicolor/48x48/apps/claude-usage-tray.png
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/linux/icons/claude-usage-tray-64.png
+    dst: /usr/share/icons/hicolor/64x64/apps/claude-usage-tray.png
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/linux/icons/claude-usage-tray-128.png
+    dst: /usr/share/icons/hicolor/128x128/apps/claude-usage-tray.png
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/linux/icons/claude-usage-tray-256.png
+    dst: /usr/share/icons/hicolor/256x256/apps/claude-usage-tray.png
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/linux/icons/claude-usage-tray-512.png
+    dst: /usr/share/icons/hicolor/512x512/apps/claude-usage-tray.png
+    file_info:
+      mode: 0644
+
   - src: ./LICENSE
     dst: /usr/share/doc/claude-usage-tray/LICENSE
     file_info:
