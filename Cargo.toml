@@ -22,7 +22,7 @@ strip = true      # Strip symbols from the binary.
 # `src/platform/mod.rs` for where the boundary runs).
 [dependencies]
 dirs = "7.0.0"
-jiff = "0.2.35"
+jiff = "1.0.1"
 # Only for `flock` and `kill` in `src/instance.rs` (the single-instance lock and
 # `restart`); std has neither. Both supported platforms are Unix, and libc is
 # already in the dependency tree several times over, so this adds nothing to the
